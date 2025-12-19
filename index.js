@@ -1018,6 +1018,64 @@ async function fetchVoicesByKeywords(plan, userText) {
     }
   }
 
+  // 2b) extra broad fallback with alternative language name (e.g., 'polish')
+  if (seen.size === 0 && language) {
+    const LANGUAGE_PARAM_MAP = {
+      pl: ['pl', 'polish'],
+      en: ['en', 'english'],
+      es: ['es', 'spanish', 'español', 'espanol'],
+      de: ['de', 'german', 'deutsch'],
+      fr: ['fr', 'french', 'français', 'francais'],
+      it: ['it', 'italian', 'italiano']
+    };
+    const candidates = Array.from(new Set(LANGUAGE_PARAM_MAP[language] || [language]));
+    const alt = candidates.find((v) => v !== language);
+    if (alt) {
+      const params = new URLSearchParams();
+      params.set('page_size', '100');
+      params.set('language', alt);
+      if (accent) params.set('accent', accent);
+      if (gender) params.set('gender', gender);
+      if (qualityPref === 'high_only') {
+        params.set('category', 'high_quality');
+      }
+      try {
+        const altVoices = await callSharedVoices(params);
+        altVoices.forEach((voice) => {
+          if (!voice || !voice.voice_id) return;
+          if (!seen.has(voice.voice_id)) {
+            seen.set(voice.voice_id, { voice, matchedKeywords: new Set() });
+          }
+        });
+      } catch (err) {
+        console.error('Error in alt-language broad fallback:', err.message || err);
+      }
+    }
+  }
+
+  // 2c) last-resort: no language param, then filter heuristically
+  if (seen.size === 0 && language) {
+    const params = new URLSearchParams();
+    params.set('page_size', '100');
+    if (accent) params.set('accent', accent);
+    if (gender) params.set('gender', gender);
+    if (qualityPref === 'high_only') {
+      params.set('category', 'high_quality');
+    }
+    try {
+      const noLangVoices = await callSharedVoices(params);
+      const filtered = (noLangVoices || []).filter((v) => isVoiceInLanguage(v, language));
+      filtered.forEach((voice) => {
+        if (!voice || !voice.voice_id) return;
+        if (!seen.has(voice.voice_id)) {
+          seen.set(voice.voice_id, { voice, matchedKeywords: new Set() });
+        }
+      });
+    } catch (err) {
+      console.error('Error in no-language heuristic fallback:', err.message || err);
+    }
+  }
+
   // 4) convert map -> list, attach matched_keywords
   let voices = Array.from(seen.values()).map((entry) => {
     const v = entry.voice;
