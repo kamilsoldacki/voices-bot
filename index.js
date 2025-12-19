@@ -308,36 +308,31 @@ function detectQualityPreferenceFromText(text) {
   if (!text) return null;
   const lower = text.toLowerCase();
 
-  if (
-    lower.includes('only high quality') ||
-    lower.includes('high quality only') ||
-    lower.includes('just high quality') ||
-    lower.includes('hq only') ||
-    lower.includes('only hq') ||
-    // Polish variations
-    lower.includes('tylko wysoka jakość') ||
-    lower.includes('tylko wysokiej jakości') ||
-    // separated tokens implying exclusivity
-    ((/\bonly\b/.test(lower) || /\btylko\b/.test(lower)) &&
-      (lower.includes('high quality') ||
-        lower.includes('wysokiej jakości') ||
-        lower.includes('wysoka jakość')))
-  ) {
-    return 'high_only';
-  }
-
-  if (
-    lower.includes('without high quality') ||
+  // Negations take precedence
+  const hasNegative =
     lower.includes('no high quality') ||
+    lower.includes('without high quality') ||
     lower.includes('exclude high quality') ||
     lower.includes('standard only') ||
-    // Polish variants
     lower.includes('bez wysokiej jakości') ||
-    lower.includes('bez wysokiej jakosci')
-  ) {
-    return 'no_high';
-  }
+    lower.includes('bez wysokiej jakosci') ||
+    lower.includes('sin alta calidad') ||
+    lower.includes('bez hq');
+  if (hasNegative) return 'no_high';
 
+  // Any HQ mention => high_only (supports common typo and PL/ES variants)
+  const mentionsHQ =
+    /\bhq\b/.test(lower) ||
+    lower.includes('high quality') ||
+    lower.includes('high quaility') ||
+    lower.includes('wysoka jakość') ||
+    lower.includes('wysokiej jakości') ||
+    lower.includes('wysoka jakosc') ||
+    lower.includes('wysokiej jakosci') ||
+    lower.includes('alta calidad');
+  if (mentionsHQ) return 'high_only';
+
+  // No explicit preference
   return null;
 }
 
