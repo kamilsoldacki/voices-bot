@@ -535,6 +535,52 @@ function checkWhichHighIntent(lower) {
   return hasWhich && hasHighQuality;
 }
 
+function uniqueMergeKeywords(baseArr, addArr) {
+  const base = Array.isArray(baseArr) ? baseArr : [];
+  const add = Array.isArray(addArr) ? addArr : [];
+  const set = new Set(base.map((x) => (x || '').toString().toLowerCase().trim()).filter(Boolean));
+  const out = [...base];
+  for (const it of add) {
+    const v = (it || '').toString().toLowerCase().trim();
+    if (v && !set.has(v)) {
+      out.push(v);
+      set.add(v);
+    }
+  }
+  return out;
+}
+
+async function refineKeywordPlanFromFollowUp(existingPlan, followUpText) {
+  const base = existingPlan ? JSON.parse(JSON.stringify(existingPlan)) : {};
+  const delta = await buildKeywordPlan(followUpText);
+
+  // Fields with explicit override if provided in follow-up
+  const qpOverride = detectQualityPreferenceFromText(followUpText);
+  base.quality_preference = qpOverride || base.quality_preference || 'any';
+
+  if (delta && typeof delta.target_voice_language === 'string' && delta.target_voice_language) {
+    base.target_voice_language = delta.target_voice_language;
+  }
+  if (delta && typeof delta.target_accent === 'string' && delta.target_accent) {
+    base.target_accent = delta.target_accent;
+  }
+  if (delta && typeof delta.target_gender === 'string' && delta.target_gender) {
+    base.target_gender = delta.target_gender;
+  }
+
+  // Merge keywords (unique, lowercase)
+  base.tone_keywords = uniqueMergeKeywords(base.tone_keywords, delta.tone_keywords);
+  base.use_case_keywords = uniqueMergeKeywords(base.use_case_keywords, delta.use_case_keywords);
+  base.character_keywords = uniqueMergeKeywords(
+    base.character_keywords,
+    delta.character_keywords
+  );
+  base.style_keywords = uniqueMergeKeywords(base.style_keywords, delta.style_keywords);
+  base.extra_keywords = uniqueMergeKeywords(base.extra_keywords, delta.extra_keywords);
+
+  return base;
+}
+
 // Detect special intent like "most used Polish voices", "najczęściej używane polskie głosy"
 function detectSpecialIntent(userText, plan) {
   const lower = (userText || '').toLowerCase();
@@ -1691,7 +1737,45 @@ app.event('app_mention', async ({ event, client }) => {
       return;
     }
 
-    // If it doesn't look like a follow-up filter → treat as a brand new search
+    // Refinement flow: merge new hints into the existing keyword plan
+    try {
+      const refinedPlan = await refineKeywordPlanFromFollowUp(
+        JSON.parse(JSON.stringify(existing.keywordPlan || {})),
+        cleaned
+      );
+      const combinedQuery = [existing.originalQuery || '', cleaned].join(' ').trim();
+      const voices = await fetchVoicesByKeywords(refinedPlan, combinedQuery);
+      if (!voices.length) {
+        const labels = getLabels();
+        const noResText = await translateForUserLanguage(labels.noResults, existing.uiLanguage);
+        await client.chat.postMessage({
+          channel: event.channel,
+          thread_ts: threadTs,
+          text: noResText
+        });
+        return;
+      }
+      const ranked = await rankVoicesWithGPT(combinedQuery, refinedPlan, voices);
+      existing.keywordPlan = refinedPlan;
+      existing.originalQuery = combinedQuery;
+      existing.voices = voices;
+      existing.ranking = ranked.scoreMap;
+      existing.lastActive = Date.now();
+
+      let msg = buildMessageFromSession(existing);
+      msg = await translateForUserLanguage(msg, existing.uiLanguage);
+      const blocks = buildBlocksFromText(msg);
+      await client.chat.postMessage({
+        channel: event.channel,
+        thread_ts: threadTs,
+        text: msg,
+        blocks: blocks || undefined
+      });
+      return;
+    } catch (e) {
+      safeLogAxiosError('refineKeywordPlanFromFollowUp', e);
+      // fallthrough to new search as last resort
+    }
   }
 
   await handleNewSearch(event, cleaned, threadTs, client);
