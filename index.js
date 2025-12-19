@@ -1,10 +1,10 @@
 const { App } = require('@slack/bolt');
 const axios = require('axios');
 
-// Prosta "pamięć": wątek Slacka -> ostatnie wyniki wyszukiwania + preferencje
+// Simple in-memory cache: Slack thread -> last search results and filters
 const sessions = {};
 
-// Inicjalizacja Bolt w Socket Mode
+// Initialize Bolt in Socket Mode
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   signingSecret: process.env.SLACK_SIGNING_SECRET,
@@ -12,21 +12,21 @@ const app = new App({
   appToken: process.env.SLACK_APP_TOKEN,
 });
 
-// Usuwamy z tekstu mention typu <@U123ABC>
+// Remove Slack mentions like <@U123ABC> from the text
 function cleanText(text) {
   if (!text) return '';
   return text.replace(/<@[^>]+>/g, '').trim();
 }
 
-// Bardzo proste zgadywanie PL / EN z treści
+// Naive detection of PL vs EN based on the message content
 function guessUiLanguageFromText(text) {
   if (!text) return 'en';
   const lower = text.toLowerCase();
 
-  // kilka znaków diakrytycznych PL
+  // Polish diacritics
   if (/[ąćęłńóśżź]/.test(lower)) return 'pl';
 
-  // słowa-klucze PL
+  // Some common Polish words
   if (lower.includes('głos') || lower.includes('glos') || lower.includes('szukam')) {
     return 'pl';
   }
@@ -34,7 +34,7 @@ function guessUiLanguageFromText(text) {
   return 'en';
 }
 
-// Teksty interfejsu (PL / EN)
+// UI messages in PL / EN
 function getMessages(uiLang) {
   if (uiLang === 'pl') {
     return {
@@ -42,7 +42,7 @@ function getMessages(uiLang) {
       noResults:
         'Niestety nie znalazłem żadnych głosów pasujących do tego opisu 😕\n' +
         'Spróbuj opisać głos trochę szerzej albo użyj innego słowa.',
-      headerWithQuery: (q) => `Opis użytkownika: _${q}_\nProponowane głosy:\n`,
+      suggestionsHeader: 'Proponowane głosy:\n',
       standardSectionTitle: '*Głosy standardowe (nie oznaczone jako high quality):*',
       highQualitySectionTitle: '*Głosy oznaczone jako high quality:*',
       femaleTitle: 'Damskie:',
@@ -74,13 +74,13 @@ function getMessages(uiLang) {
     };
   }
 
-  // Domyślnie EN
+  // Default EN
   return {
     searching: 'Got it, searching the Voice Library for matching voices 🔍',
     noResults:
       "I couldn't find any voices matching this description 😕\n" +
       'Try describing the voice a bit more broadly or using a different wording.',
-    headerWithQuery: (q) => `User description: _${q}_\nSuggested voices:\n`,
+    suggestionsHeader: 'Suggested voices:\n',
     standardSectionTitle: '*Standard voices (not marked as high quality):*',
     highQualitySectionTitle: '*High quality voices:*',
     femaleTitle: 'Female:',
@@ -112,7 +112,49 @@ function getMessages(uiLang) {
   };
 }
 
-// 1. LLM: z naturalnego tekstu robi JSON filtrów do Voice Library
+// Infer quality preference ("any" | "high_only" | "no_high") from raw user text
+function inferQualityFromText(text) {
+  const lower = (text || '').toLowerCase();
+
+  // explicit "without high quality"
+  if (
+    lower.includes('bez high quality') ||
+    lower.includes('without high quality') ||
+    lower.includes('no high quality') ||
+    lower.includes('not high quality')
+  ) {
+    return 'no_high';
+  }
+
+  // explicit request for ONLY high quality
+  if (
+    (lower.includes('high quality') || lower.includes('high-quality') || lower.includes('hq')) &&
+    (lower.includes('only') ||
+      lower.includes('tylko') ||
+      lower.includes('just') ||
+      lower.includes('wyłącznie') ||
+      lower.includes('wylacznie'))
+  ) {
+    return 'high_only';
+  }
+
+  // phrases like "high quality voice", "głos najwyższej jakości" → treat as high_only
+  if (
+    lower.includes('high quality voice') ||
+    lower.includes('high-quality voice') ||
+    lower.includes('głos high quality') ||
+    lower.includes('glos high quality') ||
+    lower.includes('wysokiej jakości') ||
+    lower.includes('najwyższej jakości') ||
+    lower.includes('najwyzszej jakosci')
+  ) {
+    return 'high_only';
+  }
+
+  return 'any';
+}
+
+// 1. LLM: from natural language description to JSON filters for Voice Library
 async function parseQueryWithLLM(userText) {
   const instructions = `
 You are an assistant that takes natural language descriptions of voices (in ANY language)
@@ -128,12 +170,7 @@ The JSON MUST have exactly these fields:
   "gender": string or null,          // "male", "female", or null if not specified
   "descriptives": string[],          // 0-5 short English adjectives, lowercase (e.g. ["calm","confident"])
   "use_cases": string[],             // 0-5 short English tags, lowercase (e.g. ["agent","narration"])
-  "search": string,                  // short English search text summarizing the voice request
-  "quality": "any" | "high_only" | "no_high", // "high_only" if the user clearly wants only high quality voices,
-                                              // "no_high" if the user clearly excludes high quality voices,
-                                              // otherwise "any"
-  "response_language": string        // 2-letter code of the language the USER is using in the message (e.g. "en", "pl", "zh").
-                                     // If you are not sure, default to "en".
+  "search": string                   // short English search text summarizing the voice request
 }
 `.trim();
 
@@ -168,8 +205,6 @@ The JSON MUST have exactly these fields:
       descriptives: Array.isArray(parsed.descriptives) ? parsed.descriptives : [],
       use_cases: Array.isArray(parsed.use_cases) ? parsed.use_cases : [],
       search: parsed.search || userText,
-      quality: parsed.quality || 'any',
-      response_language: parsed.response_language || guessUiLanguageFromText(userText),
     };
   } catch (e) {
     console.error('JSON parse error from LLM, falling back to simple filters:', e);
@@ -180,44 +215,29 @@ The JSON MUST have exactly these fields:
       descriptives: [],
       use_cases: [],
       search: userText,
-      quality: 'any',
-      response_language: guessUiLanguageFromText(userText),
     };
   }
 }
 
-// 2. Budowanie parametrów do GET /v1/shared-voices
+// 2. Build query params for GET /v1/shared-voices
 function buildSharedVoicesParams(filters) {
   const params = new URLSearchParams();
-  params.set('page_size', '30'); // trochę więcej wyników, potem i tak tnijmy w odpowiedzi
+  params.set('page_size', '30'); // a bit more; we'll cut in Slack reply
 
   if (filters.language) params.set('language', filters.language);
   if (filters.accent) params.set('accent', filters.accent);
   if (filters.gender) params.set('gender', filters.gender);
   if (filters.search) params.set('search', filters.search);
 
-  // useCases & descriptives - jako wielokrotne parametry
-  if (Array.isArray(filters.use_cases)) {
-    filters.use_cases.forEach((uc) => {
-      if (uc) params.append('useCases', uc);
-    });
-  }
-  if (Array.isArray(filters.descriptives)) {
-    filters.descriptives.forEach((d) => {
-      if (d) params.append('descriptives', d);
-    });
-  }
-
-  // quality: jeśli tylko high quality, użyjemy filtra po category
+  // quality: if only high quality, use category filter
   if (filters.quality === 'high_only') {
-    // Zakładamy, że Voice Library używa category=high_quality do filtrowania HQ voices
     params.set('category', 'high_quality');
   }
 
   return params;
 }
 
-// 3. Zapytanie do ElevenLabs Voice Library: /v1/shared-voices
+// 3. Call ElevenLabs Voice Library: /v1/shared-voices
 async function searchSharedVoices(filters) {
   const params = buildSharedVoicesParams(filters);
 
@@ -233,7 +253,7 @@ async function searchSharedVoices(filters) {
 
   let voices = res.data.voices || [];
 
-  // Jeśli użytkownik chciał WYKLUCZYĆ high quality, filtrujemy po stronie klienta
+  // If user explicitly wants to exclude high quality, filter client-side
   if (filters.quality === 'no_high') {
     voices = voices.filter((v) => !isHighQuality(v));
   }
@@ -241,14 +261,47 @@ async function searchSharedVoices(filters) {
   return voices;
 }
 
-// Pomocnicze: wykrywanie high quality z obiektu voice
+// 3b. Search with a simple fallback: relax accent/gender/search if nothing found
+async function searchSharedVoicesWithFallback(filters) {
+  // Try with full filters first
+  let voices = await searchSharedVoices(filters);
+  if (voices.length) {
+    return { voices, usedFilters: filters };
+  }
+
+  // Relax accent and gender
+  const relaxed1 = {
+    ...filters,
+    accent: null,
+    gender: null,
+  };
+  voices = await searchSharedVoices(relaxed1);
+  if (voices.length) {
+    return { voices, usedFilters: relaxed1 };
+  }
+
+  // Relax search text as well (keep language if any)
+  const relaxed2 = {
+    ...relaxed1,
+    search: null,
+  };
+  voices = await searchSharedVoices(relaxed2);
+  if (voices.length) {
+    return { voices, usedFilters: relaxed2 };
+  }
+
+  // Nothing found at all
+  return { voices: [], usedFilters: filters };
+}
+
+// Helper: detect high quality from voice object
 function isHighQuality(voice) {
   if (!voice || typeof voice !== 'object') return false;
 
   const cat =
     (voice.category ||
       (voice.sharing && voice.sharing.category) ||
-      '').toLowerCase();
+      '').toString().toLowerCase();
 
   if (cat === 'high_quality' || cat === 'high quality') return true;
 
@@ -259,7 +312,6 @@ function isHighQuality(voice) {
     return true;
   }
 
-  // jeśli w labels jest jakiś flag typu "high_quality": true / "yes", też możemy to wykorzystać
   if (voice.labels && typeof voice.labels === 'object') {
     const labelHq = String(voice.labels.high_quality || '').toLowerCase();
     if (labelHq === 'true' || labelHq === 'yes' || labelHq === '1') return true;
@@ -268,7 +320,7 @@ function isHighQuality(voice) {
   return false;
 }
 
-// Podział głosów na standard/high_quality oraz płeć
+// Split voices into standard/high quality and by gender
 function splitVoicesByQualityAndGender(voices) {
   const groups = {
     standard: { female: [], male: [], other: [] },
@@ -296,7 +348,7 @@ function splitVoicesByQualityAndGender(voices) {
   return groups;
 }
 
-// Format jednej linijki z linkiem do Voice Library (search by voice_id)
+// One line of Slack output for a voice, linking to Voice Library search by voice_id
 function formatVoiceLine(voice, index) {
   const url = `https://elevenlabs.io/app/voice-library?search=${encodeURIComponent(
     voice.voice_id
@@ -304,9 +356,9 @@ function formatVoiceLine(voice, index) {
   return `${index}. <${url}|${voice.name} | ${voice.voice_id}>`;
 }
 
-// Budowanie tekstu odpowiedzi dla wyszukiwania
-function buildSearchResultText(cleanedQuery, split, filters, messages) {
-  let text = messages.headerWithQuery(cleanedQuery);
+// Build Slack message text for search results
+function buildSearchResultText(split, filters, messages) {
+  let text = messages.suggestionsHeader;
 
   const { standard, high } = split;
 
@@ -318,7 +370,7 @@ function buildSearchResultText(cleanedQuery, split, filters, messages) {
 
     const female = standard.female.slice(0, 5);
     const male = standard.male.slice(0, 5);
-    const other = standard.other.slice(0, 3); // mniej "innych", żeby nie zalać listy
+    const other = standard.other.slice(0, 3);
 
     if (!female.length && !male.length && !other.length) {
       text += messages.nothingInSection + '\n\n';
@@ -386,11 +438,11 @@ function buildSearchResultText(cleanedQuery, split, filters, messages) {
   return text;
 }
 
-// Prosta klasyfikacja follow-upów (bez LLM)
+// Very simple follow-up intent classifier (no LLM)
 function classifyFollowupIntent(text) {
-  const lower = text.toLowerCase();
+  const lower = (text || '').toLowerCase();
 
-  // języki
+  // language questions
   if (
     lower.includes('język') ||
     lower.includes('jezyk') ||
@@ -400,15 +452,15 @@ function classifyFollowupIntent(text) {
     return 'languages';
   }
 
-  // "tylko high quality", "show only high quality"
+  // "only high quality"
   if (
     (lower.includes('high quality') || lower.includes('high-quality')) &&
-    (lower.includes('tylko') || lower.includes('only'))
+    (lower.includes('only') || lower.includes('tylko'))
   ) {
     return 'rescope_high_only';
   }
 
-  // "bez high quality", "without high quality"
+  // "without high quality"
   if (
     lower.includes('bez high quality') ||
     lower.includes('without high quality') ||
@@ -417,17 +469,19 @@ function classifyFollowupIntent(text) {
     return 'rescope_no_high';
   }
 
-  // ogólne pytanie o HQ
+  // generic HQ question
   if (lower.includes('high quality') || lower.includes('high-quality')) {
     return 'which_are_high';
   }
 
-  // "więcej głosów", "more voices"
+  // "more voices"
   if (
     lower.includes('więcej') ||
     lower.includes('wiecej') ||
     lower.includes('more voices') ||
-    lower.includes('show more')
+    lower.includes('show more') ||
+    (lower.includes('tylko') && lower.includes('jeden')) ||
+    (lower.includes('only') && lower.includes('one'))
   ) {
     return 'more';
   }
@@ -435,7 +489,7 @@ function classifyFollowupIntent(text) {
   return 'unknown';
 }
 
-// Zliczanie języków z wyników
+// Count languages across voices (language + verified_languages)
 function summarizeLanguages(voices) {
   const langCount = {};
 
@@ -458,7 +512,7 @@ function summarizeLanguages(voices) {
   return langCount;
 }
 
-// 4. Obsługa eventu: ktoś pisze @voices-bot ...
+// 4. Event handler: someone mentions @voices-bot ...
 app.event('app_mention', async ({ event, client }) => {
   const rawText = event.text || '';
   const cleaned = cleanText(rawText);
@@ -466,7 +520,7 @@ app.event('app_mention', async ({ event, client }) => {
 
   const existingSession = sessions[threadTs];
 
-  // ------------------ FOLLOW-UP W TYM SAMYM WĄTKU ------------------
+  // ------------------ FOLLOW-UP IN THE SAME THREAD ------------------
   if (existingSession) {
     const uiLang = existingSession.uiLanguage || guessUiLanguageFromText(rawText);
     const messages = getMessages(uiLang);
@@ -538,7 +592,7 @@ app.event('app_mention', async ({ event, client }) => {
       });
 
       try {
-        const voices = await searchSharedVoices(newFilters);
+        const { voices, usedFilters } = await searchSharedVoicesWithFallback(newFilters);
         if (!voices.length) {
           await client.chat.postMessage({
             channel: event.channel,
@@ -551,17 +605,13 @@ app.event('app_mention', async ({ event, client }) => {
         const split = splitVoicesByQualityAndGender(voices);
 
         sessions[threadTs] = {
-          filters: newFilters,
+          filters: usedFilters,
           voices,
           uiLanguage: uiLang,
+          originalQuery: existingSession.originalQuery,
         };
 
-        const replyText = buildSearchResultText(
-          existingSession.originalQuery || cleaned,
-          split,
-          newFilters,
-          messages
-        );
+        const replyText = buildSearchResultText(split, usedFilters, messages);
 
         await client.chat.postMessage({
           channel: event.channel,
@@ -616,10 +666,9 @@ app.event('app_mention', async ({ event, client }) => {
     return;
   }
 
-  // ------------------ PIERWSZE WIADOMOŚĆ W WĄTKU → NOWE WYSZUKIWANIE ------------------
-  // UI language zgadujemy od razu, ale docelowo bierzemy z LLM
-  let uiLang = guessUiLanguageFromText(rawText);
-  let messages = getMessages(uiLang);
+  // ------------------ FIRST MESSAGE IN THREAD → NEW SEARCH ------------------
+  const uiLang = guessUiLanguageFromText(rawText);
+  const messages = getMessages(uiLang);
 
   await client.chat.postMessage({
     channel: event.channel,
@@ -628,13 +677,16 @@ app.event('app_mention', async ({ event, client }) => {
   });
 
   try {
-    // 1) LLM → filtry
-    const filters = await parseQueryWithLLM(cleaned);
-    uiLang = filters.response_language || uiLang;
-    messages = getMessages(uiLang);
+    // 1) LLM → semantic filters
+    const llmFilters = await parseQueryWithLLM(cleaned);
+    const quality = inferQualityFromText(rawText);
+    const filters = {
+      ...llmFilters,
+      quality,
+    };
 
-    // 2) ElevenLabs → lista głosów z Voice Library
-    const voices = await searchSharedVoices(filters);
+    // 2) ElevenLabs → voices (with simple fallback)
+    const { voices, usedFilters } = await searchSharedVoicesWithFallback(filters);
 
     if (!voices.length) {
       await client.chat.postMessage({
@@ -647,15 +699,15 @@ app.event('app_mention', async ({ event, client }) => {
 
     const split = splitVoicesByQualityAndGender(voices);
 
-    // zapamiętujemy wyniki do follow-upów
+    // remember results for follow-ups
     sessions[threadTs] = {
-      filters,
+      filters: usedFilters,
       voices,
       uiLanguage: uiLang,
       originalQuery: cleaned,
     };
 
-    const replyText = buildSearchResultText(cleaned, split, filters, messages);
+    const replyText = buildSearchResultText(split, usedFilters, messages);
 
     await client.chat.postMessage({
       channel: event.channel,
@@ -675,9 +727,9 @@ app.event('app_mention', async ({ event, client }) => {
   }
 });
 
-// Start aplikacji – w Socket Mode nie musimy wystawiać HTTP, ale na Render można użyć PORT
+// Start the app – on Render we still bind to PORT, even in Socket Mode
 (async () => {
   const port = process.env.PORT || 3000;
   await app.start(port);
-  console.log('⚡️ voices-bot działa na porcie ' + port);
+  console.log('⚡️ voices-bot is running on port ' + port);
 })();
