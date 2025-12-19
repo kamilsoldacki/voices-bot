@@ -71,7 +71,8 @@ function detectVoiceLanguageFromText(text) {
     lower.includes('polish') ||
     lower.includes('po polsku') ||
     lower.includes('polski głos') ||
-    lower.includes('polski glos')
+    lower.includes('polski glos') ||
+    lower.includes('polski')
   ) {
     return 'pl';
   }
@@ -190,7 +191,8 @@ function detectQualityPreferenceFromText(text) {
   return null;
 }
 
-// UI labels – EN only (all user-facing Slack text)
+// UI labels – EN only (all user-facing base text)
+// (then translated per userLanguage before sending)
 function getLabels() {
   return {
     searching:
@@ -361,6 +363,96 @@ function checkLanguagesIntent(lower) {
 
 function checkWhichHighIntent(lower) {
   return lower.includes('which') && lower.includes('high quality');
+}
+
+// Detect special intent like "most used Polish voices", "najczęściej używane polskie głosy"
+function detectSpecialIntent(userText, plan) {
+  const lower = (userText || '').toLowerCase();
+
+  const hasUsageKeyword =
+    lower.includes('most used') ||
+    lower.includes('most popular') ||
+    lower.includes('top used') ||
+    lower.includes('top voices') ||
+    lower.includes('top polish voices') ||
+    lower.includes('most frequently used') ||
+    lower.includes('najczęściej używan') ||
+    lower.includes('najczesciej uzywan') ||
+    lower.includes('najpopularniejsze');
+
+  if (!hasUsageKeyword) {
+    return { mode: 'generic', languageCode: null };
+  }
+
+  let languageCode = null;
+
+  if (plan && typeof plan.target_voice_language === 'string' && plan.target_voice_language.trim()) {
+    languageCode = plan.target_voice_language.trim().toLowerCase().slice(0, 2);
+  }
+
+  if (!languageCode) {
+    languageCode = detectVoiceLanguageFromText(userText);
+  }
+
+  if (!languageCode) {
+    return { mode: 'generic', languageCode: null };
+  }
+
+  return { mode: 'top_by_language', languageCode };
+}
+
+// -------------------------------------------------------------
+// Translation helper – output in user's language
+// -------------------------------------------------------------
+
+async function translateForUserLanguage(text, userLanguage) {
+  if (!text) return '';
+  if (!userLanguage) return text;
+
+  const lang = userLanguage.toString().toLowerCase().slice(0, 2);
+  if (lang === 'en') return text; // base text already in English
+
+  const systemPrompt = `
+You are a translation assistant.
+
+Task:
+- Translate the user's message into the target language with ISO code "${lang}".
+- Preserve Markdown structure (#, ##, **, -, etc.) and line breaks.
+- The text may contain Slack-style links in angle brackets, e.g.:
+  <https://elevenlabs.io/app/voice-library?search=ID|Name | ID>
+- DO NOT modify anything between '<' and '>' characters.
+  Treat the entire <...> block as opaque and copy it exactly.
+- Do not add explanations or comments. Return ONLY the translated text.
+`.trim();
+
+  const payload = {
+    model: 'gpt-4.1-mini',
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: text }
+    ],
+    temperature: 0
+  };
+
+  try {
+    const response = await axios.post(
+      'https://api.openai.com/v1/chat/completions',
+      payload,
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 20000
+      }
+    );
+
+    const content = response.data.choices[0].message.content;
+    return content || text;
+  } catch (err) {
+    console.error('Translation failed, returning original English text.', err.message || err);
+    return text;
+  }
 }
 
 // -------------------------------------------------------------
@@ -618,7 +710,7 @@ async function fetchVoicesByKeywords(plan, userText) {
     }
   }
 
-  // 2) fallback: if nothing found at all
+  // 2) fallback: if nothing found at all, try a combined-search query
   if (seen.size === 0) {
     const params = new URLSearchParams();
     params.set('page_size', '80');
@@ -653,7 +745,37 @@ async function fetchVoicesByKeywords(plan, userText) {
     }
   }
 
-  // 3) convert map -> list, attach matched_keywords
+  // 3) broad fallback: if STILL nothing, fetch by language/accent only (no search)
+  if (seen.size === 0) {
+    const params = new URLSearchParams();
+    params.set('page_size', '100');
+    if (language) params.set('language', language);
+    if (accent) params.set('accent', accent);
+    if (gender) params.set('gender', gender);
+    if (qualityPref === 'high_only') {
+      params.set('category', 'high_quality');
+    }
+
+    try {
+      const broadVoices = await callSharedVoices(params);
+      broadVoices.forEach((voice) => {
+        if (!voice || !voice.voice_id) return;
+        if (!seen.has(voice.voice_id)) {
+          seen.set(voice.voice_id, {
+            voice,
+            matchedKeywords: new Set()
+          });
+        }
+      });
+    } catch (err) {
+      console.error(
+        'Error in broad fallback fetchVoicesByKeywords:',
+        err.message || err
+      );
+    }
+  }
+
+  // 4) convert map -> list, attach matched_keywords
   let voices = Array.from(seen.values()).map((entry) => {
     const v = entry.voice;
     v._matched_keywords = Array.from(entry.matchedKeywords || []);
@@ -678,6 +800,44 @@ async function fetchVoicesByKeywords(plan, userText) {
   }
 
   return voices;
+}
+
+// Special mode: "top by language" – most used voices in a given language
+async function fetchTopVoicesByLanguage(languageCode, qualityPreference) {
+  const XI_KEY = process.env.ELEVENLABS_API_KEY;
+
+  try {
+    const params = new URLSearchParams();
+    params.set('page_size', '100');
+    if (languageCode) params.set('language', languageCode);
+    if (qualityPreference === 'high_only') {
+      params.set('category', 'high_quality');
+    }
+
+    const url = `https://api.elevenlabs.io/v1/shared-voices?${params.toString()}`;
+
+    const res = await axios.get(url, {
+      headers: {
+        'xi-api-key': XI_KEY,
+        'Content-Type': 'application/json'
+      },
+      timeout: 10000
+    });
+
+    let voices = res.data.voices || [];
+    if (!voices.length) return [];
+
+    voices.sort((a, b) => {
+      const ua = a.usage_character_count_1y || a.usage_character_count_7d || 0;
+      const ub = b.usage_character_count_1y || b.usage_character_count_7d || 0;
+      return ub - ua;
+    });
+
+    return voices.slice(0, 80);
+  } catch (err) {
+    console.error('Error in fetchTopVoicesByLanguage:', err.message || err);
+    return [];
+  }
 }
 
 // -------------------------------------------------------------
@@ -1006,31 +1166,86 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
     const keywordPlan = await buildKeywordPlan(cleaned);
     const labels = getLabels();
 
+    let uiLang =
+      (keywordPlan.user_interface_language ||
+        guessUiLanguageFromText(cleaned) ||
+        'en')
+        .toString()
+        .slice(0, 2)
+        .toLowerCase();
+
+    const searchingText = await translateForUserLanguage(labels.searching, uiLang);
+
     await client.chat.postMessage({
       channel: event.channel,
       thread_ts: threadTs,
-      text: labels.searching
+      text: searchingText
     });
 
-    const voices = await fetchVoicesByKeywords(keywordPlan, cleaned);
+    const special = detectSpecialIntent(cleaned, keywordPlan);
 
-    if (!voices.length) {
-      await client.chat.postMessage({
-        channel: event.channel,
-        thread_ts: threadTs,
-        text: labels.noResults
-      });
-      return;
+    let voices;
+    let rankingMap;
+
+    if (special.mode === 'top_by_language' && special.languageCode) {
+      // "most used Polish voices" mode – sort by usage
+      voices = await fetchTopVoicesByLanguage(
+        special.languageCode,
+        keywordPlan.quality_preference
+      );
+
+      if (!voices.length) {
+        const noResText = await translateForUserLanguage(labels.noResults, uiLang);
+        await client.chat.postMessage({
+          channel: event.channel,
+          thread_ts: threadTs,
+          text: noResText
+        });
+        return;
+      }
+
+      const maxUsage = voices.reduce((max, v) => {
+        const u = v.usage_character_count_1y || v.usage_character_count_7d || 0;
+        return u > max ? u : max;
+      }, 0);
+
+      rankingMap = {};
+      if (maxUsage > 0) {
+        voices.forEach((v) => {
+          const u = v.usage_character_count_1y || v.usage_character_count_7d || 0;
+          rankingMap[v.voice_id] = u / maxUsage;
+        });
+      } else {
+        voices.forEach((v, idx) => {
+          rankingMap[v.voice_id] =
+            (voices.length - idx) / Math.max(voices.length, 1);
+        });
+      }
+    } else {
+      // normal mode – keyword-based search + GPT curator ranking
+      voices = await fetchVoicesByKeywords(keywordPlan, cleaned);
+
+      if (!voices.length) {
+        const noResText = await translateForUserLanguage(labels.noResults, uiLang);
+        await client.chat.postMessage({
+          channel: event.channel,
+          thread_ts: threadTs,
+          text: noResText
+        });
+        return;
+      }
+
+      const ranked = await rankVoicesWithGPT(cleaned, keywordPlan, voices);
+      rankingMap = ranked.scoreMap;
+      uiLang = ranked.userLanguage || uiLang;
     }
-
-    const ranked = await rankVoicesWithGPT(cleaned, keywordPlan, voices);
 
     const session = {
       originalQuery: cleaned,
       keywordPlan,
       voices,
-      ranking: ranked.scoreMap,
-      uiLanguage: ranked.userLanguage,
+      ranking: rankingMap,
+      uiLanguage: uiLang,
       filters: {
         quality: keywordPlan.quality_preference || 'any',
         gender: 'any',
@@ -1040,7 +1255,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
 
     sessions[threadTs] = session;
 
-    const message = buildMessageFromSession(session);
+    let message = buildMessageFromSession(session);
+    message = await translateForUserLanguage(message, session.uiLanguage);
 
     await client.chat.postMessage({
       channel: event.channel,
@@ -1050,10 +1266,12 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
   } catch (error) {
     console.error('Error in handleNewSearch:', error);
     const labels = getLabels();
+    const uiLang = guessUiLanguageFromText(cleaned);
+    const errText = await translateForUserLanguage(labels.genericError, uiLang);
     await client.chat.postMessage({
       channel: event.channel,
       thread_ts: threadTs,
-      text: labels.genericError
+      text: errText
     });
   }
 }
@@ -1084,7 +1302,8 @@ app.event('app_mention', async ({ event, client }) => {
     const filtersChanged = applyFilterChangesFromText(existing, lower);
 
     if (wantsLanguages) {
-      const msg = buildLanguagesMessage(existing);
+      let msg = buildLanguagesMessage(existing);
+      msg = await translateForUserLanguage(msg, existing.uiLanguage);
       await client.chat.postMessage({
         channel: event.channel,
         thread_ts: threadTs,
@@ -1094,7 +1313,8 @@ app.event('app_mention', async ({ event, client }) => {
     }
 
     if (wantsWhichHigh) {
-      const msg = buildWhichHighMessage(existing);
+      let msg = buildWhichHighMessage(existing);
+      msg = await translateForUserLanguage(msg, existing.uiLanguage);
       await client.chat.postMessage({
         channel: event.channel,
         thread_ts: threadTs,
@@ -1104,7 +1324,8 @@ app.event('app_mention', async ({ event, client }) => {
     }
 
     if (filtersChanged) {
-      const msg = buildMessageFromSession(existing);
+      let msg = buildMessageFromSession(existing);
+      msg = await translateForUserLanguage(msg, existing.uiLanguage);
       await client.chat.postMessage({
         channel: event.channel,
         thread_ts: threadTs,
