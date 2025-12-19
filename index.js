@@ -771,9 +771,8 @@ IMPORTANT:
     const content = response.data.choices[0].message.content;
     let plan = JSON.parse(content);
 
-    if (!plan.user_interface_language || typeof plan.user_interface_language !== 'string') {
-      plan.user_interface_language = guessUiLanguageFromText(userText);
-    }
+    // Always derive UI language from the user's message (deterministic)
+    plan.user_interface_language = guessUiLanguageFromText(userText);
 
     if (!plan.target_voice_language) {
       const inferredLang = detectVoiceLanguageFromText(userText);
@@ -1516,12 +1515,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
     const labels = getLabels();
 
     let uiLang =
-      (keywordPlan.user_interface_language ||
-        guessUiLanguageFromText(cleaned) ||
-        'en')
-        .toString()
-        .slice(0, 2)
-        .toLowerCase();
+      (guessUiLanguageFromText(cleaned) || 'en').toString().slice(0, 2).toLowerCase();
 
     const searchingText = await translateForUserLanguage(labels.searching, uiLang);
 
@@ -1586,7 +1580,6 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
 
       const ranked = await rankVoicesWithGPT(cleaned, keywordPlan, voices);
       rankingMap = ranked.scoreMap;
-      uiLang = ranked.userLanguage || uiLang;
     }
 
     const session = {
