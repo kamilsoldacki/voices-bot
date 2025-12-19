@@ -4,7 +4,7 @@ const axios = require('axios');
 // Simple in-memory session store: Slack thread -> last search context
 const sessions = {};
 
-// Clean Slack mentions like <@U123ABC> from the message
+// Remove Slack mentions like <@U123ABC> from the message
 function cleanText(text) {
   if (!text) return '';
   return text.replace(/<@[^>]+>/g, '').trim();
@@ -13,8 +13,49 @@ function cleanText(text) {
 // Detect whether a voice should be treated as "high quality"
 function isHighQuality(voice) {
   if (!voice || typeof voice !== 'object') return false;
+
+  // 1) Direct category flag
   const cat = (voice.category || '').toString().toLowerCase();
-  return cat === 'high_quality' || cat === 'high quality';
+  if (cat === 'high_quality' || cat === 'high quality') return true;
+
+  // 2) Some APIs may nest category under sharing
+  if (voice.sharing && typeof voice.sharing === 'object') {
+    const sharingCat = (voice.sharing.category || '').toString().toLowerCase();
+    if (sharingCat === 'high_quality' || sharingCat === 'high quality') {
+      return true;
+    }
+  }
+
+  // 3) Official "high quality base models" flag from the docs
+  // If this list exists and is non-empty, we treat the voice as high quality.
+  if (
+    Array.isArray(voice.high_quality_base_model_ids) &&
+    voice.high_quality_base_model_ids.length > 0
+  ) {
+    return true;
+  }
+
+  // 4) Labels that explicitly mark a voice as high quality
+  if (voice.labels && typeof voice.labels === 'object') {
+    const labelHq = String(voice.labels.high_quality || '').toLowerCase();
+    if (labelHq === 'true' || labelHq === 'yes' || labelHq === '1') {
+      return true;
+    }
+  }
+
+  if (
+    voice.sharing &&
+    typeof voice.sharing === 'object' &&
+    voice.sharing.labels &&
+    typeof voice.sharing.labels === 'object'
+  ) {
+    const labelHq = String(voice.sharing.labels.high_quality || '').toLowerCase();
+    if (labelHq === 'true' || labelHq === 'yes' || labelHq === '1') {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 // Build a semantic search plan using GPT
@@ -134,54 +175,43 @@ GUIDELINES:
   }
 }
 
-// Fetch candidate voices from ElevenLabs Voice Library using the search plan
+// Fetch candidate voices from ElevenLabs Voice Library using a robust multi-step strategy
 async function fetchVoicesForSearchPlan(plan) {
-  const baseParams = new URLSearchParams();
-  baseParams.set('page_size', '50');
-
-  if (plan.target_voice_language) baseParams.set('language', plan.target_voice_language);
-  if (plan.target_accent) baseParams.set('accent', plan.target_accent);
-  if (plan.target_gender && plan.target_gender !== 'neutral') {
-    baseParams.set('gender', plan.target_gender);
-  }
-
-  // Only high quality -> filter by category at the API level
-  if (plan.quality_preference === 'high_only') {
-    baseParams.set('category', 'high_quality');
-  }
-
-  if (Array.isArray(plan.use_cases)) {
-    for (const u of plan.use_cases) {
-      if (u) baseParams.append('use_cases', u);
-    }
-  }
-
-  if (Array.isArray(plan.tone_descriptors)) {
-    for (const d of plan.tone_descriptors) {
-      if (d) baseParams.append('descriptives', d);
-    }
-  }
-
   const seen = new Set();
   let voices = [];
+
+  const wantsHighOnly = plan.quality_preference === 'high_only';
+  const wantsNoHigh = plan.quality_preference === 'no_high';
+
+  // Normalize values for API
+  let language = null;
+  if (plan.target_voice_language && typeof plan.target_voice_language === 'string') {
+    language = plan.target_voice_language.slice(0, 2).toLowerCase();
+  }
+
+  let accent = null;
+  if (plan.target_accent && typeof plan.target_accent === 'string') {
+    accent = plan.target_accent.toLowerCase();
+  }
+
+  let gender = null;
+  if (plan.target_gender === 'male' || plan.target_gender === 'female') {
+    gender = plan.target_gender;
+  }
 
   const queries =
     Array.isArray(plan.search_queries) && plan.search_queries.length
       ? plan.search_queries.slice(0, 5)
       : [null];
 
-  for (const q of queries) {
-    const params = new URLSearchParams(baseParams);
+  const XI_KEY = process.env.ELEVENLABS_API_KEY;
 
-    if (q && q.toString().trim().length > 0) {
-      params.set('search', q.toString().trim());
-    }
-
+  async function callSharedVoices(params) {
     const url = `https://api.elevenlabs.io/v1/shared-voices?${params.toString()}`;
 
     const res = await axios.get(url, {
       headers: {
-        'xi-api-key': process.env.ELEVENLABS_API_KEY,
+        'xi-api-key': XI_KEY,
         'Content-Type': 'application/json'
       },
       timeout: 10000
@@ -194,23 +224,92 @@ async function fetchVoicesForSearchPlan(plan) {
         voices.push(v);
       }
     }
-
-    // Avoid grabbing huge amounts
-    if (voices.length >= 60) break;
-    if (!res.data.has_more) break;
   }
 
-  // If user explicitly wants no high quality voices, filter client-side
-  if (plan.quality_preference === 'no_high') {
-    voices = voices.filter(v => !isHighQuality(v));
+  function buildParams({ page_size, withLanguage, withAccent, withGender, search }) {
+    const params = new URLSearchParams();
+    params.set('page_size', String(page_size || 30));
+
+    if (withLanguage && language) params.set('language', language);
+    if (withAccent && accent) params.set('accent', accent);
+    if (withGender && gender) params.set('gender', gender);
+
+    if (search && String(search).trim().length > 0) {
+      params.set('search', String(search).trim());
+    }
+
+    return params;
   }
 
-  return voices;
+  // STEP 1: Narrow fuzzy search using search queries + language/accent/gender (if available)
+  for (const q of queries) {
+    const params = buildParams({
+      page_size: 30,
+      withLanguage: !!language,
+      withAccent: !!accent,
+      withGender: !!gender,
+      search: q
+    });
+
+    try {
+      await callSharedVoices(params);
+    } catch (err) {
+      console.error('Error calling shared voices (step 1):', err.message || err);
+    }
+
+    if (voices.length >= 30) break;
+  }
+
+  // STEP 2: If we still have few voices and we know the language, fetch a broad sample of ALL voices in that language
+  if (voices.length < 20 && language) {
+    const params = buildParams({
+      page_size: 100,
+      withLanguage: true,
+      withAccent: false,
+      withGender: false
+    });
+
+    try {
+      await callSharedVoices(params);
+    } catch (err) {
+      console.error('Error calling shared voices (step 2):', err.message || err);
+    }
+  }
+
+  // STEP 3: If STILL very few voices, fall back to a general sample of the library
+  if (voices.length < 10) {
+    const params = buildParams({
+      page_size: 100,
+      withLanguage: false,
+      withAccent: false,
+      withGender: false
+    });
+
+    try {
+      await callSharedVoices(params);
+    } catch (err) {
+      console.error('Error calling shared voices (step 3):', err.message || err);
+    }
+  }
+
+  // Apply high quality filters AFTER collecting broad candidates
+  let result = voices;
+
+  if (wantsHighOnly) {
+    const onlyHigh = voices.filter(isHighQuality);
+    // If filtering leaves us with nothing, fall back to unfiltered
+    if (onlyHigh.length) result = onlyHigh;
+  } else if (wantsNoHigh) {
+    const onlyStandard = voices.filter(v => !isHighQuality(v));
+    if (onlyStandard.length) result = onlyStandard;
+  }
+
+  return result;
 }
 
 // Ask GPT to act as a "voice curator" on top of the candidate voices
 async function curateVoicesWithGPT(userText, plan, voices) {
-  const candidates = voices.slice(0, 40).map(v => ({
+  const candidates = voices.slice(0, 80).map(v => ({
     voice_id: v.voice_id,
     name: v.name,
     language: v.language,
@@ -224,7 +323,8 @@ async function curateVoicesWithGPT(userText, plan, voices) {
     cloned_by_count: v.cloned_by_count,
     featured: v.featured,
     description: v.description,
-    verified_languages: v.verified_languages
+    verified_languages: v.verified_languages,
+    high_quality_base_model_ids: v.high_quality_base_model_ids
   }));
 
   const systemPrompt = `
@@ -238,7 +338,7 @@ You receive:
 Your job:
 
 1. From candidate_voices, select and order the BEST matches for the user's request.
-   - Match on language, accent, gender, use_case, descriptive, age, category.
+   - Match on language, accent, gender, use_case, descriptive, age, category, and verified_languages.
    - Use popularity signals as tie-breakers: usage_character_count_1y, cloned_by_count, featured.
    - Never invent new voices. Use ONLY the provided candidate_voices.
 
@@ -246,15 +346,24 @@ Your job:
    - "Standard voices (not high quality)"
    - "High quality voices"
 
-   Treat voices as "high quality" when their category is "high_quality" (case-insensitive).
-   All others are "standard voices".
+   Treat voices as "high quality" when they either:
+   - have category "high_quality" (case-insensitive), OR
+   - have a non-empty high_quality_base_model_ids list, OR
+   - are otherwise clearly described as high quality in their metadata.
+
+   All other voices are "standard voices".
 
 3. Inside each of those sections, group voices by gender:
    - "Female:"
    - "Male:"
    - "Other / unspecified:"
 
-4. Within each gender subgroup, output up to 5 voices.
+4. Normally, within each gender subgroup, output up to 5 voices.
+   HOWEVER:
+   - If the user explicitly asks to "list all" voices of a certain type
+     (e.g. "list all", "show all", "wymień wszystkie głosy"),
+     you may output all matching voices from candidate_voices, up to about 50 total,
+     instead of enforcing the "up to 5 per subgroup" rule.
 
 5. For each voice, output ONE bullet line in this EXACT Slack format:
    - "- <https://elevenlabs.io/app/voice-library?search=VOICE_ID|NAME | VOICE_ID>"
@@ -262,6 +371,8 @@ Your job:
    Where:
    - VOICE_ID is the voice_id from the candidate object,
    - NAME is the voice's name.
+
+   Do NOT wrap the whole line in quotes. Do NOT add extra hyphens inside the bullet prefix.
 
 6. If a section has no voices, you MUST still output the section header and a line:
    - "_No voices in this section._"
@@ -334,7 +445,7 @@ VERY IMPORTANT:
     if (!standard.length) {
       text += '_No voices in this section._\n\n';
     } else {
-      standard.slice(0, 10).forEach((v, i) => {
+      standard.slice(0, 20).forEach((v, i) => {
         text += formatLine(v, i + 1) + '\n';
       });
       text += '\n';
@@ -344,7 +455,7 @@ VERY IMPORTANT:
     if (!high.length) {
       text += '_No voices in this section._\n\n';
     } else {
-      high.slice(0, 10).forEach((v, i) => {
+      high.slice(0, 20).forEach((v, i) => {
         text += formatLine(v, i + 1) + '\n';
       });
       text += '\n';
@@ -373,7 +484,7 @@ app.event('app_mention', async ({ event, client }) => {
 
   const existing = sessions[threadTs];
 
-  // If there is already a session in this thread, treat this as a follow-up
+  // If there is already a session in this thread, treat this as extra context for the search
   const combinedText = existing
     ? `${existing.originalQuery}\n\nUser follow-up:\n${cleaned}`
     : cleaned;
@@ -389,7 +500,7 @@ app.event('app_mention', async ({ event, client }) => {
     // 1) Build search plan with GPT (uses the whole conversation context in this thread)
     const searchPlan = await buildSearchPlan(combinedText);
 
-    // 2) Fetch candidate voices from ElevenLabs Voice Library
+    // 2) Fetch candidate voices from ElevenLabs Voice Library (with multi-step fallback)
     const voices = await fetchVoicesForSearchPlan(searchPlan);
 
     if (!voices.length) {
