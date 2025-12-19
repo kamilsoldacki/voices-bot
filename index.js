@@ -5,10 +5,102 @@ const axios = require('axios');
 // In-memory conversation sessions (per Slack thread)
 // -------------------------------------------------------------
 const sessions = {};
+const recentRequests = new Map();
+const REQUEST_DEDUP_TTL_MS = 15000;
+const SESSION_TTL_MS = 45 * 60 * 1000; // 45 minutes
+const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const KEYWORD_SEARCH_CONCURRENCY = 4; // limit concurrent keyword searches
 
 // -------------------------------------------------------------
 // Small helpers
 // -------------------------------------------------------------
+
+function validateEnvOrExit() {
+  const required = [
+    'OPENAI_API_KEY',
+    'ELEVENLABS_API_KEY',
+    'SLACK_BOT_TOKEN',
+    'SLACK_SIGNING_SECRET',
+    'SLACK_APP_TOKEN'
+  ];
+  const missing = required.filter((k) => !process.env[k] || String(process.env[k]).trim() === '');
+  if (missing.length) {
+    console.error(
+      'Missing required environment variables: ' + missing.join(', ') + '. Exiting.'
+    );
+    process.exit(1);
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableError(err) {
+  try {
+    const status = err?.response?.status;
+    if (status === 429) return true;
+    if (status >= 500 && status < 600) return true;
+  } catch (_) {}
+  const code = err?.code;
+  const retryableCodes = new Set([
+    'ECONNRESET',
+    'ETIMEDOUT',
+    'EAI_AGAIN',
+    'ENOTFOUND',
+    'ECONNABORTED'
+  ]);
+  if (retryableCodes.has(code)) return true;
+  return false;
+}
+
+async function withRetry(fn, options = {}) {
+  const attempts = options.attempts || 3;
+  const baseDelayMs = options.baseDelayMs || 300;
+  const maxDelayMs = options.maxDelayMs || 3000;
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (i === attempts - 1 || !isRetryableError(err)) {
+        throw err;
+      }
+      const jitter = Math.random() * 200;
+      const delay = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, i)) + jitter;
+      await sleep(delay);
+    }
+  }
+  throw lastErr;
+}
+
+async function httpGetWithRetry(url, config) {
+  return withRetry(async () => {
+    const res = await axios.get(url, config);
+    return res;
+  });
+}
+
+async function httpPostWithRetry(url, data, config) {
+  return withRetry(async () => {
+    const res = await axios.post(url, data, config);
+    return res;
+  });
+}
+
+function isDuplicateRequest(threadTs, cleaned) {
+  try {
+    const key = `${threadTs}|${(cleaned || '').toLowerCase()}`;
+    const now = Date.now();
+    const prev = recentRequests.get(key);
+    if (prev && now - prev < REQUEST_DEDUP_TTL_MS) return true;
+    recentRequests.set(key, now);
+    return false;
+  } catch (_) {
+    return false;
+  }
+}
 
 function safeLogAxiosError(context, err) {
   try {
@@ -31,10 +123,36 @@ function safeLogAxiosError(context, err) {
   }
 }
 
+function startMemoryCleanup() {
+  setInterval(() => {
+    const now = Date.now();
+    // Clean sessions by lastActive
+    for (const [ts, session] of Object.entries(sessions)) {
+      try {
+        const last = session?.lastActive || 0;
+        if (now - last > SESSION_TTL_MS) {
+          delete sessions[ts];
+        }
+      } catch (_) {}
+    }
+    // Clean recentRequests older than TTL
+    try {
+      for (const [key, timestamp] of recentRequests.entries()) {
+        if (now - timestamp > REQUEST_DEDUP_TTL_MS) {
+          recentRequests.delete(key);
+        }
+      }
+    } catch (_) {}
+  }, CLEANUP_INTERVAL_MS);
+}
+
 function cleanText(text) {
   if (!text) return '';
   // remove Slack mentions like <@U123ABC>
-  return text.replace(/<@[^>]+>/g, '').trim();
+  return text
+    .replace(/<@[^>]+>/g, '')
+    .trim()
+    .replace(/^[\s,;:\-–—"“”'`]+/, '');
 }
 
 function isHighQuality(voice) {
@@ -195,7 +313,15 @@ function detectQualityPreferenceFromText(text) {
     lower.includes('high quality only') ||
     lower.includes('just high quality') ||
     lower.includes('hq only') ||
-    lower.includes('only hq')
+    lower.includes('only hq') ||
+    // Polish variations
+    lower.includes('tylko wysoka jakość') ||
+    lower.includes('tylko wysokiej jakości') ||
+    // separated tokens implying exclusivity
+    ((/\bonly\b/.test(lower) || /\btylko\b/.test(lower)) &&
+      (lower.includes('high quality') ||
+        lower.includes('wysokiej jakości') ||
+        lower.includes('wysoka jakość')))
   ) {
     return 'high_only';
   }
@@ -204,7 +330,10 @@ function detectQualityPreferenceFromText(text) {
     lower.includes('without high quality') ||
     lower.includes('no high quality') ||
     lower.includes('exclude high quality') ||
-    lower.includes('standard only')
+    lower.includes('standard only') ||
+    // Polish variants
+    lower.includes('bez wysokiej jakości') ||
+    lower.includes('bez wysokiej jakosci')
   ) {
     return 'no_high';
   }
@@ -253,7 +382,7 @@ function formatVoiceLine(voice) {
   const url = `https://elevenlabs.io/app/voice-library?search=${encodeURIComponent(
     voice.voice_id
   )}`;
-  return `<${url}|${voice.name} | ${voice.voice_id}>`;
+  return `<${url}|${voice.name}> \`${voice.voice_id}\``;
 }
 
 function detectListAll(text) {
@@ -379,11 +508,36 @@ function applyFilterChangesFromText(session, lower) {
 }
 
 function checkLanguagesIntent(lower) {
-  return lower.includes('language') || lower.includes('languages');
+  // EN
+  if (lower.includes('language') || lower.includes('languages')) return true;
+  // PL
+  if (
+    lower.includes('język') ||
+    lower.includes('jezyk') ||
+    lower.includes('języki') ||
+    lower.includes('jezyki')
+  )
+    return true;
+  // ES
+  if (lower.includes('idioma') || lower.includes('idiomas')) return true;
+  return false;
 }
 
 function checkWhichHighIntent(lower) {
-  return lower.includes('which') && lower.includes('high quality');
+  const hasWhich =
+    lower.includes('which') ||
+    lower.includes('które') ||
+    lower.includes('ktore') ||
+    lower.includes('cuáles') ||
+    lower.includes('cuales');
+  const hasHighQuality =
+    lower.includes('high quality') ||
+    lower.includes('hq') ||
+    lower.includes('wysokiej jakości') ||
+    lower.includes('wysoka jakosc') ||
+    lower.includes('wysokiej jakosci') ||
+    lower.includes('alta calidad');
+  return hasWhich && hasHighQuality;
 }
 
 // Detect special intent like "most used Polish voices", "najczęściej używane polskie głosy"
@@ -499,7 +653,7 @@ Task:
   };
 
   try {
-    const response = await axios.post(
+    const response = await httpPostWithRetry(
       'https://api.openai.com/v1/chat/completions',
       payload,
       {
@@ -607,7 +761,7 @@ IMPORTANT:
   };
 
   try {
-    const response = await axios.post(
+    const response = await httpPostWithRetry(
       'https://api.openai.com/v1/chat/completions',
       payload,
       {
@@ -689,7 +843,7 @@ async function fetchVoicesByKeywords(plan, userText) {
 
   async function callSharedVoices(params) {
     const url = `https://api.elevenlabs.io/v1/shared-voices?${params.toString()}`;
-    const res = await axios.get(url, {
+    const res = await httpGetWithRetry(url, {
       headers: {
         'xi-api-key': XI_KEY,
         'Content-Type': 'application/json'
@@ -741,39 +895,68 @@ async function fetchVoicesByKeywords(plan, userText) {
   const MAX_KEYWORD_QUERIES = 10;
   const selectedKeywords = normalizedKw.slice(0, MAX_KEYWORD_QUERIES);
 
-  // 1) separate search for EACH keyword
-  for (const kw of selectedKeywords) {
-    const params = new URLSearchParams();
-    params.set('page_size', '40');
-
-    if (language) params.set('language', language);
-    if (accent) params.set('accent', accent);
-    if (gender) params.set('gender', gender);
-    if (qualityPref === 'high_only') {
-      params.set('category', 'high_quality');
-    }
-
-    params.set('search', kw);
-
-    try {
-      const voicesForKeyword = await callSharedVoices(params);
-
-      voicesForKeyword.forEach((voice) => {
-        if (!voice || !voice.voice_id) return;
-        let entry = seen.get(voice.voice_id);
-        if (!entry) {
-          entry = {
-            voice,
-            matchedKeywords: new Set()
-          };
+  // 1) separate search for EACH keyword, with limited concurrency
+  async function runWithLimit(items, limit, worker) {
+    const results = new Array(items.length);
+    let index = 0;
+    async function runner() {
+      while (true) {
+        const current = index++;
+        if (current >= items.length) break;
+        try {
+          results[current] = await worker(items[current], current);
+        } catch (e) {
+          results[current] = { error: e };
         }
-        entry.matchedKeywords.add(kw);
-        seen.set(voice.voice_id, entry);
-      });
-    } catch (err) {
-      console.error('Error fetching voices for keyword:', kw, err.message || err);
+      }
     }
+    const workers = [];
+    const count = Math.min(limit, items.length);
+    for (let i = 0; i < count; i++) workers.push(runner());
+    await Promise.all(workers);
+    return results;
   }
+
+  const perKeywordResults = await runWithLimit(
+    selectedKeywords,
+    KEYWORD_SEARCH_CONCURRENCY,
+    async (kw) => {
+      const params = new URLSearchParams();
+      params.set('page_size', '40');
+      if (language) params.set('language', language);
+      if (accent) params.set('accent', accent);
+      if (gender) params.set('gender', gender);
+      if (qualityPref === 'high_only') {
+        params.set('category', 'high_quality');
+      }
+      params.set('search', kw);
+      try {
+        const voicesForKeyword = await callSharedVoices(params);
+        return { kw, voices: voicesForKeyword || [] };
+      } catch (err) {
+        console.error('Error fetching voices for keyword:', kw, err.message || err);
+        return { kw, voices: [] };
+      }
+    }
+  );
+
+  // merge results
+  perKeywordResults.forEach((res) => {
+    if (!res || !Array.isArray(res.voices)) return;
+    const kw = res.kw;
+    res.voices.forEach((voice) => {
+      if (!voice || !voice.voice_id) return;
+      let entry = seen.get(voice.voice_id);
+      if (!entry) {
+        entry = {
+          voice,
+          matchedKeywords: new Set()
+        };
+      }
+      entry.matchedKeywords.add(kw);
+      seen.set(voice.voice_id, entry);
+    });
+  });
 
   // 2) fallback: if nothing found at all, try a combined-search query
   if (seen.size === 0) {
@@ -864,6 +1047,11 @@ async function fetchVoicesByKeywords(plan, userText) {
     if (onlyStandard.length) voices = onlyStandard;
   }
 
+  // cap total voices to keep memory bounded
+  if (voices.length > 120) {
+    voices = voices.slice(0, 120);
+  }
+
   return voices;
 }
 
@@ -881,7 +1069,7 @@ async function fetchTopVoicesByLanguage(languageCode, qualityPreference) {
 
     const url = `https://api.elevenlabs.io/v1/shared-voices?${params.toString()}`;
 
-    const res = await axios.get(url, {
+    const res = await httpGetWithRetry(url, {
       headers: {
         'xi-api-key': XI_KEY,
         'Content-Type': 'application/json'
@@ -1041,7 +1229,7 @@ Every candidate_voices.voice_id MUST appear exactly once in "ranking".
   };
 
   try {
-    const response = await axios.post(
+    const response = await httpPostWithRetry(
       'https://api.openai.com/v1/chat/completions',
       payload,
       {
@@ -1168,14 +1356,14 @@ function buildMessageFromSession(session) {
       other: labels.other
     };
 
-    lines.push(`### ${title}`);
+    lines.push(`*${title}*`);
 
     if (genderFilter !== 'any') {
       const key = genderFilter;
       const label = genderLabels[key];
       const arr = groups[key];
 
-      lines.push(`**${label}:**`);
+      lines.push(`*${label}:*`);
       if (!arr.length) {
         lines.push(labels.noVoices);
       } else {
@@ -1192,7 +1380,7 @@ function buildMessageFromSession(session) {
       const label = genderLabels[key];
       const arr = groups[key];
 
-      lines.push(`**${label}:**`);
+      lines.push(`*${label}:*`);
       if (!arr.length) {
         lines.push(labels.noVoices);
       } else {
@@ -1220,6 +1408,49 @@ function buildMessageFromSession(session) {
   }
 
   return lines.join('\n');
+}
+
+function buildBlocksFromText(text) {
+  if (!text) return null;
+  // Split by blank lines to keep sections readable
+  const parts = text.split(/\n\s*\n/);
+  const blocks = [];
+  for (const part of parts) {
+    // If a section is too long for one block, split by lines
+    const lines = part.split('\n');
+    let buffer = '';
+    for (const line of lines) {
+      const next = buffer ? buffer + '\n' + line : line;
+      if (next.length > 2800) {
+        blocks.push({
+          type: 'section',
+          text: { type: 'mrkdwn', text: buffer }
+        });
+        buffer = line;
+      } else {
+        buffer = next;
+      }
+    }
+    if (buffer) {
+      blocks.push({
+        type: 'section',
+        text: { type: 'mrkdwn', text: buffer }
+      });
+    }
+    // Add light spacing
+    if (blocks.length < 48) {
+      blocks.push({ type: 'divider' });
+    }
+  }
+  // Ensure we stay under Slack's 50 blocks limit
+  while (blocks.length > 50) {
+    blocks.pop();
+  }
+  // Remove trailing divider
+  if (blocks.length && blocks[blocks.length - 1].type === 'divider') {
+    blocks.pop();
+  }
+  return blocks;
 }
 
 // -------------------------------------------------------------
@@ -1315,18 +1546,21 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         quality: keywordPlan.quality_preference || 'any',
         gender: 'any',
         listAll: detectListAll(cleaned)
-      }
+      },
+      lastActive: Date.now()
     };
 
     sessions[threadTs] = session;
 
     let message = buildMessageFromSession(session);
     message = await translateForUserLanguage(message, session.uiLanguage);
+    const blocks = buildBlocksFromText(message);
 
     await client.chat.postMessage({
       channel: event.channel,
       thread_ts: threadTs,
-      text: message
+      text: message,
+      blocks: blocks || undefined
     });
   } catch (error) {
     console.error('Error in handleNewSearch:', error);
@@ -1357,10 +1591,16 @@ app.event('app_mention', async ({ event, client }) => {
   const cleaned = cleanText(rawText);
   const threadTs = event.thread_ts || event.ts;
 
+  // Avoid duplicate replies on quick edits/duplicates within a short window
+  if (isDuplicateRequest(threadTs, cleaned)) {
+    return;
+  }
+
   const existing = sessions[threadTs];
 
   if (existing) {
     const lower = cleaned.toLowerCase();
+    existing.lastActive = Date.now();
 
     const wantsLanguages = checkLanguagesIntent(lower);
     const wantsWhichHigh = checkWhichHighIntent(lower);
@@ -1369,10 +1609,12 @@ app.event('app_mention', async ({ event, client }) => {
     if (wantsLanguages) {
       let msg = buildLanguagesMessage(existing);
       msg = await translateForUserLanguage(msg, existing.uiLanguage);
+      const blocks = buildBlocksFromText(msg);
       await client.chat.postMessage({
         channel: event.channel,
         thread_ts: threadTs,
-        text: msg
+        text: msg,
+        blocks: blocks || undefined
       });
       return;
     }
@@ -1380,10 +1622,12 @@ app.event('app_mention', async ({ event, client }) => {
     if (wantsWhichHigh) {
       let msg = buildWhichHighMessage(existing);
       msg = await translateForUserLanguage(msg, existing.uiLanguage);
+      const blocks = buildBlocksFromText(msg);
       await client.chat.postMessage({
         channel: event.channel,
         thread_ts: threadTs,
-        text: msg
+        text: msg,
+        blocks: blocks || undefined
       });
       return;
     }
@@ -1391,10 +1635,12 @@ app.event('app_mention', async ({ event, client }) => {
     if (filtersChanged) {
       let msg = buildMessageFromSession(existing);
       msg = await translateForUserLanguage(msg, existing.uiLanguage);
+      const blocks = buildBlocksFromText(msg);
       await client.chat.postMessage({
         channel: event.channel,
         thread_ts: threadTs,
-        text: msg
+        text: msg,
+        blocks: blocks || undefined
       });
       return;
     }
@@ -1410,6 +1656,8 @@ app.event('app_mention', async ({ event, client }) => {
 // -------------------------------------------------------------
 
 (async () => {
+  validateEnvOrExit();
+  startMemoryCleanup();
   const port = process.env.PORT || 3000;
   await app.start(port);
   console.log('⚡️ voices-bot is running on port ' + port);
