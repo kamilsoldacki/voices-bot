@@ -1,6 +1,7 @@
 {
   "name": "voices-bot",
   "version": "1.0.0",
+  "description": "Slack bot that curates ElevenLabs Voice Library voices using OpenAI.",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
