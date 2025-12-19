@@ -26,8 +26,7 @@ function isHighQuality(voice) {
     }
   }
 
-  // 3) Official "high quality base models" flag from the docs
-  // If this list exists and is non-empty, we treat the voice as high quality.
+  // 3) Official "high quality base models" flag
   if (
     Array.isArray(voice.high_quality_base_model_ids) &&
     voice.high_quality_base_model_ids.length > 0
@@ -297,7 +296,6 @@ async function fetchVoicesForSearchPlan(plan) {
 
   if (wantsHighOnly) {
     const onlyHigh = voices.filter(isHighQuality);
-    // If filtering leaves us with nothing, fall back to unfiltered
     if (onlyHigh.length) result = onlyHigh;
   } else if (wantsNoHigh) {
     const onlyStandard = voices.filter(v => !isHighQuality(v));
@@ -307,8 +305,14 @@ async function fetchVoicesForSearchPlan(plan) {
   return result;
 }
 
-// Ask GPT to act as a "voice curator" on top of the candidate voices
+// Ask GPT to act as a "voice curator" and return JSON with groups of voice_ids
 async function curateVoicesWithGPT(userText, plan, voices) {
+  // Map for quick lookup by id
+  const byId = {};
+  for (const v of voices) {
+    if (v && v.voice_id) byId[v.voice_id] = v;
+  }
+
   const candidates = voices.slice(0, 80).map(v => ({
     voice_id: v.voice_id,
     name: v.name,
@@ -335,64 +339,72 @@ You receive:
 - a "search_plan" describing what they are looking for,
 - a list of "candidate_voices" from the ElevenLabs Voice Library (GET /v1/shared-voices).
 
-Your job:
+Your task is to decide WHICH candidate voices should appear in which group.
+Formatting of the Slack message will be done by the caller, not by you.
 
-1. From candidate_voices, select and order the BEST matches for the user's request.
+You MUST return ONLY a single JSON object with EXACTLY this structure:
+
+{
+  "user_language": string,    // 2-letter code for the user's language, e.g. "en","pl","es"
+  "headings": {
+    "standard_section": string,        // heading text for standard voices section
+    "high_quality_section": string,    // heading text for high quality section
+    "female": string,                  // label for female voices
+    "male": string,                    // label for male voices
+    "other": string,                   // label for other/unspecified voices
+    "no_voices": string                // text used when a group is empty
+  },
+  "standard": {
+    "female": string[],       // array of voice_id strings (subset of candidate_voices.voice_id)
+    "male": string[],
+    "other": string[]
+  },
+  "high_quality": {
+    "female": string[],
+    "male": string[],
+    "other": string[]
+  },
+  "footer": string            // short paragraph in the user's language explaining possible follow-up questions
+}
+
+RULES:
+
+1. SELECTION & RANKING
+   - From candidate_voices, select and order the BEST matches for the user's request.
    - Match on language, accent, gender, use_case, descriptive, age, category, and verified_languages.
    - Use popularity signals as tie-breakers: usage_character_count_1y, cloned_by_count, featured.
-   - Never invent new voices. Use ONLY the provided candidate_voices.
+   - Never invent new voices. Use ONLY voice_id values that exist in candidate_voices.
+   - You may ignore voices that clearly do not match the request.
 
-2. Split voices into TWO main sections:
-   - "Standard voices (not high quality)"
-   - "High quality voices"
+2. STANDARD vs HIGH QUALITY
+   - A voice is "high quality" when it either:
+     - has category "high_quality" (case-insensitive), OR
+     - has a non-empty high_quality_base_model_ids list, OR
+     - is clearly described as high quality in its metadata.
+   - All other voices are "standard".
+   - Place each voice_id in exactly ONE of the standard or high_quality sections.
 
-   Treat voices as "high quality" when they either:
-   - have category "high_quality" (case-insensitive), OR
-   - have a non-empty high_quality_base_model_ids list, OR
-   - are otherwise clearly described as high quality in their metadata.
+3. GENDER GROUPING
+   - For each of "standard" and "high_quality", group voices by gender:
+     - Put obviously female voices into "female".
+     - Put obviously male voices into "male".
+     - Put all others into "other".
+   - Use only voice_id strings in those arrays.
 
-   All other voices are "standard voices".
+4. HOW MANY VOICES TO RETURN
+   - Normally, within each gender subgroup, include up to 5 voices (best matches first).
+   - However, if the user explicitly asks to "list all" or "wymień wszystkie" or "show all"
+     voices of a certain type, you may include more voices (up to about 50 total across all groups).
 
-3. Inside each of those sections, group voices by gender:
-   - "Female:"
-   - "Male:"
-   - "Other / unspecified:"
+5. HEADINGS & FOOTER LANGUAGE
+   - "user_language" should match the user's language (e.g. "en" for English, "pl" for Polish).
+   - All strings inside "headings" and "footer" must be in that same language.
+   - Do NOT add markdown syntax (#, **, -, etc.) inside those strings.
+     They should be plain text; the caller will add markdown.
 
-4. Normally, within each gender subgroup, output up to 5 voices.
-   HOWEVER:
-   - If the user explicitly asks to "list all" voices of a certain type
-     (e.g. "list all", "show all", "wymień wszystkie głosy"),
-     you may output all matching voices from candidate_voices, up to about 50 total,
-     instead of enforcing the "up to 5 per subgroup" rule.
-
-5. For each voice, output ONE bullet line in this EXACT Slack format:
-   - "- <https://elevenlabs.io/app/voice-library?search=VOICE_ID|NAME | VOICE_ID>"
-
-   Where:
-   - VOICE_ID is the voice_id from the candidate object,
-   - NAME is the voice's name.
-
-   Do NOT wrap the whole line in quotes. Do NOT add extra hyphens inside the bullet prefix.
-
-6. If a section has no voices, you MUST still output the section header and a line:
-   - "_No voices in this section._"
-
-7. Respond in the SAME LANGUAGE as the user's original message.
-   - The "user_interface_language" in search_plan tells you the user's language (e.g. "en","pl","es").
-   - Use that language for all headings and text.
-
-8. Do NOT repeat the full user query verbatim.
-   - You may reference it briefly ("for your request") but do not fully quote it.
-
-9. At the end of your message, add two lines explaining in a friendly way that the user can:
-   - ask which of these voices are high quality vs standard,
-   - ask about languages these voices support,
-   - refine the search with more details.
-
-VERY IMPORTANT:
-- Do NOT hallucinate voice names or IDs.
-- Use only the voices provided in candidate_voices.
-- Even if all candidates are only weak matches, still pick the best you can from them.
+6. JSON ONLY
+   - Return ONLY valid JSON for the described object.
+   - Do NOT include markdown, explanations, or any other text outside the JSON.
 `.trim();
 
   const payload = {
@@ -424,11 +436,105 @@ VERY IMPORTANT:
       }
     );
 
-    return response.data.choices[0].message.content.trim();
-  } catch (error) {
-    console.error('Failed to get curated response from OpenAI. Falling back to simple listing.', error);
+    const content = response.data.choices[0].message.content.trim();
+    const data = JSON.parse(content);
 
-    // Simple fallback: naive standard/high split list in English
+    const userLangRaw =
+      data.user_language ||
+      plan.user_interface_language ||
+      'en';
+
+    const userLang = userLangRaw.toString().slice(0, 2).toLowerCase();
+
+    const headings = data.headings || {};
+    const standardGroups = data.standard || {};
+    const highGroups = data.high_quality || {};
+    const footer = typeof data.footer === 'string' ? data.footer.trim() : '';
+
+    function getHeading(key, fallbackEn, fallbackPl) {
+      const v = headings[key];
+      if (typeof v === 'string' && v.trim().length > 0) return v.trim();
+      if (userLang === 'pl') return fallbackPl;
+      return fallbackEn;
+    }
+
+    const hStandard = getHeading(
+      'standard_section',
+      'Standard voices (not high quality)',
+      'Głosy standardowe (nie high quality)'
+    );
+    const hHigh = getHeading(
+      'high_quality_section',
+      'High quality voices',
+      'Głosy wysokiej jakości'
+    );
+    const hFemale = getHeading('female', 'Female:', 'Kobiety:');
+    const hMale = getHeading('male', 'Male:', 'Mężczyźni:');
+    const hOther = getHeading('other', 'Other / unspecified:', 'Inne / nieokreślone:');
+    const noVoicesLabel = getHeading(
+      'no_voices',
+      'No voices in this section.',
+      'Brak głosów w tej sekcji.'
+    );
+
+    function formatVoiceLine(voice) {
+      const url = `https://elevenlabs.io/app/voice-library?search=${encodeURIComponent(
+        voice.voice_id
+      )}`;
+      return `<${url}|${voice.name} | ${voice.voice_id}>`;
+    }
+
+    const lines = [];
+
+    function appendSection(sectionTitle, groups) {
+      lines.push(`### ${sectionTitle}`);
+
+      const order = [
+        { key: 'female', label: hFemale },
+        { key: 'male', label: hMale },
+        { key: 'other', label: hOther }
+      ];
+
+      for (const { key, label } of order) {
+        const arr = Array.isArray(groups[key]) ? groups[key] : [];
+        lines.push(`**${label}**`);
+        let count = 0;
+        for (const id of arr) {
+          const v = byId[id];
+          if (!v) continue;
+          lines.push(`- ${formatVoiceLine(v)}`);
+          count++;
+        }
+        if (count === 0) {
+          lines.push(`- ${noVoicesLabel}`);
+        }
+      }
+
+      lines.push('---');
+    }
+
+    appendSection(hStandard, standardGroups);
+    appendSection(hHigh, highGroups);
+
+    if (footer && footer.length > 0) {
+      lines.push(footer);
+    } else {
+      if (userLang === 'pl') {
+        lines.push(
+          'Możesz zapytać, które głosy są high quality, o języki, które obsługują, albo doprecyzować swoje kryteria wyszukiwania.'
+        );
+      } else {
+        lines.push(
+          'Feel free to ask which voices are high quality vs standard, what languages they support, or refine your search with more details.'
+        );
+      }
+    }
+
+    return lines.join('\n');
+  } catch (error) {
+    console.error('Failed to get curated JSON from OpenAI. Falling back to simple listing.', error);
+
+    // SIMPLE FALLBACK: naive standard/high split list in English
     const standard = voices.filter(v => !isHighQuality(v));
     const high = voices.filter(v => isHighQuality(v));
 
@@ -513,7 +619,7 @@ app.event('app_mention', async ({ event, client }) => {
       return;
     }
 
-    // 3) Ask GPT to act as a curator on top of these voices
+    // 3) Ask GPT to act as a curator on top of these voices and return grouped JSON
     const reply = await curateVoicesWithGPT(combinedText, searchPlan, voices);
 
     // 4) Store session for further follow-ups in this thread
