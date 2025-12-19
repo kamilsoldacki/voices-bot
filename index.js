@@ -1,25 +1,27 @@
 const { App } = require('@slack/bolt');
 const axios = require('axios');
 
-// --------------------- In-memory sessions ---------------------
+// -------------------------------------------------------------
+// In-memory conversation sessions (per Slack thread)
+// -------------------------------------------------------------
 const sessions = {};
 
-// --------------------- Helper functions -----------------------
+// -------------------------------------------------------------
+// Small helpers
+// -------------------------------------------------------------
 
-// Remove Slack mentions like <@U123ABC> from the message
 function cleanText(text) {
   if (!text) return '';
+  // remove Slack mentions like <@U123ABC>
   return text.replace(/<@[^>]+>/g, '').trim();
 }
 
-// Detect whether a voice should be treated as "high quality"
 function isHighQuality(voice) {
   if (!voice || typeof voice !== 'object') return false;
 
   const cat = (voice.category || '').toString().toLowerCase();
   if (cat === 'high_quality' || cat === 'high quality') return true;
 
-  // Uwaga: tu była literówka voice.shing – poprawione na voice.sharing
   if (voice.sharing && typeof voice.sharing === 'object') {
     const sharingCat = (voice.sharing.category || '').toString().toLowerCase();
     if (sharingCat === 'high_quality' || sharingCat === 'high quality') return true;
@@ -50,43 +52,65 @@ function isHighQuality(voice) {
   return false;
 }
 
-// Rough guess of UI language from text (only as fallback)
+// Very rough guess of the language the user is typing in
 function guessUiLanguageFromText(text) {
   if (!text) return 'en';
   const lower = text.toLowerCase();
-  if (/[ąćęłńóśżź]/.test(lower) ||
-      lower.includes('głos') ||
-      lower.includes('glos') ||
-      lower.includes('szukam')) {
+  if (/[ąćęłńóśżź]/.test(lower) || lower.includes('głos') || lower.includes('glos')) {
     return 'pl';
   }
   return 'en';
 }
 
-// Detect target VOICE language (not UI) from text
+// Try to detect which VOICE language user wants (Polish, English, Spanish, etc.)
 function detectVoiceLanguageFromText(text) {
   if (!text) return null;
   const lower = text.toLowerCase();
 
-  const patterns = [
-    { code: 'pl', keys: ['polsk', 'po polsku', 'polish'] },
-    { code: 'en', keys: ['english', 'angielsk', 'po angielsku'] },
-    { code: 'es', keys: ['hiszpań', 'hiszpansk', 'spanish', 'español', 'espanol'] },
-    { code: 'de', keys: ['niemiec', 'german', 'deutsch'] },
-    { code: 'fr', keys: ['francus', 'french'] },
-    { code: 'it', keys: ['włoski', 'wloski', 'italian'] }
-  ];
+  if (
+    lower.includes('polish') ||
+    lower.includes('po polsku') ||
+    lower.includes('polski głos') ||
+    lower.includes('polski glos')
+  ) {
+    return 'pl';
+  }
 
-  for (const entry of patterns) {
-    for (const key of entry.keys) {
-      if (lower.includes(key)) return entry.code;
-    }
+  if (
+    lower.includes('english') ||
+    lower.includes('american accent') ||
+    lower.includes('us accent') ||
+    lower.includes('angielski')
+  ) {
+    return 'en';
+  }
+
+  if (
+    lower.includes('spanish') ||
+    lower.includes('español') ||
+    lower.includes('espanol') ||
+    lower.includes('hiszpań') ||
+    lower.includes('hiszpansk')
+  ) {
+    return 'es';
+  }
+
+  if (lower.includes('german') || lower.includes('deutsch') || lower.includes('niemieck')) {
+    return 'de';
+  }
+
+  if (lower.includes('french') || lower.includes('francus')) {
+    return 'fr';
+  }
+
+  if (lower.includes('italian') || lower.includes('włoski') || lower.includes('wloski')) {
+    return 'it';
   }
 
   return null;
 }
 
-// Check if a voice "belongs" to a given language code (heuristic)
+// Heuristic: is this voice effectively in langCode?
 function isVoiceInLanguage(voice, langCode) {
   if (!voice || !langCode) return false;
   const lc = langCode.toLowerCase();
@@ -100,52 +124,55 @@ function isVoiceInLanguage(voice, langCode) {
 
   if (Array.isArray(voice.verified_languages)) {
     for (const entry of voice.verified_languages) {
-      if (!entry) continue;
-      const el = (entry.language || '').toString().toLowerCase();
-      if (!el) continue;
+      if (!entry || !entry.language) continue;
+      const el = entry.language.toString().toLowerCase();
       if (el === lc || el.startsWith(lc + '-') || el.includes(lc)) return true;
-      if (lc === 'pl' && (el.includes('polish') || el.includes('polski'))) return true;
-      if (lc === 'en' && (el.includes('english') || el.includes('angielski'))) return true;
-      if (lc === 'es' && (el.includes('spanish') || el.includes('hiszpan') || el.includes('español') || el.includes('espanol'))) return true;
-      if (lc === 'de' && (el.includes('german') || el.includes('niemiecki') || el.includes('deutsch'))) return true;
     }
   }
 
   const blob = (
-    (voice.name || '') + ' ' +
-    (voice.description || '') + ' ' +
-    (voice.descriptive || '') + ' ' +
+    (voice.name || '') +
+    ' ' +
+    (voice.description || '') +
+    ' ' +
+    (voice.descriptive || '') +
+    ' ' +
     (voice.accent || '')
   ).toString().toLowerCase();
 
   if (lc === 'pl') {
-    if (blob.includes('polish') || blob.includes('polski') || blob.includes('polska')) return true;
-  }
-  if (lc === 'en') {
-    if (blob.includes('english') || blob.includes('angielski')) return true;
-  }
-  if (lc === 'es') {
-    if (blob.includes('spanish') || blob.includes('hiszpan') || blob.includes('español') || blob.includes('espanol'))) return true;
-  }
-  if (lc === 'de') {
-    if (blob.includes('german') || blob.includes('niemiecki') || blob.includes('deutsch')) return true;
+    if (blob.includes('polish') || blob.includes('polski')) return true;
+  } else if (lc === 'en') {
+    if (blob.includes('english') || blob.includes('angielski') || blob.includes('american')) {
+      return true;
+    }
+  } else if (lc === 'es') {
+    if (blob.includes('spanish') || blob.includes('español') || blob.includes('espanol')) {
+      return true;
+    }
+  } else if (lc === 'de') {
+    if (blob.includes('german') || blob.includes('deutsch')) return true;
+  } else if (lc === 'fr') {
+    if (blob.includes('french') || blob.includes('français') || blob.includes('francais')) {
+      return true;
+    }
+  } else if (lc === 'it') {
+    if (blob.includes('italian') || blob.includes('italiano')) return true;
   }
 
   return false;
 }
 
-// Detect quality preference explicitly from user text (for initial query AND follow-ups)
+// Detect if user explicitly wants only high quality / no high quality
 function detectQualityPreferenceFromText(text) {
   if (!text) return null;
   const lower = text.toLowerCase();
 
   if (
     lower.includes('only high quality') ||
-    lower.includes('show only high quality') ||
-    lower.includes('tylko high quality') ||
-    lower.includes('tylko hq') ||
-    lower.includes('hq only') ||
+    lower.includes('high quality only') ||
     lower.includes('just high quality') ||
+    lower.includes('hq only') ||
     lower.includes('only hq')
   ) {
     return 'high_only';
@@ -154,9 +181,7 @@ function detectQualityPreferenceFromText(text) {
   if (
     lower.includes('without high quality') ||
     lower.includes('no high quality') ||
-    lower.includes('bez high quality') ||
-    lower.includes('without hq') ||
-    lower.includes('no hq') ||
+    lower.includes('exclude high quality') ||
     lower.includes('standard only')
   ) {
     return 'no_high';
@@ -165,81 +190,42 @@ function detectQualityPreferenceFromText(text) {
   return null;
 }
 
-// Labels per language (headings, footers, etc.)
-function getLabels(uiLang) {
-  const lang = (uiLang || 'en').slice(0, 2).toLowerCase();
-
-  if (lang === 'pl') {
-    return {
-      lang: 'pl',
-      searchingPrefix: 'Jasne, już zaglądam do Voice Library pod kątem Twojego opisu… 🔍',
-      noResults:
-        'Nie widzę żadnych sensownych kandydatów pod ten opis. ' +
-        'Spróbuj opisać głos trochę szerzej, innymi słowami albo doprecyzuj zastosowanie.',
-      suggestedHeader: 'Na podstawie Twojego opisu wybrałem te głosy:',
-      standardHeader: 'Głosy standardowe (bez high quality)',
-      highHeader: 'Głosy high quality',
-      female: 'Kobiece',
-      male: 'Męskie',
-      other: 'Inne / nieokreślone',
-      noVoices: '– tu nic sensownego nie wyszło.',
-      genericFooter: [
-        'Możesz dopytać, np.:',
-        '• „pokaż tylko high quality”',
-        '• „pokaż tylko kobiece / męskie”',
-        '• „w jakich językach dobrze działają te głosy?”',
-        '• albo po prostu opisz nową potrzebę w tym samym wątku'
-      ].join('\n'),
-      femaleFilterFooter:
-        'Aktualnie pokazuję tylko głosy kobiece. Napisz „pokaż wszystkie płcie”, jeśli chcesz wrócić do pełnej listy.',
-      maleFilterFooter:
-        'Aktualnie pokazuję tylko głosy męskie. Napisz „pokaż wszystkie płcie”, jeśli chcesz wrócić do pełnej listy.',
-      languagesHeader: 'Języki wśród wybranych głosów:',
-      languagesNone: 'Te głosy nie mają opisanych języków w metadanych (albo jest z tym bałagan).',
-      highQualityHeader: 'Te głosy z bieżącej listy są oznaczone jako high quality:',
-      highQualityNone:
-        'Wśród aktualnych propozycji nie widzę żadnych głosów oznaczonych jako high quality.',
-      genericError:
-        'Coś się wysypało po drodze (LLM albo API). Napisz jeszcze raz – spróbuję ponownie.'
-    };
-  }
-
-  // default EN
+// UI labels – EN only (all user-facing Slack text)
+function getLabels() {
   return {
-    lang: 'en',
-    searchingPrefix: 'Got it, let me dig through the Voice Library for that brief… 🔍',
+    searching:
+      "Got it – I’ll dig through the public Voice Library for something that fits your brief… 🔍",
     noResults:
-      "I couldn't find any good candidates for that description. " +
-      'Try describing the voice a bit more broadly, or with slightly different wording.',
-    suggestedHeader: 'Based on your brief, here are the voices I recommend:',
+      "I couldn’t find any convincing matches for that description. " +
+      'Try describing the voice a bit more broadly or in different words.',
+    suggestedHeader: 'Here are the voices I’d recommend based on your brief:',
     standardHeader: 'Standard voices (not marked as high quality)',
     highHeader: 'High quality voices',
     female: 'Female',
     male: 'Male',
     other: 'Other / unspecified',
-    noVoices: '– nothing really good in this bucket.',
+    noVoices: '– nothing strong enough to show here.',
     genericFooter: [
-      'You can follow up with things like:',
+      'You can refine this shortlist by asking things like:',
       '• “show only high quality”',
       '• “show only female / only male”',
       '• “what languages do these voices support?”',
-      '• or just describe a new need in this same thread'
+      '• or just send a new brief in this thread'
     ].join('\n'),
     femaleFilterFooter:
       'Right now I’m only showing female voices. Say “show all genders” if you want to see everything again.',
     maleFilterFooter:
       'Right now I’m only showing male voices. Say “show all genders” if you want to see everything again.',
     languagesHeader: 'Languages across the current shortlist:',
-    languagesNone: 'These voices don’t expose clear language metadata (or it’s a bit messy).',
+    languagesNone:
+      "These voices don’t expose clear language metadata (or it’s inconsistent in the library).",
     highQualityHeader: 'From the current shortlist, these are marked as high quality:',
-    highQualityNone:
-      'None of the current suggestions are explicitly marked as high quality.',
+    highQualityNone: 'None of the current suggestions are explicitly marked as high quality.',
     genericError:
-      'Something went wrong somewhere between the LLM and the API. Please try again and I’ll take another shot.'
+      'Something went wrong between the LLM and the Voice Library API. Please try again and I’ll take another shot.'
   };
 }
 
-// Format a single voice line for Slack
 function formatVoiceLine(voice) {
   const url = `https://elevenlabs.io/app/voice-library?search=${encodeURIComponent(
     voice.voice_id
@@ -247,23 +233,11 @@ function formatVoiceLine(voice) {
   return `<${url}|${voice.name} | ${voice.voice_id}>`;
 }
 
-// Detect "list all" intent in the text (for showing more results)
 function detectListAll(text) {
   const lower = (text || '').toLowerCase();
-  if (
-    lower.includes('list all') ||
-    lower.includes('show all') ||
-    lower.includes('wymień wszystkie') ||
-    lower.includes('wymien wszystkie') ||
-    lower.includes('pokaż wszystkie') ||
-    lower.includes('pokaz wszystkie')
-  ) {
-    return true;
-  }
-  return false;
+  return lower.includes('list all') || lower.includes('show all');
 }
 
-// Gender classification for grouping
 function getGenderGroup(voice) {
   const raw =
     (voice.gender ||
@@ -275,7 +249,6 @@ function getGenderGroup(voice) {
   return 'other';
 }
 
-// Summarize languages across voices
 function summarizeLanguages(voices) {
   const langCount = {};
   voices.forEach((v) => {
@@ -294,15 +267,13 @@ function summarizeLanguages(voices) {
   return langCount;
 }
 
-// Build languages summary text
 function buildLanguagesMessage(session) {
-  const labels = getLabels(session.uiLanguage);
+  const labels = getLabels();
   const langCount = summarizeLanguages(session.voices);
   const entries = Object.entries(langCount);
   if (!entries.length) {
     return labels.languagesNone;
   }
-
   let text = `${labels.languagesHeader}\n`;
   entries.forEach(([lang, count]) => {
     text += `• ${lang}: ${count} voices\n`;
@@ -310,9 +281,8 @@ function buildLanguagesMessage(session) {
   return text;
 }
 
-// Build "which are high quality" message
 function buildWhichHighMessage(session) {
-  const labels = getLabels(session.uiLanguage);
+  const labels = getLabels();
   const { voices, ranking } = session;
   const hqVoices = voices.filter(isHighQuality);
 
@@ -321,8 +291,7 @@ function buildWhichHighMessage(session) {
   }
 
   const sorted = [...hqVoices].sort(
-    (a, b) =>
-      (ranking[b.voice_id] || 0) - (ranking[a.voice_id] || 0)
+    (a, b) => (ranking[b.voice_id] || 0) - (ranking[a.voice_id] || 0)
   );
 
   const max = Math.min(sorted.length, 20);
@@ -335,18 +304,16 @@ function buildWhichHighMessage(session) {
   return text;
 }
 
-// Apply filters from follow-up text to session.filters
+// Parse follow-up filters from the user text
 function applyFilterChangesFromText(session, lower) {
   let changed = false;
 
-  // Gender filters
+  // gender
   if (
     lower.includes('only female') ||
     lower.includes('female only') ||
     lower.includes('show only female') ||
-    lower.includes('tylko kobiece') ||
-    lower.includes('tylko damskie') ||
-    lower.includes('tylko kobiety')
+    lower.includes('show female only')
   ) {
     session.filters.gender = 'female';
     changed = true;
@@ -354,12 +321,7 @@ function applyFilterChangesFromText(session, lower) {
     lower.includes('only male') ||
     lower.includes('male only') ||
     lower.includes('show only male') ||
-    lower.includes('tylko męskie') ||
-    lower.includes('tylko meskie') ||
-    lower.includes('tylko mężczyzn') ||
-    lower.includes('tylko mezczyzn') ||
-    lower.includes('tylko facetów') ||
-    lower.includes('tylko facetow')
+    lower.includes('show male only')
   ) {
     session.filters.gender = 'male';
     changed = true;
@@ -367,14 +329,14 @@ function applyFilterChangesFromText(session, lower) {
 
   if (
     lower.includes('all genders') ||
-    lower.includes('wszystkie płcie') ||
-    lower.includes('wszystkie plcie')
+    lower.includes('show all genders') ||
+    lower.includes('show both genders')
   ) {
     session.filters.gender = 'any';
     changed = true;
   }
 
-  // Quality filters via helper
+  // quality
   const qp = detectQualityPreferenceFromText(lower);
   if (qp === 'high_only') {
     session.filters.quality = 'high_only';
@@ -384,15 +346,8 @@ function applyFilterChangesFromText(session, lower) {
     changed = true;
   }
 
-  // Show all / list all
-  if (
-    lower.includes('list all') ||
-    lower.includes('show all') ||
-    lower.includes('wymień wszystkie') ||
-    lower.includes('wymien wszystkie') ||
-    lower.includes('pokaż wszystkie') ||
-    lower.includes('pokaz wszystkie')
-  ) {
+  // list all
+  if (lower.includes('list all') || lower.includes('show all')) {
     session.filters.listAll = true;
     changed = true;
   }
@@ -401,68 +356,23 @@ function applyFilterChangesFromText(session, lower) {
 }
 
 function checkLanguagesIntent(lower) {
-  return (
-    lower.includes('language') ||
-    lower.includes('languages') ||
-    lower.includes('język') ||
-    lower.includes('jezyk') ||
-    lower.includes('języki') ||
-    lower.includes('jezyki')
-  );
+  return lower.includes('language') || lower.includes('languages');
 }
 
 function checkWhichHighIntent(lower) {
-  if (lower.includes('high quality')) {
-    if (lower.includes('which') || lower.includes('które') || lower.includes('ktore')) {
-      return true;
-    }
-  }
-  return false;
+  return lower.includes('which') && lower.includes('high quality');
 }
 
-// Detect special "top by language" intent (e.g. "najczęściej używane polskie głosy")
-function detectSpecialIntent(userText, plan) {
-  const lower = (userText || '').toLowerCase();
-
-  const hasUsageKeyword =
-    lower.includes('najczęściej używan') ||
-    lower.includes('najczesciej uzywan') ||
-    lower.includes('najpopularniejsze') ||
-    lower.includes('most used') ||
-    lower.includes('most popular') ||
-    lower.includes('top used') ||
-    lower.includes('top voices') ||
-    lower.includes('most frequently used');
-
-  if (!hasUsageKeyword) {
-    return { mode: 'generic', languageCode: null };
-  }
-
-  let languageCode = null;
-
-  if (plan && typeof plan.target_voice_language === 'string' && plan.target_voice_language.trim()) {
-    languageCode = plan.target_voice_language.trim().toLowerCase().slice(0, 2);
-  }
-
-  if (!languageCode) {
-    languageCode = detectVoiceLanguageFromText(userText);
-  }
-
-  if (!languageCode) {
-    return { mode: 'generic', languageCode: null };
-  }
-
-  return { mode: 'top_by_language', languageCode };
-}
-
-// ---------------- GPT: build keyword plan ----------------------
+// -------------------------------------------------------------
+// GPT: build keyword plan from user brief
+// -------------------------------------------------------------
 
 async function buildKeywordPlan(userText) {
   const systemPrompt = `
 You are an assistant that takes a user's description of the voice they want (in ANY language)
 and produces a JSON keyword plan for the ElevenLabs Voice Library (GET /v1/shared-voices).
 
-You MUST return ONLY a single JSON object, no markdown, no explanations.
+Return ONLY a single JSON object, no markdown, no explanations.
 
 The JSON MUST have exactly these fields:
 
@@ -487,7 +397,7 @@ RULES:
 
 - target_voice_language:
   - Language of the VOICE the user wants (e.g. "en" for an American English voice, "pl" for Polish).
-  - Infer from explicit mentions ("American accent", "polski", "głos angielski") when possible.
+  - Infer from explicit mentions ("American accent", "polish voice") when possible.
 
 - target_accent:
   - Accent of the VOICE (e.g. "american", "british", "australian", "polish"), or null if unclear.
@@ -497,9 +407,9 @@ RULES:
 
 - quality_preference:
   - "high_only" ONLY if the user explicitly asks for high quality only
-    (e.g. "only high quality", "just high quality", "tylko high quality", "hq only").
+    (e.g. "only high quality", "high quality only", "hq only").
   - "no_high" ONLY if the user explicitly excludes high quality
-    (e.g. "without high quality", "no high quality", "bez high quality", "standard only").
+    (e.g. "without high quality", "no high quality", "standard only").
   - Words like "best", "top", "great", "good", "premium" are NOT enough to set "high_only".
   - In all other cases use "any".
 
@@ -585,7 +495,7 @@ IMPORTANT:
     plan.style_keywords = normalizeArray(plan.style_keywords);
     plan.extra_keywords = normalizeArray(plan.extra_keywords);
 
-    // Override quality_preference if text clearly says "only high quality" or "without high quality"
+    // Manual override from raw text if needed
     const qp = detectQualityPreferenceFromText(userText);
     if (qp) {
       plan.quality_preference = qp;
@@ -612,7 +522,9 @@ IMPORTANT:
   }
 }
 
-// ---------------- ElevenLabs: fetch voices (per-keyword) -----
+// -------------------------------------------------------------
+// ElevenLabs: search public shared voices (per keyword)
+// -------------------------------------------------------------
 
 async function fetchVoicesByKeywords(plan, userText) {
   const XI_KEY = process.env.ELEVENLABS_API_KEY;
@@ -629,8 +541,6 @@ async function fetchVoicesByKeywords(plan, userText) {
     });
     return res.data.voices || [];
   }
-
-  // --- stałe filtry z planu (język, akcent, płeć, jakość) ---
 
   let language = null;
   if (plan.target_voice_language && typeof plan.target_voice_language === 'string') {
@@ -649,8 +559,7 @@ async function fetchVoicesByKeywords(plan, userText) {
 
   const qualityPref = plan.quality_preference || 'any';
 
-  // --- keywords z GPT: każdy będzie osobnym wyszukiwaniem ---
-
+  // ALL keywords from the plan – each will be used in a separate search
   const allKw = [
     ...(plan.tone_keywords || []),
     ...(plan.use_case_keywords || []),
@@ -667,17 +576,15 @@ async function fetchVoicesByKeywords(plan, userText) {
     )
   );
 
-  // Jeśli GPT prawie nic nie wymyślił – użyj całego tekstu użytkownika jako jeden keyword
+  // If GPT gave us nothing reasonable, use full user text as one keyword
   if (!normalizedKw.length && userText) {
     normalizedKw.push(userText.toLowerCase());
   }
 
-  // Limit liczby osobnych zapytań, żeby nie zabić API
   const MAX_KEYWORD_QUERIES = 10;
   const selectedKeywords = normalizedKw.slice(0, MAX_KEYWORD_QUERIES);
 
-  // --- 1) osobne zapytanie dla KAŻDEGO keywordu ---
-
+  // 1) separate search for EACH keyword
   for (const kw of selectedKeywords) {
     const params = new URLSearchParams();
     params.set('page_size', '40');
@@ -689,7 +596,6 @@ async function fetchVoicesByKeywords(plan, userText) {
       params.set('category', 'high_quality');
     }
 
-    // Kluczowy moment: każdy keyword osobno w search=...
     params.set('search', kw);
 
     try {
@@ -712,8 +618,7 @@ async function fetchVoicesByKeywords(plan, userText) {
     }
   }
 
-  // --- 2) fallback: gdyby po keywordach nadal było pusto ---
-
+  // 2) fallback: if nothing found at all
   if (seen.size === 0) {
     const params = new URLSearchParams();
     params.set('page_size', '80');
@@ -748,15 +653,14 @@ async function fetchVoicesByKeywords(plan, userText) {
     }
   }
 
-  // --- 3) zamiana mapy na listę + podstawowe filtry po języku/jakości ---
-
+  // 3) convert map -> list, attach matched_keywords
   let voices = Array.from(seen.values()).map((entry) => {
     const v = entry.voice;
     v._matched_keywords = Array.from(entry.matchedKeywords || []);
     return v;
   });
 
-  // dodatkowe, ostrożne filtrowanie po języku (heurystyki z isVoiceInLanguage)
+  // extra language filter (heuristic)
   if (language && voices.length) {
     const langFiltered = voices.filter((v) => isVoiceInLanguage(v, language));
     if (langFiltered.length >= 5) {
@@ -764,62 +668,21 @@ async function fetchVoicesByKeywords(plan, userText) {
     }
   }
 
-  // quality_preference = high_only / no_high
+  // quality preference
   if (qualityPref === 'high_only') {
     const onlyHigh = voices.filter(isHighQuality);
-    if (onlyHigh.length) {
-      voices = onlyHigh;
-    }
+    if (onlyHigh.length) voices = onlyHigh;
   } else if (qualityPref === 'no_high') {
     const onlyStandard = voices.filter((v) => !isHighQuality(v));
-    if (onlyStandard.length) {
-      voices = onlyStandard;
-    }
+    if (onlyStandard.length) voices = onlyStandard;
   }
 
   return voices;
 }
 
-// Special mode: "top by language" – most used voices in a given language
-async function fetchTopVoicesByLanguage(languageCode, qualityPreference) {
-  const XI_KEY = process.env.ELEVENLABS_API_KEY;
-
-  try {
-    const params = new URLSearchParams();
-    params.set('page_size', '100');
-    params.set('language', languageCode);
-
-    if (qualityPreference === 'high_only') {
-      params.set('category', 'high_quality');
-    }
-
-    const url = `https://api.elevenlabs.io/v1/shared-voices?${params.toString()}`;
-
-    const res = await axios.get(url, {
-      headers: {
-        'xi-api-key': XI_KEY,
-        'Content-Type': 'application/json'
-      },
-      timeout: 10000
-    });
-
-    let voices = res.data.voices || [];
-    if (!voices.length) return [];
-
-    voices.sort((a, b) => {
-      const ua = a.usage_character_count_1y || a.usage_character_count_7d || 0;
-      const ub = b.usage_character_count_1y || b.usage_character_count_7d || 0;
-      return ub - ua;
-    });
-
-    return voices.slice(0, 80);
-  } catch (err) {
-    console.error('Error in fetchTopVoicesByLanguage:', err.message || err);
-    return [];
-  }
-}
-
-// ---------------- GPT: curator ranking ------------------------
+// -------------------------------------------------------------
+// GPT: curator – rank voices for this specific brief
+// -------------------------------------------------------------
 
 async function rankVoicesWithGPT(userText, keywordPlan, voices) {
   const MAX_VOICES = 80;
@@ -845,7 +708,7 @@ You are a world-class voice curator at ElevenLabs.
 
 Your job:
 - Read the user's brief (user_query).
-- Read the keyword_plan (which captures tone, use case, language, etc.).
+- Read the keyword_plan (tone, use case, language, etc.).
 - Look at each candidate voice with its metadata AND which keywords it matched.
 - First, imagine and describe (for yourself) what the ideal voice or 2–3 ideal personas would sound like.
 - Then, assign each candidate a score between 0.0 and 1.0 based on how close it is to that mental target.
@@ -854,18 +717,7 @@ You will receive:
 
 {
   "user_query": string,
-  "keyword_plan": {
-    "user_interface_language": string,
-    "target_voice_language": string or null,
-    "target_accent": string or null,
-    "target_gender": "male" | "female" | "neutral" | null,
-    "quality_preference": "any" | "high_only" | "no_high",
-    "tone_keywords": string[],
-    "use_case_keywords": string[],
-    "character_keywords": string[],
-    "style_keywords": string[],
-    "extra_keywords": string[]
-  },
+  "keyword_plan": { ... },
   "candidate_voices": [
     {
       "voice_id": string,
@@ -886,14 +738,10 @@ You will receive:
   ]
 }
 
-Important: think like a human curator:
+Think like a human curator:
 
 1. Build an internal mental picture:
    - From user_query + keyword_plan, imagine 1–3 short "ideal voice" descriptions.
-   - Example for "calm, confident, slow american voice for conversational support":
-     - A warm, slow-paced American English support agent, very calm and reassuring, not hyped.
-   - Example for "bad characters for cartoon":
-     - Cartoonish, exaggerated villain or grandma/grandpa, with playful or creepy flavour.
 
 2. Scoring logic for each candidate:
 
@@ -998,7 +846,7 @@ Every candidate_voices.voice_id MUST appear exactly once in "ranking".
       scoreMap[item.voice_id] = score;
     });
 
-    // Upewnij się, że każdy kandydat ma jakiś score
+    // Ensure every candidate has some score
     candidates.forEach((c, idx) => {
       if (!scoreMap[c.voice_id]) {
         scoreMap[c.voice_id] =
@@ -1019,7 +867,6 @@ Every candidate_voices.voice_id MUST appear exactly once in "ranking".
   } catch (err) {
     console.error('Failed to rank voices with GPT, falling back to API order.', err);
 
-    // fallback: kolejność z "seen"
     const scoreMap = {};
     voices.forEach((v, idx) => {
       scoreMap[v.voice_id] = (voices.length - idx) / Math.max(voices.length, 1);
@@ -1037,17 +884,18 @@ Every candidate_voices.voice_id MUST appear exactly once in "ranking".
   }
 }
 
-// ---------------- Build Slack message from session -------------
+// -------------------------------------------------------------
+// Build Slack message from session
+// -------------------------------------------------------------
 
 function buildMessageFromSession(session) {
-  const { voices, ranking, uiLanguage, filters, originalQuery } = session;
-  const labels = getLabels(uiLanguage);
+  const { voices, ranking, filters, originalQuery } = session;
+  const labels = getLabels();
 
   const maxPerGender = filters.listAll ? 50 : 6;
 
   const sorted = [...voices].sort(
-    (a, b) =>
-      (ranking[b.voice_id] || 0) - (ranking[a.voice_id] || 0)
+    (a, b) => (ranking[b.voice_id] || 0) - (ranking[a.voice_id] || 0)
   );
 
   const qualityFilter = filters.quality || 'any';
@@ -1080,18 +928,10 @@ function buildMessageFromSession(session) {
 
   const lines = [];
 
-  // Przyjazne intro bazujące na oryginalnym opisie
-  if (labels.lang === 'pl') {
-    lines.push(
-      labels.suggestedHeader +
-        (originalQuery ? `\n> „${originalQuery.trim()}”` : '')
-    );
-  } else {
-    lines.push(
-      labels.suggestedHeader +
-        (originalQuery ? `\n> “${originalQuery.trim()}”` : '')
-    );
-  }
+  lines.push(
+    labels.suggestedHeader +
+      (originalQuery ? `\n> “${originalQuery.trim()}”` : '')
+  );
   lines.push('');
 
   function appendSection(title, sectionKey) {
@@ -1122,7 +962,7 @@ function buildMessageFromSession(session) {
       return;
     }
 
-    // Show all genders
+    // all genders
     order.forEach((key) => {
       const label = genderLabels[key];
       const arr = groups[key];
@@ -1157,100 +997,49 @@ function buildMessageFromSession(session) {
   return lines.join('\n');
 }
 
-// ---------------- New search handler --------------------------
+// -------------------------------------------------------------
+// New search handler
+// -------------------------------------------------------------
 
 async function handleNewSearch(event, cleaned, threadTs, client) {
   try {
-    // 1) GPT → plan keywordów
     const keywordPlan = await buildKeywordPlan(cleaned);
+    const labels = getLabels();
 
-    const uiLangFromPlan = (keywordPlan.user_interface_language || 'en')
-      .toString()
-      .slice(0, 2)
-      .toLowerCase();
-    const labelsForSearching = getLabels(uiLangFromPlan);
-
-    // 2) Info na Slacku, że szukamy
     await client.chat.postMessage({
       channel: event.channel,
       thread_ts: threadTs,
-      text: labelsForSearching.searchingPrefix
+      text: labels.searching
     });
 
-    // 3) specjalny tryb "najczęściej używane X głosy"
-    const special = detectSpecialIntent(cleaned, keywordPlan);
-    let voices;
-    let ranking = {};
-    let finalUiLang = uiLangFromPlan;
+    const voices = await fetchVoicesByKeywords(keywordPlan, cleaned);
 
-    if (special.mode === 'top_by_language' && special.languageCode) {
-      // tryb "najczęściej używane polskie/angielskie głosy" – ranking po usage
-      voices = await fetchTopVoicesByLanguage(
-        special.languageCode,
-        keywordPlan.quality_preference
-      );
-
-      if (!voices.length) {
-        await client.chat.postMessage({
-          channel: event.channel,
-          thread_ts: threadTs,
-          text: labelsForSearching.noResults
-        });
-        return;
-      }
-
-      const maxUsage = voices.reduce((max, v) => {
-        const u = v.usage_character_count_1y || v.usage_character_count_7d || 0;
-        return u > max ? u : max;
-      }, 0);
-
-      if (maxUsage > 0) {
-        voices.forEach((v) => {
-          const u = v.usage_character_count_1y || v.usage_character_count_7d || 0;
-          ranking[v.voice_id] = (u || 1) / maxUsage;
-        });
-      } else {
-        voices.forEach((v, idx) => {
-          ranking[v.voice_id] = (voices.length - idx) / Math.max(voices.length, 1);
-        });
-      }
-    } else {
-      // 4) normalny tryb – keywords → Voice Library → GPT kurator
-      voices = await fetchVoicesByKeywords(keywordPlan, cleaned);
-
-      if (!voices.length) {
-        await client.chat.postMessage({
-          channel: event.channel,
-          thread_ts: threadTs,
-          text: labelsForSearching.noResults
-        });
-        return;
-      }
-
-      // Tu wchodzi GPT jako kurator – dla TEGO konkretnego briefu
-      const ranked = await rankVoicesWithGPT(cleaned, keywordPlan, voices);
-      ranking = ranked.scoreMap;
-      finalUiLang = ranked.userLanguage || uiLangFromPlan;
+    if (!voices.length) {
+      await client.chat.postMessage({
+        channel: event.channel,
+        thread_ts: threadTs,
+        text: labels.noResults
+      });
+      return;
     }
 
-    const listAll = detectListAll(cleaned);
+    const ranked = await rankVoicesWithGPT(cleaned, keywordPlan, voices);
 
     const session = {
       originalQuery: cleaned,
       keywordPlan,
       voices,
-      ranking,
-      uiLanguage: finalUiLang,
+      ranking: ranked.scoreMap,
+      uiLanguage: ranked.userLanguage,
       filters: {
         quality: keywordPlan.quality_preference || 'any',
         gender: 'any',
-        listAll
+        listAll: detectListAll(cleaned)
       }
     };
 
     sessions[threadTs] = session;
 
-    // 5) Zbuduj wiadomość
     const message = buildMessageFromSession(session);
 
     await client.chat.postMessage({
@@ -1260,7 +1049,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
     });
   } catch (error) {
     console.error('Error in handleNewSearch:', error);
-    const labels = getLabels('en');
+    const labels = getLabels();
     await client.chat.postMessage({
       channel: event.channel,
       thread_ts: threadTs,
@@ -1269,7 +1058,9 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
   }
 }
 
-// ---------------- Slack Bolt app & events ---------------------
+// -------------------------------------------------------------
+// Slack Bolt app – app_mention handler
+// -------------------------------------------------------------
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -1286,7 +1077,6 @@ app.event('app_mention', async ({ event, client }) => {
   const existing = sessions[threadTs];
 
   if (existing) {
-    // Follow-up w tym samym wątku – używamy już pobranych głosów
     const lower = cleaned.toLowerCase();
 
     const wantsLanguages = checkLanguagesIntent(lower);
@@ -1323,14 +1113,16 @@ app.event('app_mention', async ({ event, client }) => {
       return;
     }
 
-    // jeśli follow-up nie jest jasnym filtrem → potraktuj jako nowe wyszukiwanie w tym samym wątku
+    // If it doesn't look like a follow-up filter → treat as a brand new search
   }
 
-  // Nowe wyszukiwanie
   await handleNewSearch(event, cleaned, threadTs, client);
 });
 
-// Start the app (Render uses PORT)
+// -------------------------------------------------------------
+// Start the app (for Render etc.)
+// -------------------------------------------------------------
+
 (async () => {
   const port = process.env.PORT || 3000;
   await app.start(port);
