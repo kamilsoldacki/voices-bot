@@ -1,8 +1,10 @@
 const { App } = require('@slack/bolt');
 const axios = require('axios');
 
-// Simple in-memory session store: Slack thread -> last search context
+// --------------------- In-memory sessions ---------------------
 const sessions = {};
+
+// --------------------- Helper functions -----------------------
 
 // Remove Slack mentions like <@U123ABC> from the message
 function cleanText(text) {
@@ -14,19 +16,14 @@ function cleanText(text) {
 function isHighQuality(voice) {
   if (!voice || typeof voice !== 'object') return false;
 
-  // 1) Direct category flag
   const cat = (voice.category || '').toString().toLowerCase();
   if (cat === 'high_quality' || cat === 'high quality') return true;
 
-  // 2) Some APIs may nest category under sharing
   if (voice.sharing && typeof voice.sharing === 'object') {
     const sharingCat = (voice.sharing.category || '').toString().toLowerCase();
-    if (sharingCat === 'high_quality' || sharingCat === 'high quality') {
-      return true;
-    }
+    if (sharingCat === 'high_quality' || sharingCat === 'high quality') return true;
   }
 
-  // 3) Official "high quality base models" flag
   if (
     Array.isArray(voice.high_quality_base_model_ids) &&
     voice.high_quality_base_model_ids.length > 0
@@ -34,12 +31,9 @@ function isHighQuality(voice) {
     return true;
   }
 
-  // 4) Labels that explicitly mark a voice as high quality
   if (voice.labels && typeof voice.labels === 'object') {
     const labelHq = String(voice.labels.high_quality || '').toLowerCase();
-    if (labelHq === 'true' || labelHq === 'yes' || labelHq === '1') {
-      return true;
-    }
+    if (labelHq === 'true' || labelHq === 'yes' || labelHq === '1') return true;
   }
 
   if (
@@ -49,15 +43,296 @@ function isHighQuality(voice) {
     typeof voice.sharing.labels === 'object'
   ) {
     const labelHq = String(voice.sharing.labels.high_quality || '').toLowerCase();
-    if (labelHq === 'true' || labelHq === 'yes' || labelHq === '1') {
-      return true;
-    }
+    if (labelHq === 'true' || labelHq === 'yes' || labelHq === '1') return true;
   }
 
   return false;
 }
 
-// Build a semantic search plan using GPT
+// Guess UI language from text (very rough, only for fallback)
+function guessUiLanguageFromText(text) {
+  if (!text) return 'en';
+  const lower = text.toLowerCase();
+  if (/[ąćęłńóśżź]/.test(lower) ||
+      lower.includes('głos') ||
+      lower.includes('glos') ||
+      lower.includes('szukam')) {
+    return 'pl';
+  }
+  return 'en';
+}
+
+// Labels per language (headings, footers, etc.)
+function getLabels(uiLang) {
+  const lang = (uiLang || 'en').slice(0, 2).toLowerCase();
+
+  if (lang === 'pl') {
+    return {
+      lang: 'pl',
+      searching: 'Szukam głosów w Voice Library… 🔍',
+      noResults:
+        'Niestety nie znalazłem żadnych głosów pasujących do tego opisu. ' +
+        'Spróbuj opisać głos trochę szerzej albo użyć innego sformułowania.',
+      suggestedHeader: 'Proponowane głosy:',
+      standardHeader: 'Głosy standardowe (nie high quality)',
+      highHeader: 'Głosy wysokiej jakości',
+      female: 'Kobiety',
+      male: 'Mężczyźni',
+      other: 'Inne / nieokreślone',
+      noVoices: 'Brak głosów w tej sekcji.',
+      genericFooter:
+        'Możesz dopytać o to, które głosy są high quality, w jakich językach działają, ' +
+        'albo doprecyzować swoje kryteria wyszukiwania.',
+      femaleFilterFooter:
+        'Pokazuję tylko kobiece głosy dla tego zapytania. ' +
+        'Możesz dopytać o jakość, języki lub doprecyzować opis.',
+      maleFilterFooter:
+        'Pokazuję tylko męskie głosy dla tego zapytania. ' +
+        'Możesz dopytać o jakość, języki lub doprecyzować opis.',
+      languagesHeader: 'Języki wśród bieżących wyników:',
+      languagesNone: 'Nie widzę informacji o językach dla tych głosów.',
+      highQualityHeader: 'Te głosy są oznaczone jako high quality:',
+      highQualityNone:
+        'Wśród bieżących propozycji nie ma żadnych głosów high quality.',
+      genericError:
+        'Coś poszło nie tak przy analizie opisu lub zapytaniu do API. Spróbuj ponownie.'
+    };
+  }
+
+  // default EN
+  return {
+    lang: 'en',
+    searching: 'Searching the Voice Library for matching voices… 🔍',
+    noResults:
+      "I couldn't find any voices matching this description. " +
+      'Try describing the voice more broadly or using different wording.',
+    suggestedHeader: 'Suggested voices:',
+    standardHeader: 'Standard voices (not high quality)',
+    highHeader: 'High quality voices',
+    female: 'Female',
+    male: 'Male',
+    other: 'Other / unspecified',
+    noVoices: 'No voices in this section.',
+    genericFooter:
+      'You can ask follow-up questions about high quality vs standard voices, ' +
+      'what languages they support, or refine your search with more details.',
+    femaleFilterFooter:
+      'Showing only female voices for your request. You can ask about their quality, languages, or refine your search further.',
+    maleFilterFooter:
+      'Showing only male voices for your request. You can ask about their quality, languages, or refine your search further.',
+    languagesHeader: 'Languages across the current results:',
+    languagesNone: 'I cannot see any language information for these voices.',
+    highQualityHeader: 'These voices are marked as high quality:',
+    highQualityNone:
+      'None of the current suggestions are marked as high quality.',
+    genericError:
+      'Something went wrong while analysing your request or calling the APIs. Please try again.'
+  };
+}
+
+// Format a single voice line for Slack
+function formatVoiceLine(voice) {
+  const url = `https://elevenlabs.io/app/voice-library?search=${encodeURIComponent(
+    voice.voice_id
+  )}`;
+  return `<${url}|${voice.name} | ${voice.voice_id}>`;
+}
+
+// Detect "list all" intent in the text (for showing more results)
+function detectListAll(text) {
+  const lower = (text || '').toLowerCase();
+  if (
+    lower.includes('list all') ||
+    lower.includes('show all') ||
+    lower.includes('wymień wszystkie') ||
+    lower.includes('wymien wszystkie') ||
+    lower.includes('pokaż wszystkie') ||
+    lower.includes('pokaz wszystkie')
+  ) {
+    return true;
+  }
+  return false;
+}
+
+// Gender classification for grouping
+function getGenderGroup(voice) {
+  const raw =
+    (voice.gender ||
+      (voice.labels && voice.labels.gender) ||
+      '').toString().toLowerCase();
+
+  if (raw === 'female' || raw === 'woman' || raw === 'f') return 'female';
+  if (raw === 'male' || raw === 'man' || raw === 'm') return 'male';
+  return 'other';
+}
+
+// Summarize languages across voices
+function summarizeLanguages(voices) {
+  const langCount = {};
+  voices.forEach((v) => {
+    const langs = [];
+    if (Array.isArray(v.verified_languages) && v.verified_languages.length > 0) {
+      v.verified_languages.forEach((entry) => {
+        if (entry && entry.language) langs.push(entry.language);
+      });
+    } else if (v.language) {
+      langs.push(v.language);
+    }
+    langs.forEach((lang) => {
+      langCount[lang] = (langCount[lang] || 0) + 1;
+    });
+  });
+  return langCount;
+}
+
+// Build languages summary text
+function buildLanguagesMessage(session) {
+  const labels = getLabels(session.uiLanguage);
+  const langCount = summarizeLanguages(session.voices);
+  const entries = Object.entries(langCount);
+  if (!entries.length) {
+    return labels.languagesNone;
+  }
+
+  let text = `${labels.languagesHeader}\n`;
+  entries.forEach(([lang, count]) => {
+    text += `• ${lang}: ${count} voices\n`;
+  });
+  return text;
+}
+
+// Build "which are high quality" message
+function buildWhichHighMessage(session) {
+  const labels = getLabels(session.uiLanguage);
+  const { voices, ranking } = session;
+  const hqVoices = voices.filter(isHighQuality);
+
+  if (!hqVoices.length) {
+    return labels.highQualityNone;
+  }
+
+  const sorted = [...hqVoices].sort(
+    (a, b) =>
+      (ranking[b.voice_id] || 0) - (ranking[a.voice_id] || 0)
+  );
+
+  const max = Math.min(sorted.length, 20);
+  let text = `${labels.highQualityHeader}\n`;
+  for (let i = 0; i < max; i++) {
+    const v = sorted[i];
+    text += `- ${formatVoiceLine(v)}\n`;
+  }
+
+  return text;
+}
+
+// Apply filters from follow-up text to session.filters
+function applyFilterChangesFromText(session, lower) {
+  let changed = false;
+
+  // Gender filters
+  if (
+    lower.includes('only female') ||
+    lower.includes('female only') ||
+    lower.includes('show only female') ||
+    lower.includes('tylko kobiece') ||
+    lower.includes('tylko damskie') ||
+    lower.includes('tylko kobiety')
+  ) {
+    session.filters.gender = 'female';
+    changed = true;
+  } else if (
+    lower.includes('only male') ||
+    lower.includes('male only') ||
+    lower.includes('show only male') ||
+    lower.includes('tylko męskie') ||
+    lower.includes('tylko meskie') ||
+    lower.includes('tylko mężczyzn') ||
+    lower.includes('tylko mezczyzn') ||
+    lower.includes('tylko facetów') ||
+    lower.includes('tylko facetow')
+  ) {
+    session.filters.gender = 'male';
+    changed = true;
+  }
+
+  if (
+    lower.includes('all genders') ||
+    lower.includes('wszystkie płcie') ||
+    lower.includes('wszystkie plcie')
+  ) {
+    session.filters.gender = 'any';
+    changed = true;
+  }
+
+  // Quality filters
+  if (
+    lower.includes('only high quality') ||
+    lower.includes('show only high quality') ||
+    lower.includes('tylko high quality') ||
+    lower.includes('pokaż tylko high quality') ||
+    lower.includes('pokaz tylko high quality') ||
+    lower.includes('only hq') ||
+    lower.includes('tylko hq')
+  ) {
+    session.filters.quality = 'high_only';
+    changed = true;
+  } else if (
+    lower.includes('without high quality') ||
+    lower.includes('no high quality') ||
+    lower.includes('show without high quality') ||
+    lower.includes('bez high quality')
+  ) {
+    session.filters.quality = 'no_high';
+    changed = true;
+  } else if (
+    lower.includes('any quality') ||
+    lower.includes('all qualities') ||
+    lower.includes('dowolna jakość') ||
+    lower.includes('dowolna jakosc')
+  ) {
+    session.filters.quality = 'any';
+    changed = true;
+  }
+
+  // Show all / list all
+  if (
+    lower.includes('list all') ||
+    lower.includes('show all') ||
+    lower.includes('wymień wszystkie') ||
+    lower.includes('wymien wszystkie') ||
+    lower.includes('pokaż wszystkie') ||
+    lower.includes('pokaz wszystkie')
+  ) {
+    session.filters.listAll = true;
+    changed = true;
+  }
+
+  return changed;
+}
+
+function checkLanguagesIntent(lower) {
+  return (
+    lower.includes('language') ||
+    lower.includes('languages') ||
+    lower.includes('język') ||
+    lower.includes('jezyk') ||
+    lower.includes('języki') ||
+    lower.includes('jezyki')
+  );
+}
+
+function checkWhichHighIntent(lower) {
+  if (lower.includes('high quality')) {
+    if (lower.includes('which') || lower.includes('które') || lower.includes('ktore')) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---------------- GPT: build search plan ----------------------
+
 async function buildSearchPlan(userText) {
   const systemPrompt = `
 You are an assistant that takes a user's description of the voice they want (in ANY language)
@@ -114,7 +389,8 @@ GUIDELINES:
 `.trim();
 
   const payload = {
-    model: 'gpt-4o-mini',
+    model: 'gpt-5-mini',
+    response_format: { type: 'json_object' },
     messages: [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userText }
@@ -135,12 +411,11 @@ GUIDELINES:
       }
     );
 
-    const content = response.data.choices[0].message.content.trim();
+    const content = response.data.choices[0].message.content;
     let plan = JSON.parse(content);
 
-    // Basic sanitization / defaults
     if (!plan.user_interface_language || typeof plan.user_interface_language !== 'string') {
-      plan.user_interface_language = 'en';
+      plan.user_interface_language = guessUiLanguageFromText(userText);
     }
 
     if (!Array.isArray(plan.use_cases)) plan.use_cases = [];
@@ -162,7 +437,7 @@ GUIDELINES:
     console.error('Failed to build search plan from OpenAI. Falling back to basic defaults.', error);
 
     return {
-      user_interface_language: 'en',
+      user_interface_language: guessUiLanguageFromText(userText),
       target_voice_language: null,
       target_accent: null,
       target_gender: null,
@@ -174,7 +449,8 @@ GUIDELINES:
   }
 }
 
-// Fetch candidate voices from ElevenLabs Voice Library using a robust multi-step strategy
+// ---------------- ElevenLabs: fetch voices --------------------
+
 async function fetchVoicesForSearchPlan(plan) {
   const seen = new Set();
   let voices = [];
@@ -182,7 +458,6 @@ async function fetchVoicesForSearchPlan(plan) {
   const wantsHighOnly = plan.quality_preference === 'high_only';
   const wantsNoHigh = plan.quality_preference === 'no_high';
 
-  // Normalize values for API
   let language = null;
   if (plan.target_voice_language && typeof plan.target_voice_language === 'string') {
     language = plan.target_voice_language.slice(0, 2).toLowerCase();
@@ -228,19 +503,16 @@ async function fetchVoicesForSearchPlan(plan) {
   function buildParams({ page_size, withLanguage, withAccent, withGender, search }) {
     const params = new URLSearchParams();
     params.set('page_size', String(page_size || 30));
-
     if (withLanguage && language) params.set('language', language);
     if (withAccent && accent) params.set('accent', accent);
     if (withGender && gender) params.set('gender', gender);
-
     if (search && String(search).trim().length > 0) {
       params.set('search', String(search).trim());
     }
-
     return params;
   }
 
-  // STEP 1: Narrow fuzzy search using search queries + language/accent/gender (if available)
+  // STEP 1: Narrow fuzzy search using queries + language/accent/gender
   for (const q of queries) {
     const params = buildParams({
       page_size: 30,
@@ -259,7 +531,7 @@ async function fetchVoicesForSearchPlan(plan) {
     if (voices.length >= 30) break;
   }
 
-  // STEP 2: If we still have few voices and we know the language, fetch a broad sample of ALL voices in that language
+  // STEP 2: If few voices and known language, fetch broad sample for that language
   if (voices.length < 20 && language) {
     const params = buildParams({
       page_size: 100,
@@ -275,7 +547,7 @@ async function fetchVoicesForSearchPlan(plan) {
     }
   }
 
-  // STEP 3: If STILL very few voices, fall back to a general sample of the library
+  // STEP 3: If STILL few voices, get a general sample
   if (voices.length < 10) {
     const params = buildParams({
       page_size: 100,
@@ -291,29 +563,24 @@ async function fetchVoicesForSearchPlan(plan) {
     }
   }
 
-  // Apply high quality filters AFTER collecting broad candidates
+  // Apply quality filters AFTER collecting broad candidates
   let result = voices;
 
   if (wantsHighOnly) {
     const onlyHigh = voices.filter(isHighQuality);
     if (onlyHigh.length) result = onlyHigh;
   } else if (wantsNoHigh) {
-    const onlyStandard = voices.filter(v => !isHighQuality(v));
+    const onlyStandard = voices.filter((v) => !isHighQuality(v));
     if (onlyStandard.length) result = onlyStandard;
   }
 
   return result;
 }
 
-// Ask GPT to act as a "voice curator" and return JSON with groups of voice_ids
-async function curateVoicesWithGPT(userText, plan, voices) {
-  // Map for quick lookup by id
-  const byId = {};
-  for (const v of voices) {
-    if (v && v.voice_id) byId[v.voice_id] = v;
-  }
+// --------------- GPT: rank voices (no formatting) --------------
 
-  const candidates = voices.slice(0, 80).map(v => ({
+async function rankVoicesWithGPT(userText, plan, voices) {
+  const candidates = voices.slice(0, 80).map((v) => ({
     voice_id: v.voice_id,
     name: v.name,
     language: v.language,
@@ -332,83 +599,57 @@ async function curateVoicesWithGPT(userText, plan, voices) {
   }));
 
   const systemPrompt = `
-You are an expert curator of the ElevenLabs Voice Library.
+You are an assistant that ranks candidate ElevenLabs voices for a user's request.
 
-You receive:
-- the user's request in natural language (in ANY language),
-- a "search_plan" describing what they are looking for,
-- a list of "candidate_voices" from the ElevenLabs Voice Library (GET /v1/shared-voices).
+You will receive a JSON object with:
+{
+  "user_query": string,
+  "search_plan": object,
+  "candidate_voices": [
+    {
+      "voice_id": string,
+      "name": string,
+      "language": string or null,
+      "accent": string or null,
+      "gender": string or null,
+      "descriptive": string or null,
+      "use_case": string or null,
+      "category": string or null,
+      "usage_character_count_1y": number or null,
+      "cloned_by_count": number or null,
+      "featured": boolean or null,
+      "description": string or null,
+      "verified_languages": array or null
+    },
+    ...
+  ]
+}
 
-Your task is to decide WHICH candidate voices should appear in which group.
-Formatting of the Slack message will be done by the caller, not by you.
-
-You MUST return ONLY a single JSON object with EXACTLY this structure:
+Return ONLY a single JSON object with this structure:
 
 {
-  "user_language": string,    // 2-letter code for the user's language, e.g. "en","pl","es"
-  "headings": {
-    "standard_section": string,        // heading text for standard voices section
-    "high_quality_section": string,    // heading text for high quality section
-    "female": string,                  // label for female voices
-    "male": string,                    // label for male voices
-    "other": string,                   // label for other/unspecified voices
-    "no_voices": string                // text used when a group is empty
-  },
-  "standard": {
-    "female": string[],       // array of voice_id strings (subset of candidate_voices.voice_id)
-    "male": string[],
-    "other": string[]
-  },
-  "high_quality": {
-    "female": string[],
-    "male": string[],
-    "other": string[]
-  },
-  "footer": string            // short paragraph in the user's language explaining possible follow-up questions
+  "user_language": string,   // 2-letter code for the user's language, e.g. "en","pl"
+  "ranking": [
+    {
+      "voice_id": string,    // must be one of the candidate_voices.voice_id
+      "score": number        // between 0.0 and 1.0, higher = better match
+    },
+    ...
+  ]
 }
 
 RULES:
-
-1. SELECTION & RANKING
-   - From candidate_voices, select and order the BEST matches for the user's request.
-   - Match on language, accent, gender, use_case, descriptive, age, category, and verified_languages.
-   - Use popularity signals as tie-breakers: usage_character_count_1y, cloned_by_count, featured.
-   - Never invent new voices. Use ONLY voice_id values that exist in candidate_voices.
-   - You may ignore voices that clearly do not match the request.
-
-2. STANDARD vs HIGH QUALITY
-   - A voice is "high quality" when it either:
-     - has category "high_quality" (case-insensitive), OR
-     - has a non-empty high_quality_base_model_ids list, OR
-     - is clearly described as high quality in its metadata.
-   - All other voices are "standard".
-   - Place each voice_id in exactly ONE of the standard or high_quality sections.
-
-3. GENDER GROUPING
-   - For each of "standard" and "high_quality", group voices by gender:
-     - Put obviously female voices into "female".
-     - Put obviously male voices into "male".
-     - Put all others into "other".
-   - Use only voice_id strings in those arrays.
-
-4. HOW MANY VOICES TO RETURN
-   - Normally, within each gender subgroup, include up to 5 voices (best matches first).
-   - However, if the user explicitly asks to "list all" or "wymień wszystkie" or "show all"
-     voices of a certain type, you may include more voices (up to about 50 total across all groups).
-
-5. HEADINGS & FOOTER LANGUAGE
-   - "user_language" should match the user's language (e.g. "en" for English, "pl" for Polish).
-   - All strings inside "headings" and "footer" must be in that same language.
-   - Do NOT add markdown syntax (#, **, -, etc.) inside those strings.
-     They should be plain text; the caller will add markdown.
-
-6. JSON ONLY
-   - Return ONLY valid JSON for the described object.
-   - Do NOT include markdown, explanations, or any other text outside the JSON.
+- Include EACH candidate_voices.voice_id EXACTLY ONCE in "ranking".
+- Use language, accent, gender, descriptive, use_case, category, popularity (usage_character_count_1y, cloned_by_count, featured) to estimate how well each voice matches the user_query.
+- 1.0 = perfect match; 0.0 = very weak/irrelevant.
+- If you are unsure, assign a mid-range score, but still include the voice.
+- user_language should reflect the language of the user's query (e.g. "pl" for Polish).
+- Do NOT add extra fields.
 `.trim();
 
   const payload = {
-    model: 'gpt-4o-mini',
+    model: 'gpt-5-mini',
+    response_format: { type: 'json_object' },
     messages: [
       { role: 'system', content: systemPrompt },
       {
@@ -420,7 +661,7 @@ RULES:
         })
       }
     ],
-    temperature: 0.3
+    temperature: 0
   };
 
   try {
@@ -432,149 +673,245 @@ RULES:
           Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
           'Content-Type': 'application/json'
         },
-        timeout: 20000
+        timeout: 25000
       }
     );
 
-    const content = response.data.choices[0].message.content.trim();
+    const content = response.data.choices[0].message.content;
     const data = JSON.parse(content);
 
-    const userLangRaw =
-      data.user_language ||
-      plan.user_interface_language ||
-      'en';
+    const voicesById = {};
+    voices.forEach((v) => {
+      voicesById[v.voice_id] = true;
+    });
 
-    const userLang = userLangRaw.toString().slice(0, 2).toLowerCase();
+    const rankingArray = Array.isArray(data.ranking) ? data.ranking : [];
+    const scoreMap = {};
 
-    const headings = data.headings || {};
-    const standardGroups = data.standard || {};
-    const highGroups = data.high_quality || {};
-    const footer = typeof data.footer === 'string' ? data.footer.trim() : '';
-
-    function getHeading(key, fallbackEn, fallbackPl) {
-      const v = headings[key];
-      if (typeof v === 'string' && v.trim().length > 0) return v.trim();
-      if (userLang === 'pl') return fallbackPl;
-      return fallbackEn;
-    }
-
-    const hStandard = getHeading(
-      'standard_section',
-      'Standard voices (not high quality)',
-      'Głosy standardowe (nie high quality)'
-    );
-    const hHigh = getHeading(
-      'high_quality_section',
-      'High quality voices',
-      'Głosy wysokiej jakości'
-    );
-    const hFemale = getHeading('female', 'Female:', 'Kobiety:');
-    const hMale = getHeading('male', 'Male:', 'Mężczyźni:');
-    const hOther = getHeading('other', 'Other / unspecified:', 'Inne / nieokreślone:');
-    const noVoicesLabel = getHeading(
-      'no_voices',
-      'No voices in this section.',
-      'Brak głosów w tej sekcji.'
-    );
-
-    function formatVoiceLine(voice) {
-      const url = `https://elevenlabs.io/app/voice-library?search=${encodeURIComponent(
-        voice.voice_id
-      )}`;
-      return `<${url}|${voice.name} | ${voice.voice_id}>`;
-    }
-
-    const lines = [];
-
-    function appendSection(sectionTitle, groups) {
-      lines.push(`### ${sectionTitle}`);
-
-      const order = [
-        { key: 'female', label: hFemale },
-        { key: 'male', label: hMale },
-        { key: 'other', label: hOther }
-      ];
-
-      for (const { key, label } of order) {
-        const arr = Array.isArray(groups[key]) ? groups[key] : [];
-        lines.push(`**${label}**`);
-        let count = 0;
-        for (const id of arr) {
-          const v = byId[id];
-          if (!v) continue;
-          lines.push(`- ${formatVoiceLine(v)}`);
-          count++;
-        }
-        if (count === 0) {
-          lines.push(`- ${noVoicesLabel}`);
-        }
+    rankingArray.forEach((item, index) => {
+      if (!item || !item.voice_id) return;
+      const id = item.voice_id;
+      if (!voicesById[id]) return;
+      let score = typeof item.score === 'number' ? item.score : null;
+      if (score === null || isNaN(score)) {
+        score = (rankingArray.length - index) / rankingArray.length;
       }
+      scoreMap[id] = score;
+    });
 
-      lines.push('---');
-    }
-
-    appendSection(hStandard, standardGroups);
-    appendSection(hHigh, highGroups);
-
-    if (footer && footer.length > 0) {
-      lines.push(footer);
-    } else {
-      if (userLang === 'pl') {
-        lines.push(
-          'Możesz zapytać, które głosy są high quality, o języki, które obsługują, albo doprecyzować swoje kryteria wyszukiwania.'
-        );
-      } else {
-        lines.push(
-          'Feel free to ask which voices are high quality vs standard, what languages they support, or refine your search with more details.'
-        );
+    // Ensure every voice_id has some score
+    voices.forEach((v, idx) => {
+      if (!scoreMap[v.voice_id]) {
+        scoreMap[v.voice_id] = ((voices.length - idx) / voices.length) * 0.2;
       }
-    }
+    });
 
-    return lines.join('\n');
+    const userLang =
+      (data.user_language ||
+        plan.user_interface_language ||
+        guessUiLanguageFromText(userText) ||
+        'en')
+        .toString()
+        .slice(0, 2)
+        .toLowerCase();
+
+    return { scoreMap, userLanguage: userLang };
   } catch (error) {
-    console.error('Failed to get curated JSON from OpenAI. Falling back to simple listing.', error);
+    console.error('Failed to rank voices with OpenAI. Falling back to API order.', error);
 
-    // SIMPLE FALLBACK: naive standard/high split list in English
-    const standard = voices.filter(v => !isHighQuality(v));
-    const high = voices.filter(v => isHighQuality(v));
+    const scoreMap = {};
+    voices.forEach((v, idx) => {
+      scoreMap[v.voice_id] = (voices.length - idx) / voices.length;
+    });
 
-    function formatLine(v, index) {
-      const url = `https://elevenlabs.io/app/voice-library?search=${encodeURIComponent(
-        v.voice_id
-      )}`;
-      return `${index}. <${url}|${v.name} | ${v.voice_id}>`;
-    }
+    const userLang =
+      (plan.user_interface_language ||
+        guessUiLanguageFromText(userText) ||
+        'en')
+        .toString()
+        .slice(0, 2)
+        .toLowerCase();
 
-    let text = 'Suggested voices:\n\n';
-
-    text += '*Standard voices (not high quality):*\n';
-    if (!standard.length) {
-      text += '_No voices in this section._\n\n';
-    } else {
-      standard.slice(0, 20).forEach((v, i) => {
-        text += formatLine(v, i + 1) + '\n';
-      });
-      text += '\n';
-    }
-
-    text += '*High quality voices:*\n';
-    if (!high.length) {
-      text += '_No voices in this section._\n\n';
-    } else {
-      high.slice(0, 20).forEach((v, i) => {
-        text += formatLine(v, i + 1) + '\n';
-      });
-      text += '\n';
-    }
-
-    text +=
-      '\nYou can ask follow-up questions about quality (standard vs high quality) or the languages these voices support.';
-
-    return text;
+    return { scoreMap, userLanguage: userLang };
   }
 }
 
-// Initialize Slack Bolt app in Socket Mode
+// ---------------- Build Slack message from session -------------
+
+function buildMessageFromSession(session) {
+  const { voices, ranking, uiLanguage, filters } = session;
+  const labels = getLabels(uiLanguage);
+
+  const maxPerGender = filters.listAll ? 50 : 5;
+
+  const sorted = [...voices].sort(
+    (a, b) =>
+      (ranking[b.voice_id] || 0) - (ranking[a.voice_id] || 0)
+  );
+
+  const qualityFilter = filters.quality || 'any';
+  const genderFilter = filters.gender || 'any';
+
+  const sections = {
+    standard: { female: [], male: [], other: [] },
+    high: { female: [], male: [], other: [] }
+  };
+
+  sorted.forEach((v) => {
+    const isHq = isHighQuality(v);
+    if (qualityFilter === 'high_only' && !isHq) return;
+    if (qualityFilter === 'no_high' && isHq) return;
+
+    const group = isHq ? 'high' : 'standard';
+    const genderGroup = getGenderGroup(v);
+
+    if (genderFilter !== 'any' && genderGroup !== genderFilter) return;
+
+    const arr = sections[group][genderGroup];
+    if (arr.length < maxPerGender) {
+      arr.push(v);
+    }
+  });
+
+  const lines = [];
+  lines.push(labels.suggestedHeader);
+  lines.push('');
+
+  function appendSection(title, sectionKey) {
+    const groups = sections[sectionKey];
+    const order = ['female', 'male', 'other'];
+    const genderLabels = {
+      female: labels.female,
+      male: labels.male,
+      other: labels.other
+    };
+
+    lines.push(`### ${title}`);
+
+    if (genderFilter !== 'any') {
+      const key = genderFilter;
+      const label = genderLabels[key];
+      const arr = groups[key];
+
+      lines.push(`**${label}:**`);
+      if (!arr.length) {
+        lines.push(`- ${labels.noVoices}`);
+      } else {
+        arr.forEach((v) => {
+          lines.push(`- ${formatVoiceLine(v)}`);
+        });
+      }
+      lines.push('');
+      return;
+    }
+
+    // Show all genders
+    order.forEach((key) => {
+      const label = genderLabels[key];
+      const arr = groups[key];
+
+      lines.push(`**${label}:**`);
+      if (!arr.length) {
+        lines.push(`- ${labels.noVoices}`);
+      } else {
+        arr.forEach((v) => {
+          lines.push(`- ${formatVoiceLine(v)}`);
+        });
+      }
+      lines.push('');
+    });
+  }
+
+  appendSection(labels.standardHeader, 'standard');
+  appendSection(labels.highHeader, 'high');
+
+  if (genderFilter === 'female') {
+    lines.push(labels.femaleFilterFooter || labels.genericFooter);
+  } else if (genderFilter === 'male') {
+    lines.push(labels.maleFilterFooter || labels.genericFooter);
+  } else {
+    lines.push(labels.genericFooter);
+  }
+
+  return lines.join('\n');
+}
+
+// ---------------- New search handler --------------------------
+
+async function handleNewSearch(event, cleaned, threadTs, client) {
+  try {
+    // 1) Build search plan via GPT
+    const searchPlan = await buildSearchPlan(cleaned);
+    const uiLangFromPlan = (searchPlan.user_interface_language || 'en')
+      .toString()
+      .slice(0, 2)
+      .toLowerCase();
+    const labelsForSearching = getLabels(uiLangFromPlan);
+
+    // 2) Inform user we're searching
+    await client.chat.postMessage({
+      channel: event.channel,
+      thread_ts: threadTs,
+      text: labelsForSearching.searching
+    });
+
+    // 3) Fetch voices from ElevenLabs (public Voice Library only)
+    const voices = await fetchVoicesForSearchPlan(searchPlan);
+    if (!voices.length) {
+      await client.chat.postMessage({
+        channel: event.channel,
+        thread_ts: threadTs,
+        text: labelsForSearching.noResults
+      });
+      return;
+    }
+
+    // 4) Rank voices via GPT-5-mini
+    const { scoreMap, userLanguage } = await rankVoicesWithGPT(
+      cleaned,
+      searchPlan,
+      voices
+    );
+
+    const finalUiLang = userLanguage || uiLangFromPlan;
+    const listAll = detectListAll(cleaned);
+
+    const session = {
+      originalQuery: cleaned,
+      searchPlan,
+      voices,
+      ranking: scoreMap,
+      uiLanguage: finalUiLang,
+      filters: {
+        quality: searchPlan.quality_preference || 'any',
+        gender: 'any',
+        listAll
+      }
+    };
+
+    sessions[threadTs] = session;
+
+    // 5) Build final Slack message
+    const message = buildMessageFromSession(session);
+
+    await client.chat.postMessage({
+      channel: event.channel,
+      thread_ts: threadTs,
+      text: message
+    });
+  } catch (error) {
+    console.error('Error in handleNewSearch:', error);
+    const labels = getLabels('en');
+    await client.chat.postMessage({
+      channel: event.channel,
+      thread_ts: threadTs,
+      text: labels.genericError
+    });
+  }
+}
+
+// ---------------- Slack Bolt app & events ---------------------
+
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   signingSecret: process.env.SLACK_SIGNING_SECRET,
@@ -582,7 +919,6 @@ const app = new App({
   appToken: process.env.SLACK_APP_TOKEN
 });
 
-// Handle @mentions
 app.event('app_mention', async ({ event, client }) => {
   const rawText = event.text || '';
   const cleaned = cleanText(rawText);
@@ -590,61 +926,49 @@ app.event('app_mention', async ({ event, client }) => {
 
   const existing = sessions[threadTs];
 
-  // If there is already a session in this thread, treat this as extra context for the search
-  const combinedText = existing
-    ? `${existing.originalQuery}\n\nUser follow-up:\n${cleaned}`
-    : cleaned;
+  if (existing) {
+    // Follow-up logic: filters and info based on previous results
+    const lower = cleaned.toLowerCase();
 
-  // Small immediate feedback
-  await client.chat.postMessage({
-    channel: event.channel,
-    thread_ts: threadTs,
-    text: 'Searching the Voice Library for matching voices… 🔍'
-  });
+    const wantsLanguages = checkLanguagesIntent(lower);
+    const wantsWhichHigh = checkWhichHighIntent(lower);
+    const filtersChanged = applyFilterChangesFromText(existing, lower);
 
-  try {
-    // 1) Build search plan with GPT (uses the whole conversation context in this thread)
-    const searchPlan = await buildSearchPlan(combinedText);
-
-    // 2) Fetch candidate voices from ElevenLabs Voice Library (with multi-step fallback)
-    const voices = await fetchVoicesForSearchPlan(searchPlan);
-
-    if (!voices.length) {
+    if (wantsLanguages) {
+      const msg = buildLanguagesMessage(existing);
       await client.chat.postMessage({
         channel: event.channel,
         thread_ts: threadTs,
-        text:
-          "I couldn't find any voices matching this description. Try describing the voice more broadly or using different wording."
+        text: msg
       });
       return;
     }
 
-    // 3) Ask GPT to act as a curator on top of these voices and return grouped JSON
-    const reply = await curateVoicesWithGPT(combinedText, searchPlan, voices);
+    if (wantsWhichHigh) {
+      const msg = buildWhichHighMessage(existing);
+      await client.chat.postMessage({
+        channel: event.channel,
+        thread_ts: threadTs,
+        text: msg
+      });
+      return;
+    }
 
-    // 4) Store session for further follow-ups in this thread
-    sessions[threadTs] = {
-      originalQuery: combinedText,
-      searchPlan,
-      voices
-    };
+    if (filtersChanged) {
+      const msg = buildMessageFromSession(existing);
+      await client.chat.postMessage({
+        channel: event.channel,
+        thread_ts: threadTs,
+        text: msg
+      });
+      return;
+    }
 
-    // 5) Send curated response back to Slack
-    await client.chat.postMessage({
-      channel: event.channel,
-      thread_ts: threadTs,
-      text: reply
-    });
-  } catch (error) {
-    console.error('Error handling app_mention:', error);
-
-    await client.chat.postMessage({
-      channel: event.channel,
-      thread_ts: threadTs,
-      text:
-        'Something went wrong while analysing your request or calling the APIs. Please try again.'
-    });
+    // If no clear follow-up intent, treat as a brand new search in this thread
   }
+
+  // No existing session (or this looks like a new query) -> new search
+  await handleNewSearch(event, cleaned, threadTs, client);
 });
 
 // Start the app (Render uses PORT)
