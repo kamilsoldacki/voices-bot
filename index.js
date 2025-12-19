@@ -10,6 +10,27 @@ const sessions = {};
 // Small helpers
 // -------------------------------------------------------------
 
+function safeLogAxiosError(context, err) {
+  try {
+    const status = err?.response?.status;
+    const statusText = err?.response?.statusText;
+    const msg =
+      err?.response?.data?.error?.message ||
+      err?.message ||
+      (typeof err === 'string' ? err : 'Unknown error');
+    const rid =
+      err?.response?.headers?.['x-request-id'] ||
+      err?.response?.headers?.['x-openai-request-id'];
+    console.error(
+      `[${context}] ${status || ''} ${statusText || ''} ${msg}${
+        rid ? ` (request_id=${rid})` : ''
+      }`
+    );
+  } catch (e) {
+    console.error(`[${context}]`, err?.message || err);
+  }
+}
+
 function cleanText(text) {
   if (!text) return '';
   // remove Slack mentions like <@U123ABC>
@@ -366,7 +387,6 @@ function checkWhichHighIntent(lower) {
 }
 
 // Detect special intent like "most used Polish voices", "najczęściej używane polskie głosy"
-// Detect special intent like "most used Polish voices", "najczęściej używane polskie głosy"
 function detectSpecialIntent(userText, plan) {
   const lower = (userText || '').toLowerCase();
 
@@ -470,7 +490,7 @@ Task:
 `.trim();
 
   const payload = {
-    model: 'gpt-4.1-mini',
+    model: 'gpt-4o-mini',
     messages: [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: text }
@@ -494,7 +514,8 @@ Task:
     const content = response.data.choices[0].message.content;
     return content || text;
   } catch (err) {
-    console.error('Translation failed, returning original English text.', err.message || err);
+    safeLogAxiosError('translateForUserLanguage', err);
+    // Return original English text on failure
     return text;
   }
 }
@@ -576,7 +597,7 @@ IMPORTANT:
 `.trim();
 
   const payload = {
-    model: 'gpt-4.1-mini',
+    model: 'gpt-4o-mini',
     response_format: { type: 'json_object' },
     messages: [
       { role: 'system', content: systemPrompt },
@@ -639,7 +660,7 @@ IMPORTANT:
 
     return plan;
   } catch (error) {
-    console.error('Failed to build keyword plan from OpenAI. Falling back to basic defaults.', error);
+    safeLogAxiosError('buildKeywordPlan', error);
 
     const qp = detectQualityPreferenceFromText(userText);
 
@@ -889,22 +910,25 @@ async function fetchTopVoicesByLanguage(languageCode, qualityPreference) {
 // -------------------------------------------------------------
 
 async function rankVoicesWithGPT(userText, keywordPlan, voices) {
-  const MAX_VOICES = 80;
+  const MAX_VOICES = 50;
+  const truncate = (val, max) => {
+    if (val == null) return null;
+    const s = String(val);
+    return s.length > max ? s.slice(0, max) : s;
+  };
   const candidates = voices.slice(0, MAX_VOICES).map((v) => ({
     voice_id: v.voice_id,
-    name: v.name,
+    name: truncate(v.name, 80),
     language: v.language || null,
-    accent: v.accent || null,
+    accent: truncate(v.accent, 40),
     gender: v.gender || null,
-    description: v.description || null,
-    descriptive: v.descriptive || null,
-    use_case: v.use_case || null,
-    labels: v.labels || null,
+    description: truncate(v.description, 240),
+    descriptive: truncate(v.descriptive, 120),
+    // keep a small set of fields; omit heavy arrays/objects like verified_languages/labels
     category: v.category || null,
     usage_character_count_1y:
       v.usage_character_count_1y || v.usage_character_count_7d || null,
-    verified_languages: v.verified_languages || null,
-    matched_keywords: v._matched_keywords || []
+    matched_keywords: Array.isArray(v._matched_keywords) ? v._matched_keywords : []
   }));
 
   const systemPrompt = `
@@ -931,11 +955,8 @@ You will receive:
       "gender": string or null,
       "description": string or null,
       "descriptive": string or null,
-      "use_case": string or null,
-      "labels": object or null,
       "category": string or null,
       "usage_character_count_1y": number or null,
-      "verified_languages": array or null,
       "matched_keywords": string[]
     },
     ...
@@ -1003,7 +1024,7 @@ Every candidate_voices.voice_id MUST appear exactly once in "ranking".
 `.trim();
 
   const payload = {
-    model: 'gpt-4.1',
+    model: 'gpt-4o',
     response_format: { type: 'json_object' },
     messages: [
       { role: 'system', content: systemPrompt },
@@ -1069,7 +1090,7 @@ Every candidate_voices.voice_id MUST appear exactly once in "ranking".
 
     return { scoreMap, userLanguage: userLang };
   } catch (err) {
-    console.error('Failed to rank voices with GPT, falling back to API order.', err);
+    safeLogAxiosError('rankVoicesWithGPT', err);
 
     const scoreMap = {};
     voices.forEach((v, idx) => {
