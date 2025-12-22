@@ -877,9 +877,10 @@ IMPORTANT:
 // ElevenLabs: search public shared voices (per keyword)
 // -------------------------------------------------------------
 
-async function fetchVoicesByKeywords(plan, userText) {
+async function fetchVoicesByKeywords(plan, userText, traceCb) {
   const XI_KEY = process.env.ELEVENLABS_API_KEY;
   const seen = new Map(); // voice_id -> { voice, matchedKeywords: Set<string> }
+  const trace = typeof traceCb === 'function' ? traceCb : () => {};
 
   async function callSharedVoices(params) {
     const url = `https://api.elevenlabs.io/v1/shared-voices?${params.toString()}`;
@@ -972,6 +973,14 @@ async function fetchVoicesByKeywords(plan, userText) {
       params.set('search', kw);
       try {
         const voicesForKeyword = await callSharedVoices(params);
+        try {
+          trace({
+            stage: 'per_keyword',
+            keyword: kw,
+            params: paramsToObject(params),
+            count: Array.isArray(voicesForKeyword) ? voicesForKeyword.length : 0
+          });
+        } catch (_) {}
         return { kw, voices: voicesForKeyword || [] };
       } catch (err) {
         console.error('Error fetching voices for keyword:', kw, err.message || err);
@@ -1019,6 +1028,13 @@ async function fetchVoicesByKeywords(plan, userText) {
 
     try {
       const fallbackVoices = await callSharedVoices(params);
+      try {
+        trace({
+          stage: 'combined',
+          params: paramsToObject(params),
+          count: Array.isArray(fallbackVoices) ? fallbackVoices.length : 0
+        });
+      } catch (_) {}
       fallbackVoices.forEach((voice) => {
         if (!voice || !voice.voice_id) return;
         if (!seen.has(voice.voice_id)) {
@@ -1046,6 +1062,13 @@ async function fetchVoicesByKeywords(plan, userText) {
 
     try {
       const broadVoices = await callSharedVoices(params);
+      try {
+        trace({
+          stage: 'broad',
+          params: paramsToObject(params),
+          count: Array.isArray(broadVoices) ? broadVoices.length : 0
+        });
+      } catch (_) {}
       broadVoices.forEach((voice) => {
         if (!voice || !voice.voice_id) return;
         if (!seen.has(voice.voice_id)) {
@@ -1086,6 +1109,13 @@ async function fetchVoicesByKeywords(plan, userText) {
       }
       try {
         const altVoices = await callSharedVoices(params);
+        try {
+          trace({
+            stage: 'alt_language',
+            params: paramsToObject(params),
+            count: Array.isArray(altVoices) ? altVoices.length : 0
+          });
+        } catch (_) {}
         altVoices.forEach((voice) => {
           if (!voice || !voice.voice_id) return;
           if (!seen.has(voice.voice_id)) {
@@ -1109,6 +1139,13 @@ async function fetchVoicesByKeywords(plan, userText) {
     }
     try {
       const noLangVoices = await callSharedVoices(params);
+      try {
+        trace({
+          stage: 'no_language',
+          params: paramsToObject(params),
+          count: Array.isArray(noLangVoices) ? noLangVoices.length : 0
+        });
+      } catch (_) {}
       const filtered = (noLangVoices || []).filter((v) => isVoiceInLanguage(v, language));
       filtered.forEach((voice) => {
         if (!voice || !voice.voice_id) return;
@@ -1154,8 +1191,9 @@ async function fetchVoicesByKeywords(plan, userText) {
 }
 
 // Special mode: "top by language" – most used voices in a given language
-async function fetchTopVoicesByLanguage(languageCode, qualityPreference) {
+async function fetchTopVoicesByLanguage(languageCode, qualityPreference, traceCb) {
   const XI_KEY = process.env.ELEVENLABS_API_KEY;
+  const trace = typeof traceCb === 'function' ? traceCb : () => {};
 
   try {
     const params = new URLSearchParams();
@@ -1176,6 +1214,13 @@ async function fetchTopVoicesByLanguage(languageCode, qualityPreference) {
     });
 
     let voices = res.data.voices || [];
+    try {
+      trace({
+        stage: 'top_by_language',
+        params: paramsToObject(params),
+        count: Array.isArray(voices) ? voices.length : 0
+      });
+    } catch (_) {}
     if (!voices.length) return [];
 
     voices.sort((a, b) => {
@@ -1439,53 +1484,26 @@ function buildMessageFromSession(session) {
 
   const lines = [];
 
-  lines.push(
-    labels.suggestedHeader +
-      (originalQuery ? `\n> “${originalQuery.trim()}”` : '')
-  );
-  lines.push('');
-
   function appendSection(title, sectionKey) {
     const groups = sections[sectionKey];
-    const order = ['female', 'male', 'other'];
+    const order = genderFilter !== 'any' ? [genderFilter] : ['female', 'male', 'other'];
     const genderLabels = {
       female: labels.female,
       male: labels.male,
       other: labels.other
     };
 
+    const nonEmpty = order.filter((key) => (groups[key] || []).length > 0);
+    if (!nonEmpty.length) return; // skip entire section if empty
+
     lines.push(`*${title}*`);
-
-    if (genderFilter !== 'any') {
-      const key = genderFilter;
+    nonEmpty.forEach((key) => {
       const label = genderLabels[key];
       const arr = groups[key];
-
       lines.push(`*${label}:*`);
-      if (!arr.length) {
-        lines.push(labels.noVoices);
-      } else {
-        arr.forEach((v) => {
-          lines.push(`- ${formatVoiceLine(v)}`);
-        });
-      }
-      lines.push('');
-      return;
-    }
-
-    // all genders
-    order.forEach((key) => {
-      const label = genderLabels[key];
-      const arr = groups[key];
-
-      lines.push(`*${label}:*`);
-      if (!arr.length) {
-        lines.push(labels.noVoices);
-      } else {
-        arr.forEach((v) => {
-          lines.push(`- ${formatVoiceLine(v)}`);
-        });
-      }
+      arr.forEach((v) => {
+        lines.push(`- ${formatVoiceLine(v)}`);
+      });
       lines.push('');
     });
   }
@@ -1551,6 +1569,56 @@ function buildBlocksFromText(text) {
   return blocks;
 }
 
+function paramsToObject(params) {
+  const obj = {};
+  try {
+    for (const [k, v] of params.entries()) obj[k] = v;
+  } catch (_) {}
+  return obj;
+}
+
+function buildSearchReport(trace, plan, mode) {
+  try {
+    const lines = [];
+    lines.push('*Search report (POC)*');
+    lines.push(`Mode: \`${mode || 'generic'}\``);
+    lines.push(
+      `Plan: lang=${plan?.target_voice_language || '-'}, accent=${plan?.target_accent || '-'}, gender=${plan?.target_gender || '-'}, quality=${plan?.quality_preference || 'any'}`
+    );
+    lines.push('');
+    if (!Array.isArray(trace) || !trace.length) {
+      lines.push('_No trace entries collected._');
+      return lines.join('\n');
+    }
+    const max = Math.min(trace.length, 30);
+    for (let i = 0; i < max; i++) {
+      const t = trace[i];
+      const params = t.params ? Object.entries(t.params).map(([k, v]) => `${k}=${v}`).join('&') : '';
+      if (t.stage === 'per_keyword') {
+        lines.push(`• per_keyword: "${t.keyword}" (${params}) → ${t.count}`);
+      } else if (t.stage === 'combined') {
+        lines.push(`• combined (${params}) → ${t.count}`);
+      } else if (t.stage === 'broad') {
+        lines.push(`• broad (${params}) → ${t.count}`);
+      } else if (t.stage === 'alt_language') {
+        lines.push(`• alt_language (${params}) → ${t.count}`);
+      } else if (t.stage === 'no_language') {
+        lines.push(`• no_language (${params}) → ${t.count}`);
+      } else if (t.stage === 'top_by_language') {
+        lines.push(`• top_by_language (${params}) → ${t.count}`);
+      } else {
+        lines.push(`• ${t.stage || 'unknown'} (${params}) → ${t.count ?? '-'}`);
+      }
+    }
+    if (trace.length > max) {
+      lines.push(`… and ${trace.length - max} more`);
+    }
+    return lines.join('\n');
+  } catch (_) {
+    return '*Search report (POC)*\\n_Failed to render trace._';
+  }
+}
+
 // -------------------------------------------------------------
 // New search handler
 // -------------------------------------------------------------
@@ -1575,12 +1643,19 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
 
     let voices;
     let rankingMap;
+    const searchTrace = [];
+    const traceCb = (entry) => {
+      try {
+        searchTrace.push(entry);
+      } catch (_) {}
+    };
 
     if (special.mode === 'top_by_language' && special.languageCode) {
       // "most used Polish voices" mode – sort by usage
       voices = await fetchTopVoicesByLanguage(
         special.languageCode,
-        keywordPlan.quality_preference
+        keywordPlan.quality_preference,
+        traceCb
       );
 
       if (!voices.length) {
@@ -1612,7 +1687,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
       }
     } else {
       // normal mode – keyword-based search + GPT curator ranking
-      voices = await fetchVoicesByKeywords(keywordPlan, cleaned);
+      voices = await fetchVoicesByKeywords(keywordPlan, cleaned, traceCb);
 
       if (!voices.length) {
         const noResText = await translateForUserLanguage(labels.noResults, uiLang);
@@ -1654,6 +1729,18 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
       text: message,
       blocks: blocks || undefined
     });
+
+    if (process.env.POC_SEARCH_REPORT === 'true') {
+      let report = buildSearchReport(searchTrace, keywordPlan, special.mode);
+      report = await translateForUserLanguage(report, uiLang);
+      const reportBlocks = buildBlocksFromText(report);
+      await client.chat.postMessage({
+        channel: event.channel,
+        thread_ts: threadTs,
+        text: report,
+        blocks: reportBlocks || undefined
+      });
+    }
   } catch (error) {
     console.error('Error in handleNewSearch:', error);
     const labels = getLabels();
@@ -1744,7 +1831,13 @@ app.event('app_mention', async ({ event, client }) => {
         cleaned
       );
       const combinedQuery = [existing.originalQuery || '', cleaned].join(' ').trim();
-      const voices = await fetchVoicesByKeywords(refinedPlan, combinedQuery);
+      const searchTrace = [];
+      const traceCb = (entry) => {
+        try {
+          searchTrace.push(entry);
+        } catch (_) {}
+      };
+      const voices = await fetchVoicesByKeywords(refinedPlan, combinedQuery, traceCb);
       if (!voices.length) {
         const labels = getLabels();
         const noResText = await translateForUserLanguage(labels.noResults, existing.uiLanguage);
@@ -1771,6 +1864,17 @@ app.event('app_mention', async ({ event, client }) => {
         text: msg,
         blocks: blocks || undefined
       });
+      if (process.env.POC_SEARCH_REPORT === 'true') {
+        let report = buildSearchReport(searchTrace, refinedPlan, 'refine');
+        report = await translateForUserLanguage(report, existing.uiLanguage);
+        const reportBlocks = buildBlocksFromText(report);
+        await client.chat.postMessage({
+          channel: event.channel,
+          thread_ts: threadTs,
+          text: report,
+          blocks: reportBlocks || undefined
+        });
+      }
       return;
     } catch (e) {
       safeLogAxiosError('refineKeywordPlanFromFollowUp', e);
