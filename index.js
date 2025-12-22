@@ -1302,7 +1302,9 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     });
   });
 
+  // diversity seeding with per-voice dedup
   const seed = [];
+  const seedIds = new Set();
   for (const [kw, arr] of byKeywordBucket.entries()) {
     arr.sort((a, b) => {
       const sa = calcCoverageScore(a), sb = calcCoverageScore(b);
@@ -1310,9 +1312,16 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
       if (sb.matchedCount !== sa.matchedCount) return sb.matchedCount - sa.matchedCount;
       return (sb.usage || 0) - (sa.usage || 0);
     });
-    for (let i = 0; i < Math.min(arr.length, 3); i++) seed.push(arr[i]);
+    let picked = 0;
+    for (const v of arr) {
+      if (!seedIds.has(v.voice_id)) {
+        seed.push(v);
+        seedIds.add(v.voice_id);
+        picked++;
+        if (picked >= 3) break;
+      }
+    }
   }
-  const seedIds = new Set(seed.map((v) => v.voice_id));
   const rest = voices.filter((v) => !seedIds.has(v.voice_id));
   rest.sort((a, b) => {
     const sa = calcCoverageScore(a), sb = calcCoverageScore(b);
@@ -1321,6 +1330,19 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     return (sb.usage || 0) - (sa.usage || 0);
   });
   voices = [...seed, ...rest];
+
+  // final global dedup (safety)
+  {
+    const uniq = [];
+    const seenIds = new Set();
+    for (const v of voices) {
+      if (!seenIds.has(v.voice_id)) {
+        uniq.push(v);
+        seenIds.add(v.voice_id);
+      }
+    }
+    voices = uniq;
+  }
 
   // cap total voices to keep memory bounded
   if (voices.length > 120) {
@@ -1602,7 +1624,19 @@ function buildMessageFromSession(session) {
     high: { female: [], male: [], other: [] }
   };
 
-  sorted.forEach((v) => {
+  // render only unique voices (avoid duplicates)
+  const sortedUnique = [];
+  {
+    const seen = new Set();
+    for (const v of sorted) {
+      if (!seen.has(v.voice_id)) {
+        sortedUnique.push(v);
+        seen.add(v.voice_id);
+      }
+    }
+  }
+
+  sortedUnique.forEach((v) => {
     const isHq = isHighQuality(v);
 
     if (qualityFilter === 'high_only' && !isHq) return;
