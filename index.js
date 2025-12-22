@@ -635,8 +635,23 @@ function detectSpecialIntent(userText, plan) {
   // 👉 KLUCZOWA ZMIANA:
   // Jeśli jest use case (conversational, audiobook, cartoon itd.),
   // to NIE wchodzimy w tryb "top_by_language", nawet jeśli pojawi się "top / most used".
-  if (!hasUsageKeyword || hasUseCaseKeyword) {
+  if (!hasUsageKeyword && hasUseCaseKeyword) {
     return { mode: 'generic', languageCode: null };
+  }
+
+  // Nowy tryb hybrydowy: popularność + use-case
+  if (hasUsageKeyword && hasUseCaseKeyword) {
+    let languageCode = null;
+    if (plan && typeof plan.target_voice_language === 'string' && plan.target_voice_language.trim()) {
+      languageCode = plan.target_voice_language.trim().toLowerCase().slice(0, 2);
+    }
+    if (!languageCode) {
+      languageCode = detectVoiceLanguageFromText(userText);
+    }
+    if (!languageCode) {
+      return { mode: 'generic', languageCode: null };
+    }
+    return { mode: 'top_then_rank', languageCode };
   }
 
   // Jeśli dotarliśmy tutaj, to:
@@ -852,6 +867,14 @@ IMPORTANT:
       plan.quality_preference = qp;
     }
 
+    // Accent as soft preference unless explicitly mentioned by user
+    const accentRegex =
+      /\b(american|british|uk|us|australian|irish|scottish|canadian|polish)\b/i;
+    const explicitAccent = accentRegex.test(userText || '');
+    if (!explicitAccent) {
+      plan.target_accent = null;
+    }
+
     return plan;
   } catch (error) {
     safeLogAxiosError('buildKeywordPlan', error);
@@ -912,29 +935,37 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   const qualityPref = plan.quality_preference || 'any';
 
   // ALL keywords from the plan – each will be used in a separate search
-  const allKw = [
-    ...(plan.tone_keywords || []),
-    ...(plan.use_case_keywords || []),
-    ...(plan.character_keywords || []),
-    ...(plan.style_keywords || []),
-    ...(plan.extra_keywords || [])
-  ];
+  const toneKw = Array.from(new Set((plan.tone_keywords || []).map((s) => (s || '').toLowerCase().trim()).filter(Boolean)));
+  const useKw = Array.from(new Set((plan.use_case_keywords || []).map((s) => (s || '').toLowerCase().trim()).filter(Boolean)));
+  const charKw = Array.from(new Set((plan.character_keywords || []).map((s) => (s || '').toLowerCase().trim()).filter(Boolean)));
+  const styleKw = Array.from(new Set((plan.style_keywords || []).map((s) => (s || '').toLowerCase().trim()).filter(Boolean)));
+  const extraKw = Array.from(new Set((plan.extra_keywords || []).map((s) => (s || '').toLowerCase().trim()).filter(Boolean)));
 
-  const normalizedKw = Array.from(
-    new Set(
-      allKw
-        .map((x) => (x || '').toString().toLowerCase().trim())
-        .filter((x) => x.length > 0)
-    )
-  );
-
-  // If GPT gave us nothing reasonable, use full user text as one keyword
-  if (!normalizedKw.length && userText) {
-    normalizedKw.push(userText.toLowerCase());
-  }
-
+  // Budgeted selection: prioritize use/style/character over tone
   const MAX_KEYWORD_QUERIES = 10;
-  const selectedKeywords = normalizedKw.slice(0, MAX_KEYWORD_QUERIES);
+  const budgets = { tone: 2, use: 3, style: 3, character: 2 };
+  const pick = (arr, n) => arr.slice(0, Math.max(0, n));
+  let selectedKeywords = [
+    ...pick(useKw, budgets.use),
+    ...pick(styleKw, budgets.style),
+    ...pick(charKw, budgets.character),
+    ...pick(toneKw, budgets.tone)
+  ];
+  // fill remaining from extras or leftovers
+  const leftovers = [
+    ...useKw.slice(budgets.use),
+    ...styleKw.slice(budgets.style),
+    ...charKw.slice(budgets.character),
+    ...toneKw.slice(budgets.tone),
+    ...extraKw
+  ].filter((k) => !selectedKeywords.includes(k));
+  while (selectedKeywords.length < MAX_KEYWORD_QUERIES && leftovers.length) {
+    selectedKeywords.push(leftovers.shift());
+  }
+  // If nothing at all, use raw user text
+  if (!selectedKeywords.length && userText) {
+    selectedKeywords.push((userText || '').toLowerCase());
+  }
 
   // 1) separate search for EACH keyword, with limited concurrency
   async function runWithLimit(items, limit, worker) {
@@ -972,7 +1003,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
       }
       params.set('search', kw);
       try {
-        const voicesForKeyword = await callSharedVoices(params);
+        let voicesForKeyword = await callSharedVoices(params);
         try {
           trace({
             stage: 'per_keyword',
@@ -981,6 +1012,37 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             count: Array.isArray(voicesForKeyword) ? voicesForKeyword.length : 0
           });
         } catch (_) {}
+        // Early language alias retry if empty
+        if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0 && language) {
+          const LANGUAGE_PARAM_MAP = {
+            pl: ['pl', 'polish'],
+            en: ['en', 'english'],
+            es: ['es', 'spanish', 'español', 'espanol'],
+            de: ['de', 'german', 'deutsch'],
+            fr: ['fr', 'french', 'français', 'francais'],
+            it: ['it', 'italian', 'italiano']
+          };
+          const candidates = Array.from(new Set(LANGUAGE_PARAM_MAP[language] || [language]));
+          const alt = candidates.find((v) => v !== language);
+          if (alt) {
+            const altParams = new URLSearchParams(params.toString());
+            altParams.set('language', alt);
+            try {
+              const altVoicesQuick = await callSharedVoices(altParams);
+              try {
+                trace({
+                  stage: 'per_keyword_alt_lang',
+                  keyword: kw,
+                  params: paramsToObject(altParams),
+                  count: Array.isArray(altVoicesQuick) ? altVoicesQuick.length : 0
+                });
+              } catch (_) {}
+              if (Array.isArray(altVoicesQuick) && altVoicesQuick.length) {
+                voicesForKeyword = altVoicesQuick;
+              }
+            } catch (_) {}
+          }
+        }
         return { kw, voices: voicesForKeyword || [] };
       } catch (err) {
         console.error('Error fetching voices for keyword:', kw, err.message || err);
@@ -1019,8 +1081,8 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     }
 
     const fallbackSearch =
-      (normalizedKw.length ? normalizedKw.join(' ') : '') ||
-      (userText ? userText.toLowerCase() : '');
+      (selectedKeywords.length ? selectedKeywords.join(' ') : '') ||
+      ((userText ? userText.toLowerCase() : '') || '');
 
     if (fallbackSearch) {
       params.set('search', fallbackSearch);
@@ -1158,6 +1220,33 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     }
   }
 
+  // 2d) HQ local fallback: if still empty and high_only, try without category and filter locally
+  if (seen.size === 0 && qualityPref === 'high_only') {
+    const params = new URLSearchParams();
+    params.set('page_size', '100');
+    if (language) params.set('language', language);
+    if (accent) params.set('accent', accent);
+    if (gender) params.set('gender', gender);
+    try {
+      const hqLocal = await callSharedVoices(params);
+      try {
+        trace({
+          stage: 'hq_local_filter',
+          params: paramsToObject(params),
+          count: Array.isArray(hqLocal) ? hqLocal.length : 0
+        });
+      } catch (_) {}
+      (hqLocal || []).filter(isHighQuality).forEach((voice) => {
+        if (!voice || !voice.voice_id) return;
+        if (!seen.has(voice.voice_id)) {
+          seen.set(voice.voice_id, { voice, matchedKeywords: new Set() });
+        }
+      });
+    } catch (err) {
+      console.error('Error in hq-local fallback fetchVoicesByKeywords:', err.message || err);
+    }
+  }
+
   // 4) convert map -> list, attach matched_keywords
   let voices = Array.from(seen.values()).map((entry) => {
     const v = entry.voice;
@@ -1181,6 +1270,57 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     const onlyStandard = voices.filter((v) => !isHighQuality(v));
     if (onlyStandard.length) voices = onlyStandard;
   }
+
+  // Candidate ranking prep: coverage score + diversity seeding before cap
+  function calcCoverageScore(v) {
+    const mk = Array.isArray(v._matched_keywords) ? v._matched_keywords : [];
+    const set = new Set(mk);
+    const useCase = (plan.use_case_keywords || []).filter((k) => set.has(k)).length;
+    const style = (plan.style_keywords || []).filter((k) => set.has(k)).length;
+    const character = (plan.character_keywords || []).filter((k) => set.has(k)).length;
+    const tone = (plan.tone_keywords || []).filter((k) => set.has(k)).length;
+    const coverage = 3 * useCase + 3 * style + 2 * character + 1 * tone;
+    const matchedCount = mk.length;
+    const usage = v.usage_character_count_1y || v.usage_character_count_7d || 0;
+    return { coverage, matchedCount, usage };
+  }
+
+  const highSignal = new Set([
+    ...(plan.use_case_keywords || []),
+    ...(plan.style_keywords || []),
+    ...(plan.character_keywords || [])
+  ]);
+
+  const byKeywordBucket = new Map();
+  voices.forEach((v) => {
+    (v._matched_keywords || []).forEach((kw) => {
+      if (!highSignal.size || highSignal.has(kw)) {
+        const arr = byKeywordBucket.get(kw) || [];
+        arr.push(v);
+        byKeywordBucket.set(kw, arr);
+      }
+    });
+  });
+
+  const seed = [];
+  for (const [kw, arr] of byKeywordBucket.entries()) {
+    arr.sort((a, b) => {
+      const sa = calcCoverageScore(a), sb = calcCoverageScore(b);
+      if (sb.coverage !== sa.coverage) return sb.coverage - sa.coverage;
+      if (sb.matchedCount !== sa.matchedCount) return sb.matchedCount - sa.matchedCount;
+      return (sb.usage || 0) - (sa.usage || 0);
+    });
+    for (let i = 0; i < Math.min(arr.length, 3); i++) seed.push(arr[i]);
+  }
+  const seedIds = new Set(seed.map((v) => v.voice_id));
+  const rest = voices.filter((v) => !seedIds.has(v.voice_id));
+  rest.sort((a, b) => {
+    const sa = calcCoverageScore(a), sb = calcCoverageScore(b);
+    if (sb.coverage !== sa.coverage) return sb.coverage - sa.coverage;
+    if (sb.matchedCount !== sa.matchedCount) return sb.matchedCount - sa.matchedCount;
+    return (sb.usage || 0) - (sa.usage || 0);
+  });
+  voices = [...seed, ...rest];
 
   // cap total voices to keep memory bounded
   if (voices.length > 120) {
@@ -1577,7 +1717,7 @@ function paramsToObject(params) {
   return obj;
 }
 
-function buildSearchReport(trace, plan, mode) {
+function buildSearchReport(trace, plan, mode, summary) {
   try {
     const lines = [];
     lines.push('*Search report (POC)*');
@@ -1585,6 +1725,17 @@ function buildSearchReport(trace, plan, mode) {
     lines.push(
       `Plan: lang=${plan?.target_voice_language || '-'}, accent=${plan?.target_accent || '-'}, gender=${plan?.target_gender || '-'}, quality=${plan?.quality_preference || 'any'}`
     );
+    if (summary && typeof summary === 'object') {
+      lines.push('');
+      lines.push(`Summary: unique_voices=${summary.unique_count ?? '-'}`);
+      if (Array.isArray(summary.top_coverage) && summary.top_coverage.length) {
+        const top = summary.top_coverage.slice(0, 10);
+        lines.push('Top coverage (voice_id : matched_keywords_count):');
+        top.forEach((t) => {
+          lines.push(`• ${t.voice_id}: ${t.matchedCount}`);
+        });
+      }
+    }
     lines.push('');
     if (!Array.isArray(trace) || !trace.length) {
       lines.push('_No trace entries collected._');
@@ -1686,21 +1837,40 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         });
       }
     } else {
-      // normal mode – keyword-based search + GPT curator ranking
-      voices = await fetchVoicesByKeywords(keywordPlan, cleaned, traceCb);
+      if (special.mode === 'top_then_rank' && special.languageCode) {
+        voices = await fetchTopVoicesByLanguage(
+          special.languageCode,
+          keywordPlan.quality_preference,
+          traceCb
+        );
+        if (!voices.length) {
+          const noResText = await translateForUserLanguage(labels.noResults, uiLang);
+          await client.chat.postMessage({
+            channel: event.channel,
+            thread_ts: threadTs,
+            text: noResText
+          });
+          return;
+        }
+        const ranked = await rankVoicesWithGPT(cleaned, keywordPlan, voices);
+        rankingMap = ranked.scoreMap;
+      } else {
+        // normal mode – keyword-based search + GPT curator ranking
+        voices = await fetchVoicesByKeywords(keywordPlan, cleaned, traceCb);
 
-      if (!voices.length) {
-        const noResText = await translateForUserLanguage(labels.noResults, uiLang);
-        await client.chat.postMessage({
-          channel: event.channel,
-          thread_ts: threadTs,
-          text: noResText
-        });
-        return;
+        if (!voices.length) {
+          const noResText = await translateForUserLanguage(labels.noResults, uiLang);
+          await client.chat.postMessage({
+            channel: event.channel,
+            thread_ts: threadTs,
+            text: noResText
+          });
+          return;
+        }
+
+        const ranked = await rankVoicesWithGPT(cleaned, keywordPlan, voices);
+        rankingMap = ranked.scoreMap;
       }
-
-      const ranked = await rankVoicesWithGPT(cleaned, keywordPlan, voices);
-      rankingMap = ranked.scoreMap;
     }
 
     const session = {
@@ -1731,7 +1901,15 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
     });
 
     if (process.env.POC_SEARCH_REPORT === 'true') {
-      let report = buildSearchReport(searchTrace, keywordPlan, special.mode);
+      const coverage = Array.isArray(voices)
+        ? voices.map((v) => ({
+            voice_id: v.voice_id,
+            matchedCount: Array.isArray(v._matched_keywords) ? v._matched_keywords.length : 0
+          }))
+        : [];
+      coverage.sort((a, b) => b.matchedCount - a.matchedCount);
+      const summary = { unique_count: Array.isArray(voices) ? voices.length : 0, top_coverage: coverage.slice(0, 10) };
+      let report = buildSearchReport(searchTrace, keywordPlan, special.mode, summary);
       report = await translateForUserLanguage(report, uiLang);
       const reportBlocks = buildBlocksFromText(report);
       await client.chat.postMessage({
@@ -1865,7 +2043,15 @@ app.event('app_mention', async ({ event, client }) => {
         blocks: blocks || undefined
       });
       if (process.env.POC_SEARCH_REPORT === 'true') {
-        let report = buildSearchReport(searchTrace, refinedPlan, 'refine');
+        const coverage = Array.isArray(voices)
+          ? voices.map((v) => ({
+              voice_id: v.voice_id,
+              matchedCount: Array.isArray(v._matched_keywords) ? v._matched_keywords.length : 0
+            }))
+          : [];
+        coverage.sort((a, b) => b.matchedCount - a.matchedCount);
+        const summary = { unique_count: Array.isArray(voices) ? voices.length : 0, top_coverage: coverage.slice(0, 10) };
+        let report = buildSearchReport(searchTrace, refinedPlan, 'refine', summary);
         report = await translateForUserLanguage(report, existing.uiLanguage);
         const reportBlocks = buildBlocksFromText(report);
         await client.chat.postMessage({
