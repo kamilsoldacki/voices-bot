@@ -632,14 +632,12 @@ function detectSpecialIntent(userText, plan) {
 
   const hasUseCaseKeyword = useCaseTokens.some((t) => lower.includes(t));
 
-  // 👉 KLUCZOWA ZMIANA:
-  // Jeśli jest use case (conversational, audiobook, cartoon itd.),
-  // to NIE wchodzimy w tryb "top_by_language", nawet jeśli pojawi się "top / most used".
+  // Jeśli jest use case i nie ma zamiaru „top/most used”, zostań w trybie generic
   if (!hasUsageKeyword && hasUseCaseKeyword) {
     return { mode: 'generic', languageCode: null };
   }
 
-  // Nowy tryb hybrydowy: popularność + use-case
+  // Hybryda: popularność + use-case
   if (hasUsageKeyword && hasUseCaseKeyword) {
     let languageCode = null;
     if (plan && typeof plan.target_voice_language === 'string' && plan.target_voice_language.trim()) {
@@ -654,25 +652,23 @@ function detectSpecialIntent(userText, plan) {
     return { mode: 'top_then_rank', languageCode };
   }
 
-  // Jeśli dotarliśmy tutaj, to:
-  // - są słowa "most used / najczęściej używane"
-  // - NIE MA konkretnego use case
-  // -> możemy bezpiecznie odpalić tryb "top_by_language"
-  let languageCode = null;
-
-  if (plan && typeof plan.target_voice_language === 'string' && plan.target_voice_language.trim()) {
-    languageCode = plan.target_voice_language.trim().toLowerCase().slice(0, 2);
+  // Tylko jeśli użytkownik wyraźnie prosi o „most used/top...”
+  if (hasUsageKeyword) {
+    let languageCode = null;
+    if (plan && typeof plan.target_voice_language === 'string' && plan.target_voice_language.trim()) {
+      languageCode = plan.target_voice_language.trim().toLowerCase().slice(0, 2);
+    }
+    if (!languageCode) {
+      languageCode = detectVoiceLanguageFromText(userText);
+    }
+    if (!languageCode) {
+      return { mode: 'generic', languageCode: null };
+    }
+    return { mode: 'top_by_language', languageCode };
   }
 
-  if (!languageCode) {
-    languageCode = detectVoiceLanguageFromText(userText);
-  }
-
-  if (!languageCode) {
-    return { mode: 'generic', languageCode: null };
-  }
-
-  return { mode: 'top_by_language', languageCode };
+  // Domyślnie: generic
+  return { mode: 'generic', languageCode: null };
 }
 
 // -------------------------------------------------------------
@@ -863,9 +859,7 @@ IMPORTANT:
 
     // Manual override from raw text if needed
     const qp = detectQualityPreferenceFromText(userText);
-    if (qp) {
-      plan.quality_preference = qp;
-    }
+    plan.quality_preference = qp || 'any';
 
     // Accent as soft preference unless explicitly mentioned by user
     const accentRegex =
