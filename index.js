@@ -820,7 +820,7 @@ async function refineKeywordPlanFromFollowUp(existingPlan, followUpText) {
   base.style_keywords = uniqueMergeKeywords(base.style_keywords, delta.style_keywords);
   base.extra_keywords = uniqueMergeKeywords(base.extra_keywords, delta.extra_keywords);
 
-  return normalizeKeywordPlan(base, followUpText);
+  return typeof normalizeKeywordPlan === 'function' ? normalizeKeywordPlan(base, followUpText) : base;
 }
 
 // Detect special intent like "most used Polish voices", "najczęściej używane polskie głosy"
@@ -1176,7 +1176,9 @@ IMPORTANT:
 
     // Always derive UI language from the user's message (deterministic)
     plan.user_interface_language = guessUiLanguageFromText(userText);
-    plan = normalizeKeywordPlan(plan, userText);
+    if (typeof normalizeKeywordPlan === 'function') {
+      plan = normalizeKeywordPlan(plan, userText);
+    }
 
     if (!plan.target_voice_language) {
       const inferredLang = detectVoiceLanguageFromText(userText);
@@ -1252,8 +1254,10 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   const seen = new Map(); // voice_id -> { voice, matchedKeywords: Set<string> }
   const trace = typeof traceCb === 'function' ? traceCb : () => {};
 
-  // Apply keyword floor enrichment if the plan is too thin
-  plan = ensureKeywordFloor(userText, plan);
+  // Apply keyword floor enrichment if the plan is too thin (guarded)
+  if (typeof ensureKeywordFloor === 'function') {
+    plan = ensureKeywordFloor(userText, plan);
+  }
   try {
     const totalKw =
       (plan.tone_keywords?.length || 0) +
