@@ -664,6 +664,33 @@ function applyFilterChangesFromText(session, lower) {
     }
   }
 
+  // strict descriptives on/off
+  if (
+    lower.includes('strict style') ||
+    lower.includes('strict descriptive') ||
+    lower.includes('force descriptive') ||
+    lower.includes('wymuś styl') ||
+    lower.includes('wymus styl')
+  ) {
+    if (session.filters.strictDescriptives !== true) {
+      session.filters.strictDescriptives = true;
+      session._serverFiltersChanged = true;
+      changed = true;
+    }
+  }
+  if (
+    lower.includes('clear style') ||
+    lower.includes('clear descriptive') ||
+    lower.includes('ignore descriptive') ||
+    lower.includes('bez stylu')
+  ) {
+    if (session.filters.strictDescriptives !== false) {
+      session.filters.strictDescriptives = false;
+      session._serverFiltersChanged = true;
+      changed = true;
+    }
+  }
+
   // featured
   if (lower.includes('featured only') || lower.includes('only featured') || lower.includes('show featured')) {
     if (session.filters.featured !== true) {
@@ -793,7 +820,7 @@ async function refineKeywordPlanFromFollowUp(existingPlan, followUpText) {
   base.style_keywords = uniqueMergeKeywords(base.style_keywords, delta.style_keywords);
   base.extra_keywords = uniqueMergeKeywords(base.extra_keywords, delta.extra_keywords);
 
-  return base;
+  return normalizeKeywordPlan(base, followUpText);
 }
 
 // Detect special intent like "most used Polish voices", "najczęściej używane polskie głosy"
@@ -968,6 +995,41 @@ The JSON MUST have exactly these fields:
   "extra_keywords": string[]
 }
 
+// -------------------------------------------------------------
+// Plan validator / normalizer
+// -------------------------------------------------------------
+function normalizeKeywordPlan(plan, userText) {
+  const out = JSON.parse(JSON.stringify(plan || {}));
+  const clampArr = (arr, max = 12) =>
+    Array.isArray(arr)
+      ? arr
+          .map((x) => (x || '').toString().toLowerCase().trim())
+          .filter((x) => x.length > 0 && x.length <= 40)
+          .slice(0, max)
+      : [];
+
+  out.tone_keywords = clampArr(out.tone_keywords);
+  out.use_case_keywords = clampArr(out.use_case_keywords);
+  out.character_keywords = clampArr(out.character_keywords);
+  out.style_keywords = clampArr(out.style_keywords);
+  out.extra_keywords = clampArr(out.extra_keywords, 20);
+
+  // map synonyms to quality
+  const lower = (userText || '').toLowerCase();
+  if (/\b(highquality|high-quality|hq)\b/.test(lower)) {
+    out.quality_preference = 'high_only';
+  }
+  if (!['any','high_only','no_high'].includes(out.quality_preference)) {
+    out.quality_preference = 'any';
+  }
+
+  // sanitize gender
+  if (out.target_gender !== 'male' && out.target_gender !== 'female' && out.target_gender !== 'neutral') {
+    out.target_gender = null;
+  }
+
+  return out;
+}
 RULES:
 
 - user_interface_language:
@@ -1045,6 +1107,7 @@ IMPORTANT:
 
     // Always derive UI language from the user's message (deterministic)
     plan.user_interface_language = guessUiLanguageFromText(userText);
+    plan = normalizeKeywordPlan(plan, userText);
 
     if (!plan.target_voice_language) {
       const inferredLang = detectVoiceLanguageFromText(userText);
@@ -1258,6 +1321,16 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
       });
       params.set('search', kw);
       try {
+        try {
+          trace({
+            stage: 'gates',
+            keyword: kw,
+            gates: {
+              use_cases: (appended.useCases || []).length,
+              descriptives: (appended.descriptives || []).length
+            }
+          });
+        } catch (_) {}
         let voicesForKeyword;
         const wantMore = detectListAll(userText) === true || plan.__listAll === true;
         if (wantMore) {
@@ -2178,6 +2251,78 @@ function pickQueryDescriptives(plan, userText) {
   return filtered;
 }
 
+function hasExplicitDescriptiveMention(userText) {
+  const lower = (userText || '').toLowerCase();
+  const tokens = [
+    'whisper','cinematic','dramatic','meditative','asmr','slow','fast','calm','warm',
+    'friendly','energetic','deep','gravelly','raspy','growl','harsh','dark','ominous',
+    'booming','bassy','soft','soothing','confident','expressive','relaxed','storytelling'
+  ];
+  return tokens.some((t) => lower.includes(t));
+}
+
+function readEnvBoolean(name, defaultValue = false) {
+  const raw = String(process.env[name] || '').trim().toLowerCase();
+  if (raw === 'true' || raw === '1' || raw === 'yes') return true;
+  if (raw === 'false' || raw === '0' || raw === 'no') return false;
+  return defaultValue;
+}
+
+function shouldApplyParam(kind, plan, userText, flags = {}) {
+  const lower = (userText || '').toLowerCase();
+  const force = (key) => flags[key] === true || plan?.[key] === true;
+  const suppress = (key) => flags[key] === false || plan?.[key] === false;
+  switch (kind) {
+    case 'use_cases': {
+      if (force('__forceUseCases')) return true;
+      if (suppress('__suppressUseCases')) return false;
+      if (hasExplicitUseCaseMention(userText)) return true;
+      return readEnvBoolean('ENABLE_USE_CASES_BY_DEFAULT', false);
+    }
+    case 'descriptives': {
+      if (force('__forceDescriptives')) return true;
+      if (suppress('__suppressDescriptives')) return false;
+      if (hasExplicitDescriptiveMention(userText)) return true;
+      return readEnvBoolean('ENABLE_DESCRIPTIVES_BY_DEFAULT', false);
+    }
+    case 'language': {
+      if (hasExplicitLanguageMention(userText)) return true;
+      return readEnvBoolean('ENABLE_LANGUAGE_BY_DEFAULT', false);
+    }
+    case 'accent': {
+      const accentRegex = /\b(american|british|uk|us|australian|irish|scottish|canadian|polish)\b/i;
+      if (accentRegex.test(userText || '')) return true;
+      return readEnvBoolean('ENABLE_ACCENT_BY_DEFAULT', false);
+    }
+    case 'gender': {
+      // apply only if explicitly set to male/female in plan or text implies it
+      if (plan?.target_gender === 'male' || plan?.target_gender === 'female') return true;
+      const impliesMale = /\b(grandpa|old man|man|male)\b/i.test(lower);
+      const impliesFemale = /\b(grandma|old woman|woman|female)\b/i.test(lower);
+      if (impliesMale || impliesFemale) return true;
+      return readEnvBoolean('ENABLE_GENDER_BY_DEFAULT', true);
+    }
+    case 'age': {
+      if (detectAgeFromText(userText)) return true;
+      return readEnvBoolean('ENABLE_AGE_BY_DEFAULT', false);
+    }
+    case 'featured': {
+      if (flags.featured === true || plan?.__featured === true) return true;
+      return false;
+    }
+    case 'sort': {
+      if (typeof flags.sort === 'string' || typeof plan?.__sort === 'string') return true;
+      return false;
+    }
+    case 'locale': {
+      // locale depends on language+accent presence; apply if inferable
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
 function hasExplicitUseCaseMention(userText) {
   const lower = (userText || '').toLowerCase();
   const useCaseTokens = [
@@ -2228,32 +2373,37 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   const featured = options.featured === true ? true : false;
   const sort = typeof options.sort === 'string' ? options.sort : null;
   const forceUseCases = options.forceUseCases === true;
+  const forceDescriptives = options.forceDescriptives === true;
   const age =
     typeof options.age === 'string' && options.age
       ? options.age
       : detectAgeFromText(userText);
 
   // Existing filters
-  if (language) params.set('language', language);
-  if (accent) params.set('accent', accent);
-  if (gender) params.set('gender', gender);
+  if (language && shouldApplyParam('language', plan, userText)) params.set('language', language);
+  if (accent && shouldApplyParam('accent', plan, userText)) params.set('accent', accent);
+  if (gender && shouldApplyParam('gender', plan, userText)) params.set('gender', gender);
   if (qualityPref === 'high_only') {
     params.set('category', 'high_quality');
   }
 
   // New filters
-  const useCases = (forceUseCases || hasExplicitUseCaseMention(userText)) ? pickQueryUseCases(plan) : [];
+  const useCases = (forceUseCases || shouldApplyParam('use_cases', plan, userText, { __forceUseCases: forceUseCases }))
+    ? pickQueryUseCases(plan)
+    : [];
   for (const uc of useCases) params.append('use_cases', uc);
 
-  const descriptives = pickQueryDescriptives(plan, userText);
+  const descriptives = (forceDescriptives || shouldApplyParam('descriptives', plan, userText, { __forceDescriptives: forceDescriptives }))
+    ? pickQueryDescriptives(plan, userText)
+    : [];
   for (const d of descriptives) params.append('descriptives', d);
 
   const loc = inferLocale(language, accent);
-  if (loc) params.set('locale', loc);
+  if (loc && shouldApplyParam('locale', plan, userText)) params.set('locale', loc);
 
-  if (featured) params.set('featured', 'true');
-  if (age) params.set('age', age);
-  if (sort) params.set('sort', sort);
+  if (featured && shouldApplyParam('featured', plan, userText, { featured })) params.set('featured', 'true');
+  if (age && shouldApplyParam('age', plan, userText)) params.set('age', age);
+  if (sort && shouldApplyParam('sort', plan, userText, { sort })) params.set('sort', sort);
 
   return { useCases, descriptives, locale: loc, featured, age, sort };
 }
@@ -2458,6 +2608,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
     keywordPlan.__sort = null;
     keywordPlan.__listAll = detectListAll(cleaned);
     keywordPlan.__forceUseCases = false;
+    keywordPlan.__forceDescriptives = false;
 
     // Similar voices: if user asks "similar to <voice_id>"
     const voiceIdForSimilarity = extractVoiceIdCandidate(cleaned);
@@ -2494,7 +2645,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           listAll: detectListAll(cleaned),
           featured: false,
           sort: null,
-          strictUseCase: false
+          strictUseCase: false,
+          strictDescriptives: false
         },
         lastActive: Date.now()
       };
@@ -2627,7 +2779,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         listAll: detectListAll(cleaned),
         featured: false,
         sort: null,
-        strictUseCase: false
+        strictUseCase: false,
+        strictDescriptives: false
       },
       lastActive: Date.now()
     };
@@ -2746,6 +2899,7 @@ app.event('app_mention', async ({ event, client }) => {
         plan.__sort = existing.filters.sort || null;
         plan.__listAll = existing.filters.listAll === true;
         plan.__forceUseCases = existing.filters.strictUseCase === true;
+        plan.__forceDescriptives = existing.filters.strictDescriptives === true;
 
         const voices = await fetchVoicesByKeywords(plan, existing.originalQuery, traceCb);
         if (!voices.length) {
