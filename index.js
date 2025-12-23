@@ -1,5 +1,6 @@
 const { App } = require('@slack/bolt');
 const axios = require('axios');
+const FormData = require('form-data');
 
 // -------------------------------------------------------------
 // In-memory conversation sessions (per Slack thread)
@@ -248,6 +249,21 @@ function detectVoiceLanguageFromText(text) {
   }
 
   return null;
+}
+
+// Detect if user explicitly mentioned a language (so we should constrain by language)
+function hasExplicitLanguageMention(text) {
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  const tokens = [
+    'polish', 'po polsku', 'polski głos', 'polski glos', 'polski',
+    'english', 'american accent', 'us accent', 'angielski',
+    'spanish', 'español', 'espanol', 'hiszpań', 'hiszpansk',
+    'german', 'deutsch', 'niemieck',
+    'french', 'francus',
+    'italian', 'włoski', 'wloski'
+  ];
+  return tokens.some((t) => lower.includes(t));
 }
 
 // Heuristic: is this voice effectively in langCode?
@@ -867,6 +883,12 @@ IMPORTANT:
     const explicitAccent = accentRegex.test(userText || '');
     if (!explicitAccent) {
       plan.target_accent = null;
+    }
+
+    // If user didn't explicitly mention a language, don't constrain by language
+    const explicitLanguage = hasExplicitLanguageMention(userText);
+    if (!explicitLanguage) {
+      plan.target_voice_language = null;
     }
 
     return plan;
@@ -1745,6 +1767,84 @@ function paramsToObject(params) {
   return obj;
 }
 
+// -------------------------------------------------------------
+// Similar Voices helpers (by voice_id via preview_url)
+// -------------------------------------------------------------
+
+function extractVoiceIdCandidate(text) {
+  if (!text) return null;
+  const lower = text.toLowerCase();
+  const intent = /\b(similar|podobny|like)\b/.test(lower);
+  const idMatch = text.match(/([A-Za-z0-9]{18,})/g);
+  if (!intent || !idMatch) return null;
+  const candidate = idMatch.find((s) => /^[A-Za-z0-9]{18,}$/.test(s));
+  return candidate || null;
+}
+
+async function fetchSharedVoiceByIdOrSearch(voiceId, traceCb) {
+  const XI_KEY = process.env.ELEVENLABS_API_KEY;
+  try {
+    const params = new URLSearchParams();
+    params.set('page_size', '10');
+    params.set('search', voiceId);
+
+    const url = `https://api.elevenlabs.io/v1/shared-voices?${params.toString()}`;
+    const res = await httpGetWithRetry(url, {
+      headers: { 'xi-api-key': XI_KEY, 'Content-Type': 'application/json' },
+      timeout: 10000
+    });
+    const voices = Array.isArray(res.data?.voices) ? res.data.voices : [];
+    try {
+      traceCb?.({
+        stage: 'fetch_by_id_search',
+        params: paramsToObject(params),
+        count: voices.length
+      });
+    } catch (_) {}
+    if (!voices.length) return null;
+    const exact = voices.find((v) => v?.voice_id === voiceId);
+    return exact || voices[0];
+  } catch (err) {
+    safeLogAxiosError('fetchSharedVoiceByIdOrSearch', err);
+    return null;
+  }
+}
+
+async function downloadToBuffer(url) {
+  const res = await axios.get(url, { responseType: 'arraybuffer', timeout: 15000 });
+  return Buffer.from(res.data);
+}
+
+async function findSimilarVoicesByVoiceId(voiceId, traceCb) {
+  const XI_KEY = process.env.ELEVENLABS_API_KEY;
+  try {
+    const baseVoice = await fetchSharedVoiceByIdOrSearch(voiceId, traceCb);
+    if (!baseVoice || !baseVoice.preview_url) return [];
+    const audioBuf = await downloadToBuffer(baseVoice.preview_url);
+    const form = new FormData();
+    form.append('audio_file', audioBuf, { filename: `${voiceId}.mp3`, contentType: 'audio/mpeg' });
+    const res = await axios.post('https://api.elevenlabs.io/v1/similar-voices', form, {
+      headers: {
+        ...form.getHeaders(),
+        'xi-api-key': XI_KEY
+      },
+      timeout: 20000
+    });
+    const out = Array.isArray(res.data?.voices) ? res.data.voices : [];
+    try {
+      traceCb?.({
+        stage: 'similar_voices',
+        params: { top_k: 'default' },
+        count: out.length
+      });
+    } catch (_) {}
+    return out;
+  } catch (err) {
+    safeLogAxiosError('findSimilarVoicesByVoiceId', err);
+    return [];
+  }
+}
+
 function buildSearchReport(trace, plan, mode, summary) {
   try {
     const lines = [];
@@ -1817,6 +1917,68 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
       thread_ts: threadTs,
       text: searchingText
     });
+
+    // Similar voices: if user asks "similar to <voice_id>"
+    const voiceIdForSimilarity = extractVoiceIdCandidate(cleaned);
+    if (voiceIdForSimilarity) {
+      const searchTrace = [];
+      const traceCb = (entry) => {
+        try {
+          searchTrace.push(entry);
+        } catch (_) {}
+      };
+      let voices = await findSimilarVoicesByVoiceId(voiceIdForSimilarity, traceCb);
+      if (!voices.length) {
+        const noResText = await translateForUserLanguage(labels.noResults, uiLang);
+        await client.chat.postMessage({
+          channel: event.channel,
+          thread_ts: threadTs,
+          text: noResText
+        });
+        return;
+      }
+      const ranked = await rankVoicesWithGPT(cleaned, keywordPlan, voices);
+      const session = {
+        originalQuery: cleaned,
+        keywordPlan,
+        voices,
+        ranking: ranked.scoreMap,
+        uiLanguage: uiLang,
+        filters: {
+          quality: keywordPlan.quality_preference || 'any',
+          gender:
+            keywordPlan.target_gender === 'male' || keywordPlan.target_gender === 'female'
+              ? keywordPlan.target_gender
+              : 'any',
+          listAll: detectListAll(cleaned)
+        },
+        lastActive: Date.now()
+      };
+      sessions[threadTs] = session;
+      let message = buildMessageFromSession(session);
+      message = await translateForUserLanguage(message, session.uiLanguage);
+      const blocks = buildBlocksFromText(message);
+      await client.chat.postMessage({
+        channel: event.channel,
+        thread_ts: threadTs,
+        text: message,
+        blocks: blocks || undefined
+      });
+      if (process.env.POC_SEARCH_REPORT === 'true') {
+        let report = buildSearchReport(searchTrace, keywordPlan, 'similar_voices', {
+          unique_count: Array.isArray(voices) ? voices.length : 0
+        });
+        report = await translateForUserLanguage(report, uiLang);
+        const reportBlocks = buildBlocksFromText(report);
+        await client.chat.postMessage({
+          channel: event.channel,
+          thread_ts: threadTs,
+          text: report,
+          blocks: reportBlocks || undefined
+        });
+      }
+      return;
+    }
 
     const special = detectSpecialIntent(cleaned, keywordPlan);
 
@@ -1909,7 +2071,10 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
       uiLanguage: uiLang,
       filters: {
         quality: keywordPlan.quality_preference || 'any',
-        gender: 'any',
+        gender:
+          keywordPlan.target_gender === 'male' || keywordPlan.target_gender === 'female'
+            ? keywordPlan.target_gender
+            : 'any',
         listAll: detectListAll(cleaned)
       },
       lastActive: Date.now()
