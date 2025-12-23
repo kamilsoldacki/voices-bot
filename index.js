@@ -11,6 +11,9 @@ const REQUEST_DEDUP_TTL_MS = 15000;
 const SESSION_TTL_MS = 45 * 60 * 1000; // 45 minutes
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const KEYWORD_SEARCH_CONCURRENCY = 6; // limit concurrent keyword searches
+// Simple in-memory cache for shared-voices queries
+const sharedVoicesCache = new Map(); // key -> { at:number, voices:any[] }
+const SHARED_VOICES_CACHE_TTL_MS = 7 * 60 * 1000; // 7 minutes
 
 // -------------------------------------------------------------
 // Small helpers
@@ -586,6 +589,7 @@ function buildWhichHighMessage(session) {
 // Parse follow-up filters from the user text
 function applyFilterChangesFromText(session, lower) {
   let changed = false;
+  let serverChanged = false;
 
   // gender
   if (
@@ -625,12 +629,62 @@ function applyFilterChangesFromText(session, lower) {
     changed = true;
   }
 
-  // list all
-  if (lower.includes('list all') || lower.includes('show all')) {
+  // list all / show more
+  if (lower.includes('list all') || lower.includes('show all') || lower.includes('show more')) {
     session.filters.listAll = true;
     changed = true;
   }
 
+  // featured
+  if (lower.includes('featured only') || lower.includes('only featured') || lower.includes('show featured')) {
+    if (session.filters.featured !== true) {
+      session.filters.featured = true;
+      serverChanged = true;
+      changed = true;
+    }
+  }
+  if (
+    lower.includes('clear featured') ||
+    lower.includes('all voices') ||
+    lower.includes('remove featured')
+  ) {
+    if (session.filters.featured !== false) {
+      session.filters.featured = false;
+      serverChanged = true;
+      changed = true;
+    }
+  }
+
+  // age (child/young/adult/old)
+  const newAge = detectAgeFromText(lower);
+  if (newAge && session.filters.age !== newAge) {
+    session.filters.age = newAge;
+    serverChanged = true;
+    changed = true;
+  }
+
+  // sort (best-effort)
+  if (
+    lower.includes('sort by popularity') ||
+    lower.includes('most used') ||
+    lower.includes('najczęściej używan') ||
+    lower.includes('najpopularniejsze')
+  ) {
+    if (session.filters.sort !== 'usage_desc') {
+      session.filters.sort = 'usage_desc';
+      serverChanged = true;
+      changed = true;
+    }
+  }
+  if (lower.includes('sort by recent') || lower.includes('newest') || lower.includes('najnowsze')) {
+    if (session.filters.sort !== 'date_desc') {
+      session.filters.sort = 'date_desc';
+      serverChanged = true;
+      changed = true;
+    }
+  }
+
+  if (serverChanged) session._serverFiltersChanged = true;
   return changed;
 }
 
@@ -1164,15 +1218,26 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     async (kw) => {
       const params = new URLSearchParams();
       params.set('page_size', '40');
-      if (language) params.set('language', language);
-      if (accent) params.set('accent', accent);
-      if (gender) params.set('gender', gender);
-      if (qualityPref === 'high_only') {
-        params.set('category', 'high_quality');
-      }
+      const appended = appendQueryFiltersToParams(params, plan, userText, {
+        language,
+        accent,
+        gender,
+        qualityPref,
+        featured: plan.__featured === true,
+        sort: typeof plan.__sort === 'string' ? plan.__sort : null
+      });
       params.set('search', kw);
       try {
-        let voicesForKeyword = await callSharedVoices(params);
+        let voicesForKeyword;
+        const wantMore = detectListAll(userText) === true || plan.__listAll === true;
+        if (wantMore) {
+          voicesForKeyword = await callSharedVoicesAllPages(params, { maxPages: 3, cap: 200 });
+        } else {
+          voicesForKeyword = await callSharedVoicesCached(params, async (p) => {
+            const { voices } = await callSharedVoicesRaw(p);
+            return voices;
+          });
+        }
         try {
           trace({
             stage: 'per_keyword',
@@ -1181,6 +1246,52 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             count: Array.isArray(voicesForKeyword) ? voicesForKeyword.length : 0
           });
         } catch (_) {}
+        // Progressive relaxation if empty and we added filters
+        if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0) {
+          // 1) drop descriptives
+          if (appended.descriptives && appended.descriptives.length) {
+            const p2 = new URLSearchParams(params.toString());
+            // remove all descriptives
+            const keys = Array.from(p2.keys());
+            keys.forEach((k) => {
+              if (k === 'descriptives') p2.delete(k);
+            });
+            try {
+              const v2 = await callSharedVoices(p2);
+              try {
+                trace({
+                  stage: 'per_keyword_relax_descriptives',
+                  keyword: kw,
+                  params: paramsToObject(p2),
+                  count: Array.isArray(v2) ? v2.length : 0
+                });
+              } catch (_) {}
+              if (Array.isArray(v2) && v2.length) voicesForKeyword = v2;
+            } catch (_) {}
+          }
+        }
+        if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0) {
+          // 2) drop use_cases
+          if (appended.useCases && appended.useCases.length) {
+            const p3 = new URLSearchParams(params.toString());
+            const keys = Array.from(p3.keys());
+            keys.forEach((k) => {
+              if (k === 'use_cases') p3.delete(k);
+            });
+            try {
+              const v3 = await callSharedVoices(p3);
+              try {
+                trace({
+                  stage: 'per_keyword_relax_use_cases',
+                  keyword: kw,
+                  params: paramsToObject(p3),
+                  count: Array.isArray(v3) ? v3.length : 0
+                });
+              } catch (_) {}
+              if (Array.isArray(v3) && v3.length) voicesForKeyword = v3;
+            } catch (_) {}
+          }
+        }
         // Early language alias retry if empty
         if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0 && language) {
           const LANGUAGE_PARAM_MAP = {
@@ -1242,12 +1353,14 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   if (seen.size === 0) {
     const params = new URLSearchParams();
     params.set('page_size', '80');
-    if (language) params.set('language', language);
-    if (accent) params.set('accent', accent);
-    if (gender) params.set('gender', gender);
-    if (qualityPref === 'high_only') {
-      params.set('category', 'high_quality');
-    }
+    appendQueryFiltersToParams(params, plan, userText, {
+      language,
+      accent,
+      gender,
+      qualityPref,
+      featured: plan.__featured === true,
+      sort: typeof plan.__sort === 'string' ? plan.__sort : null
+    });
 
     const fallbackSearch =
       (selectedKeywords.length ? selectedKeywords.join(' ') : '') ||
@@ -1258,7 +1371,16 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     }
 
     try {
-      const fallbackVoices = await callSharedVoices(params);
+      let fallbackVoices;
+      const wantMore = detectListAll(userText) === true || plan.__listAll === true;
+      if (wantMore) {
+        fallbackVoices = await callSharedVoicesAllPages(params, { maxPages: 3, cap: 200 });
+      } else {
+        fallbackVoices = await callSharedVoicesCached(params, async (p) => {
+          const { voices } = await callSharedVoicesRaw(p);
+          return voices;
+        });
+      }
       try {
         trace({
           stage: 'combined',
@@ -1946,6 +2068,194 @@ function paramsToObject(params) {
   return obj;
 }
 
+async function buildControlsBlocks(session) {
+  try {
+    const uiLang = session.uiLanguage;
+    const featuredState = session.filters.featured ? 'On' : 'Off';
+    const quality = session.filters.quality || 'any';
+    const qualityLabel =
+      quality === 'high_only' ? 'High only' : quality === 'no_high' ? 'No high' : 'Any';
+    let b1 = `Featured only: ${featuredState}`;
+    let b2 = 'Show more';
+    let b3 = `Quality: ${qualityLabel}`;
+    b1 = await translateForUserLanguage(b1, uiLang);
+    b2 = await translateForUserLanguage(b2, uiLang);
+    b3 = await translateForUserLanguage(b3, uiLang);
+    return [
+      {
+        type: 'actions',
+        elements: [
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: b1, emoji: true },
+            action_id: 'toggle_featured'
+          },
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: b2, emoji: true },
+            action_id: 'show_more'
+          },
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: b3, emoji: true },
+            action_id: 'cycle_quality'
+          }
+        ]
+      }
+    ];
+  } catch (_) {
+    return null;
+  }
+}
+
+// -------------------------------------------------------------
+// Query building helpers for ElevenLabs GET /v1/shared-voices
+// -------------------------------------------------------------
+
+function pickQueryUseCases(plan) {
+  const src = Array.isArray(plan?.use_case_keywords) ? plan.use_case_keywords : [];
+  const allow = new Set([
+    'conversational', 'conversation', 'agent', 'support', 'customer support',
+    'call center', 'contact center', 'ivr', 'voicemail',
+    'audiobook', 'audiobooks', 'narration', 'narrator',
+    'cartoon', 'character', 'gaming', 'trailer',
+    'commercial', 'advertising', 'podcast', 'youtube', 'tiktok',
+    'explainer', 'video'
+  ]);
+  const out = [];
+  for (const k of src) {
+    const v = (k || '').toLowerCase().trim();
+    if (v && allow.has(v) && !out.includes(v)) out.push(v);
+    if (out.length >= 4) break;
+  }
+  return out;
+}
+
+function pickQueryDescriptives(plan, userText) {
+  const base = [
+    ...(Array.isArray(plan?.tone_keywords) ? plan.tone_keywords : []),
+    ...(Array.isArray(plan?.style_keywords) ? plan.style_keywords : [])
+  ];
+  // Reuse global filter and trim to a small set
+  const filtered = filterKeywordsGlobally(userText, base).slice(0, 6);
+  return filtered;
+}
+
+function inferLocale(language, accent) {
+  const lang = (language || '').toString().slice(0, 2).toLowerCase();
+  const acc = (accent || '').toString().toLowerCase();
+  if (lang === 'en') {
+    if (acc.includes('american') || acc === 'us' || acc.includes('usa')) return 'en-US';
+    if (acc.includes('british') || acc === 'uk' || acc.includes('england')) return 'en-GB';
+    if (acc.includes('australian')) return 'en-AU';
+    if (acc.includes('irish')) return 'en-IE';
+    if (acc.includes('scottish')) return 'en-GB';
+    if (acc.includes('canadian')) return 'en-CA';
+  }
+  if (lang === 'es') {
+    if (acc.includes('mexican') || acc.includes('mx')) return 'es-MX';
+    if (acc.includes('castilian') || acc.includes('spain')) return 'es-ES';
+  }
+  return null;
+}
+
+function detectAgeFromText(text) {
+  const lower = (text || '').toLowerCase();
+  if (/\b(child|kid|dziecko|niemie|dziecięcy)\b/.test(lower)) return 'child';
+  if (/\b(young|teen|młody|mlody|nastolat)\b/.test(lower)) return 'young';
+  if (/\b(adult|dorosły|dorosly)\b/.test(lower)) return 'adult';
+  if (/\b(old|senior|elderly|starszy|starczy)\b/.test(lower)) return 'old';
+  return null;
+}
+
+function appendQueryFiltersToParams(params, plan, userText, options = {}) {
+  const language = options.language || null;
+  const accent = options.accent || null;
+  const gender = options.gender || null;
+  const qualityPref = options.qualityPref || 'any';
+  const featured = options.featured === true ? true : false;
+  const sort = typeof options.sort === 'string' ? options.sort : null;
+  const age =
+    typeof options.age === 'string' && options.age
+      ? options.age
+      : detectAgeFromText(userText);
+
+  // Existing filters
+  if (language) params.set('language', language);
+  if (accent) params.set('accent', accent);
+  if (gender) params.set('gender', gender);
+  if (qualityPref === 'high_only') {
+    params.set('category', 'high_quality');
+  }
+
+  // New filters
+  const useCases = pickQueryUseCases(plan);
+  for (const uc of useCases) params.append('use_cases', uc);
+
+  const descriptives = pickQueryDescriptives(plan, userText);
+  for (const d of descriptives) params.append('descriptives', d);
+
+  const loc = inferLocale(language, accent);
+  if (loc) params.set('locale', loc);
+
+  if (featured) params.set('featured', 'true');
+  if (age) params.set('age', age);
+  if (sort) params.set('sort', sort);
+
+  return { useCases, descriptives, locale: loc, featured, age, sort };
+}
+
+// ---- Shared-voices cache & pagination helpers ----
+function cacheKeyFromParams(params) {
+  return `sv:${params.toString()}`;
+}
+
+async function callSharedVoicesRaw(params) {
+  const url = `https://api.elevenlabs.io/v1/shared-voices?${params.toString()}`;
+  const res = await httpGetWithRetry(url, {
+    headers: {
+      'xi-api-key': process.env.ELEVENLABS_API_KEY,
+      'Content-Type': 'application/json'
+    },
+    timeout: 10000
+  });
+  return {
+    voices: Array.isArray(res.data?.voices) ? res.data.voices : [],
+    has_more: !!res.data?.has_more
+  };
+}
+
+async function callSharedVoicesCached(params, callFn) {
+  try {
+    const key = cacheKeyFromParams(params);
+    const hit = sharedVoicesCache.get(key);
+    if (hit && Date.now() - hit.at < SHARED_VOICES_CACHE_TTL_MS) {
+      return hit.voices;
+    }
+    const voices = await callFn(params);
+    sharedVoicesCache.set(key, { at: Date.now(), voices });
+    return voices;
+  } catch (_) {
+    const { voices } = await callSharedVoicesRaw(params);
+    return voices;
+  }
+}
+
+async function callSharedVoicesAllPages(baseParams, options = {}) {
+  const pageSize = Number(baseParams.get('page_size') || '30');
+  const maxPages = options.maxPages ?? 3;
+  const cap = options.cap ?? 200;
+  const out = [];
+  for (let page = 0; page < maxPages && out.length < cap; page++) {
+    const p = new URLSearchParams(baseParams.toString());
+    p.set('page', String(page));
+    const { voices, has_more } = await callSharedVoicesRaw(p);
+    out.push(...voices);
+    if (!has_more || voices.length < pageSize) break;
+  }
+  return out;
+}
+
 // -------------------------------------------------------------
 // Similar Voices helpers (by voice_id via preview_url)
 // -------------------------------------------------------------
@@ -2090,6 +2400,10 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
       (guessUiLanguageFromText(cleaned) || 'en').toString().slice(0, 2).toLowerCase();
 
     // Removed initial progress message; first message will be the results
+    // Seed plan flags for server-side filtering/pagination
+    keywordPlan.__featured = false;
+    keywordPlan.__sort = null;
+    keywordPlan.__listAll = detectListAll(cleaned);
 
     // Similar voices: if user asks "similar to <voice_id>"
     const voiceIdForSimilarity = extractVoiceIdCandidate(cleaned);
@@ -2123,7 +2437,9 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
             keywordPlan.target_gender === 'male' || keywordPlan.target_gender === 'female'
               ? keywordPlan.target_gender
               : 'any',
-          listAll: detectListAll(cleaned)
+          listAll: detectListAll(cleaned),
+          featured: false,
+          sort: null
         },
         lastActive: Date.now()
       };
@@ -2132,11 +2448,14 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
       let message = buildMessageFromSession(session);
       message = await translateForUserLanguage(message, session.uiLanguage);
       const blocks = buildBlocksFromText(message);
+      const controls = await buildControlsBlocks(session);
+      const finalBlocks = blocks ? [...blocks] : [];
+      if (controls && finalBlocks.length < 50) finalBlocks.push(...controls);
       await client.chat.postMessage({
         channel: event.channel,
         thread_ts: threadTs,
         text: message,
-        blocks: blocks || undefined
+        blocks: finalBlocks || undefined
       });
       if (process.env.POC_SEARCH_REPORT === 'true') {
         let report = buildSearchReport(searchTrace, keywordPlan, 'similar_voices', {
@@ -2249,7 +2568,9 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           keywordPlan.target_gender === 'male' || keywordPlan.target_gender === 'female'
             ? keywordPlan.target_gender
             : 'any',
-        listAll: detectListAll(cleaned)
+        listAll: detectListAll(cleaned),
+        featured: false,
+        sort: null
       },
       lastActive: Date.now()
     };
@@ -2260,11 +2581,14 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
     let message = buildMessageFromSession(session);
     message = await translateForUserLanguage(message, session.uiLanguage);
     const blocks = buildBlocksFromText(message);
+    const controls = await buildControlsBlocks(session);
+    const finalBlocks = blocks ? [...blocks] : [];
+    if (controls && finalBlocks.length < 50) finalBlocks.push(...controls);
     await client.chat.postMessage({
       channel: event.channel,
       thread_ts: threadTs,
       text: message,
-      blocks: blocks || undefined
+      blocks: finalBlocks || undefined
     });
 
     if (process.env.POC_SEARCH_REPORT === 'true') {
@@ -2357,15 +2681,48 @@ app.event('app_mention', async ({ event, client }) => {
     }
 
     if (filtersChanged) {
+      if (existing._serverFiltersChanged) {
+        const searchTrace = [];
+        const traceCb = (entry) => {
+          try { searchTrace.push(entry); } catch (_) {}
+        };
+
+        const plan = JSON.parse(JSON.stringify(existing.keywordPlan || {}));
+        plan.__featured = existing.filters.featured === true;
+        plan.__sort = existing.filters.sort || null;
+        plan.__listAll = existing.filters.listAll === true;
+
+        const voices = await fetchVoicesByKeywords(plan, existing.originalQuery, traceCb);
+        if (!voices.length) {
+          const labels = getLabels();
+          const noResText = await translateForUserLanguage(labels.noResults, existing.uiLanguage);
+          await client.chat.postMessage({
+            channel: event.channel,
+            thread_ts: threadTs,
+            text: noResText
+          });
+          existing._serverFiltersChanged = false;
+          return;
+        }
+        const ranked = await rankVoicesWithGPT(existing.originalQuery, plan, voices);
+        existing.keywordPlan = plan;
+        existing.voices = voices;
+        existing.ranking = ranked.scoreMap;
+        existing._serverFiltersChanged = false;
+      }
+
       // Single unified result message
       let msg = buildMessageFromSession(existing);
       msg = await translateForUserLanguage(msg, existing.uiLanguage);
       const blocks = buildBlocksFromText(msg);
+      const controls = await buildControlsBlocks(existing);
+      const finalBlocks = blocks ? [...blocks] : [];
+      if (controls && finalBlocks.length < 50) finalBlocks.push(...controls);
       await client.chat.postMessage({
         channel: event.channel,
         thread_ts: threadTs,
         text: msg,
-        blocks: blocks || undefined
+        blocks: finalBlocks || undefined
       });
       return;
     }
@@ -2376,6 +2733,9 @@ app.event('app_mention', async ({ event, client }) => {
         JSON.parse(JSON.stringify(existing.keywordPlan || {})),
         cleaned
       );
+      refinedPlan.__featured = existing.filters.featured === true;
+      refinedPlan.__sort = existing.filters.sort || null;
+      refinedPlan.__listAll = existing.filters.listAll === true;
       const combinedQuery = [existing.originalQuery || '', cleaned].join(' ').trim();
       const searchTrace = [];
       const traceCb = (entry) => {
@@ -2405,11 +2765,14 @@ app.event('app_mention', async ({ event, client }) => {
       let msg = buildMessageFromSession(existing);
       msg = await translateForUserLanguage(msg, existing.uiLanguage);
       const blocks = buildBlocksFromText(msg);
+      const controls = await buildControlsBlocks(existing);
+      const finalBlocks = blocks ? [...blocks] : [];
+      if (controls && finalBlocks.length < 50) finalBlocks.push(...controls);
       await client.chat.postMessage({
         channel: event.channel,
         thread_ts: threadTs,
         text: msg,
-        blocks: blocks || undefined
+        blocks: finalBlocks || undefined
       });
       if (process.env.POC_SEARCH_REPORT === 'true') {
         const coverage = Array.isArray(voices)
@@ -2438,6 +2801,131 @@ app.event('app_mention', async ({ event, client }) => {
   }
 
   await handleNewSearch(event, cleaned, threadTs, client);
+});
+
+// -------------------------------------------------------------
+// Slack interactive controls
+// -------------------------------------------------------------
+app.action('toggle_featured', async ({ ack, body, client }) => {
+  try { await ack(); } catch (_) {}
+  try {
+    const channel = body.channel?.id || body.container?.channel_id || body.item?.channel || body.team?.id;
+    const threadTs =
+      body.container?.thread_ts ||
+      body.container?.message_ts ||
+      body.message?.thread_ts ||
+      body.message?.ts;
+    if (!threadTs || !channel) return;
+    const session = sessions[threadTs];
+    if (!session) return;
+    session.filters.featured = session.filters.featured ? false : true;
+    session._serverFiltersChanged = true;
+
+    const plan = JSON.parse(JSON.stringify(session.keywordPlan || {}));
+    plan.__featured = session.filters.featured === true;
+    plan.__sort = session.filters.sort || null;
+    plan.__listAll = session.filters.listAll === true;
+
+    const searchTrace = [];
+    const traceCb = (e) => { try { searchTrace.push(e); } catch (_) {} };
+    const voices = await fetchVoicesByKeywords(plan, session.originalQuery, traceCb);
+    if (!voices.length) {
+      const labels = getLabels();
+      const noResText = await translateForUserLanguage(labels.noResults, session.uiLanguage);
+      await client.chat.postMessage({ channel, thread_ts: threadTs, text: noResText });
+      session._serverFiltersChanged = false;
+      return;
+    }
+    const ranked = await rankVoicesWithGPT(session.originalQuery, plan, voices);
+    session.keywordPlan = plan;
+    session.voices = voices;
+    session.ranking = ranked.scoreMap;
+    session._serverFiltersChanged = false;
+
+    let msg = buildMessageFromSession(session);
+    msg = await translateForUserLanguage(msg, session.uiLanguage);
+    const blocks = buildBlocksFromText(msg);
+    const controls = await buildControlsBlocks(session);
+    const finalBlocks = blocks ? [...blocks] : [];
+    if (controls && finalBlocks.length < 50) finalBlocks.push(...controls);
+    await client.chat.postMessage({ channel, thread_ts: threadTs, text: msg, blocks: finalBlocks || undefined });
+  } catch (err) {
+    console.error('toggle_featured error', err);
+  }
+});
+
+app.action('show_more', async ({ ack, body, client }) => {
+  try { await ack(); } catch (_) {}
+  try {
+    const channel = body.channel?.id || body.container?.channel_id || body.item?.channel || body.team?.id;
+    const threadTs =
+      body.container?.thread_ts ||
+      body.container?.message_ts ||
+      body.message?.thread_ts ||
+      body.message?.ts;
+    if (!threadTs || !channel) return;
+    const session = sessions[threadTs];
+    if (!session) return;
+    session.filters.listAll = true;
+
+    const plan = JSON.parse(JSON.stringify(session.keywordPlan || {}));
+    plan.__featured = session.filters.featured === true;
+    plan.__sort = session.filters.sort || null;
+    plan.__listAll = true;
+
+    const searchTrace = [];
+    const traceCb = (e) => { try { searchTrace.push(e); } catch (_) {} };
+    const voices = await fetchVoicesByKeywords(plan, session.originalQuery, traceCb);
+    if (!voices.length) {
+      const labels = getLabels();
+      const noResText = await translateForUserLanguage(labels.noResults, session.uiLanguage);
+      await client.chat.postMessage({ channel, thread_ts: threadTs, text: noResText });
+      return;
+    }
+    const ranked = await rankVoicesWithGPT(session.originalQuery, plan, voices);
+    session.keywordPlan = plan;
+    session.voices = voices;
+    session.ranking = ranked.scoreMap;
+
+    let msg = buildMessageFromSession(session);
+    msg = await translateForUserLanguage(msg, session.uiLanguage);
+    const blocks = buildBlocksFromText(msg);
+    const controls = await buildControlsBlocks(session);
+    const finalBlocks = blocks ? [...blocks] : [];
+    if (controls && finalBlocks.length < 50) finalBlocks.push(...controls);
+    await client.chat.postMessage({ channel, thread_ts: threadTs, text: msg, blocks: finalBlocks || undefined });
+  } catch (err) {
+    console.error('show_more error', err);
+  }
+});
+
+app.action('cycle_quality', async ({ ack, body, client }) => {
+  try { await ack(); } catch (_) {}
+  try {
+    const channel = body.channel?.id || body.container?.channel_id || body.item?.channel || body.team?.id;
+    const threadTs =
+      body.container?.thread_ts ||
+      body.container?.message_ts ||
+      body.message?.thread_ts ||
+      body.message?.ts;
+    if (!threadTs || !channel) return;
+    const session = sessions[threadTs];
+    if (!session) return;
+    const current = session.filters.quality || 'any';
+    const next = current === 'any' ? 'high_only' : current === 'high_only' ? 'no_high' : 'any';
+    session.filters.quality = next;
+
+    // quality change does not mandate server refetch; re-render
+    let msg = buildMessageFromSession(session);
+    msg = await translateForUserLanguage(msg, session.uiLanguage);
+    const blocks = buildBlocksFromText(msg);
+    const controls = await buildControlsBlocks(session);
+    const finalBlocks = blocks ? [...blocks] : [];
+    if (controls && finalBlocks.length < 50) finalBlocks.push(...controls);
+    await client.chat.postMessage({ channel, thread_ts: threadTs, text: msg, blocks: finalBlocks || undefined });
+  } catch (err) {
+    console.error('cycle_quality error', err);
+  }
 });
 
 // -------------------------------------------------------------
