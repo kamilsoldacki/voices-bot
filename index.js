@@ -2497,14 +2497,11 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
       let message = buildMessageFromSession(session);
       message = await translateForUserLanguage(message, session.uiLanguage);
       const blocks = buildBlocksFromText(message);
-      const controls = await buildControlsBlocks(session);
-      const finalBlocks = blocks ? [...blocks] : [];
-      if (controls && finalBlocks.length < 50) finalBlocks.push(...controls);
       await client.chat.postMessage({
         channel: event.channel,
         thread_ts: threadTs,
         text: message,
-        blocks: finalBlocks || undefined
+        blocks: blocks || undefined
       });
       if (process.env.POC_SEARCH_REPORT === 'true') {
         let report = buildSearchReport(searchTrace, keywordPlan, 'similar_voices', {
@@ -2631,14 +2628,11 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
     let message = buildMessageFromSession(session);
     message = await translateForUserLanguage(message, session.uiLanguage);
     const blocks = buildBlocksFromText(message);
-    const controls = await buildControlsBlocks(session);
-    const finalBlocks = blocks ? [...blocks] : [];
-    if (controls && finalBlocks.length < 50) finalBlocks.push(...controls);
     await client.chat.postMessage({
       channel: event.channel,
       thread_ts: threadTs,
       text: message,
-      blocks: finalBlocks || undefined
+      blocks: blocks || undefined
     });
 
     if (process.env.POC_SEARCH_REPORT === 'true') {
@@ -2766,14 +2760,11 @@ app.event('app_mention', async ({ event, client }) => {
       let msg = buildMessageFromSession(existing);
       msg = await translateForUserLanguage(msg, existing.uiLanguage);
       const blocks = buildBlocksFromText(msg);
-      const controls = await buildControlsBlocks(existing);
-      const finalBlocks = blocks ? [...blocks] : [];
-      if (controls && finalBlocks.length < 50) finalBlocks.push(...controls);
       await client.chat.postMessage({
         channel: event.channel,
         thread_ts: threadTs,
         text: msg,
-        blocks: finalBlocks || undefined
+        blocks: blocks || undefined
       });
       return;
     }
@@ -2817,14 +2808,11 @@ app.event('app_mention', async ({ event, client }) => {
       let msg = buildMessageFromSession(existing);
       msg = await translateForUserLanguage(msg, existing.uiLanguage);
       const blocks = buildBlocksFromText(msg);
-      const controls = await buildControlsBlocks(existing);
-      const finalBlocks = blocks ? [...blocks] : [];
-      if (controls && finalBlocks.length < 50) finalBlocks.push(...controls);
       await client.chat.postMessage({
         channel: event.channel,
         thread_ts: threadTs,
         text: msg,
-        blocks: finalBlocks || undefined
+        blocks: blocks || undefined
       });
       if (process.env.POC_SEARCH_REPORT === 'true') {
         const coverage = Array.isArray(voices)
@@ -2897,10 +2885,7 @@ app.action('toggle_featured', async ({ ack, body, client }) => {
     let msg = buildMessageFromSession(session);
     msg = await translateForUserLanguage(msg, session.uiLanguage);
     const blocks = buildBlocksFromText(msg);
-    const controls = await buildControlsBlocks(session);
-    const finalBlocks = blocks ? [...blocks] : [];
-    if (controls && finalBlocks.length < 50) finalBlocks.push(...controls);
-    await client.chat.postMessage({ channel, thread_ts: threadTs, text: msg, blocks: finalBlocks || undefined });
+    await client.chat.postMessage({ channel, thread_ts: threadTs, text: msg, blocks: blocks || undefined });
   } catch (err) {
     console.error('toggle_featured error', err);
   }
@@ -2942,10 +2927,7 @@ app.action('show_more', async ({ ack, body, client }) => {
     let msg = buildMessageFromSession(session);
     msg = await translateForUserLanguage(msg, session.uiLanguage);
     const blocks = buildBlocksFromText(msg);
-    const controls = await buildControlsBlocks(session);
-    const finalBlocks = blocks ? [...blocks] : [];
-    if (controls && finalBlocks.length < 50) finalBlocks.push(...controls);
-    await client.chat.postMessage({ channel, thread_ts: threadTs, text: msg, blocks: finalBlocks || undefined });
+    await client.chat.postMessage({ channel, thread_ts: threadTs, text: msg, blocks: blocks || undefined });
   } catch (err) {
     console.error('show_more error', err);
   }
@@ -2971,10 +2953,7 @@ app.action('cycle_quality', async ({ ack, body, client }) => {
     let msg = buildMessageFromSession(session);
     msg = await translateForUserLanguage(msg, session.uiLanguage);
     const blocks = buildBlocksFromText(msg);
-    const controls = await buildControlsBlocks(session);
-    const finalBlocks = blocks ? [...blocks] : [];
-    if (controls && finalBlocks.length < 50) finalBlocks.push(...controls);
-    await client.chat.postMessage({ channel, thread_ts: threadTs, text: msg, blocks: finalBlocks || undefined });
+    await client.chat.postMessage({ channel, thread_ts: threadTs, text: msg, blocks: blocks || undefined });
   } catch (err) {
     console.error('cycle_quality error', err);
   }
