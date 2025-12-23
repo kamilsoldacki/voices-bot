@@ -635,6 +635,35 @@ function applyFilterChangesFromText(session, lower) {
     changed = true;
   }
 
+  // strict use case on/off (force use_cases even without explicit mention)
+  if (
+    lower.includes('strict use case') ||
+    lower.includes('force use case') ||
+    lower.includes('use case only') ||
+    lower.includes('tylko use case') ||
+    lower.includes('wymuś use case') ||
+    lower.includes('wymus use case')
+  ) {
+    if (session.filters.strictUseCase !== true) {
+      session.filters.strictUseCase = true;
+      session._serverFiltersChanged = true;
+      changed = true;
+    }
+  }
+  if (
+    lower.includes('clear use case') ||
+    lower.includes('ignore use case') ||
+    lower.includes('bez use case') ||
+    lower.includes('usuń use case') ||
+    lower.includes('usun use case')
+  ) {
+    if (session.filters.strictUseCase !== false) {
+      session.filters.strictUseCase = false;
+      session._serverFiltersChanged = true;
+      changed = true;
+    }
+  }
+
   // featured
   if (lower.includes('featured only') || lower.includes('only featured') || lower.includes('show featured')) {
     if (session.filters.featured !== true) {
@@ -1224,7 +1253,8 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
         gender,
         qualityPref,
         featured: plan.__featured === true,
-        sort: typeof plan.__sort === 'string' ? plan.__sort : null
+        sort: typeof plan.__sort === 'string' ? plan.__sort : null,
+        forceUseCases: plan.__forceUseCases === true
       });
       params.set('search', kw);
       try {
@@ -1359,7 +1389,8 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
       gender,
       qualityPref,
       featured: plan.__featured === true,
-      sort: typeof plan.__sort === 'string' ? plan.__sort : null
+      sort: typeof plan.__sort === 'string' ? plan.__sort : null,
+      forceUseCases: plan.__forceUseCases === true
     });
 
     const fallbackSearch =
@@ -2141,6 +2172,21 @@ function pickQueryDescriptives(plan, userText) {
   return filtered;
 }
 
+function hasExplicitUseCaseMention(userText) {
+  const lower = (userText || '').toLowerCase();
+  const useCaseTokens = [
+    'conversational', 'conversation', 'agent', 'support', 'customer support',
+    'call center', 'contact center', 'ivr', 'voicemail',
+    'audiobook', 'audiobooks', 'narration', 'narrator',
+    'storyteller', 'storytelling',
+    'cartoon', 'character', 'villain',
+    'game', 'gaming',
+    'trailer', 'commercial', 'ad ', 'advertising',
+    'podcast', 'youtube', 'tiktok', 'explainer', 'video'
+  ];
+  return useCaseTokens.some((t) => lower.includes(t));
+}
+
 function inferLocale(language, accent) {
   const lang = (language || '').toString().slice(0, 2).toLowerCase();
   const acc = (accent || '').toString().toLowerCase();
@@ -2175,6 +2221,7 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   const qualityPref = options.qualityPref || 'any';
   const featured = options.featured === true ? true : false;
   const sort = typeof options.sort === 'string' ? options.sort : null;
+  const forceUseCases = options.forceUseCases === true;
   const age =
     typeof options.age === 'string' && options.age
       ? options.age
@@ -2189,7 +2236,7 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   }
 
   // New filters
-  const useCases = pickQueryUseCases(plan);
+  const useCases = (forceUseCases || hasExplicitUseCaseMention(userText)) ? pickQueryUseCases(plan) : [];
   for (const uc of useCases) params.append('use_cases', uc);
 
   const descriptives = pickQueryDescriptives(plan, userText);
@@ -2404,6 +2451,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
     keywordPlan.__featured = false;
     keywordPlan.__sort = null;
     keywordPlan.__listAll = detectListAll(cleaned);
+    keywordPlan.__forceUseCases = false;
 
     // Similar voices: if user asks "similar to <voice_id>"
     const voiceIdForSimilarity = extractVoiceIdCandidate(cleaned);
@@ -2439,7 +2487,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
               : 'any',
           listAll: detectListAll(cleaned),
           featured: false,
-          sort: null
+          sort: null,
+          strictUseCase: false
         },
         lastActive: Date.now()
       };
@@ -2570,7 +2619,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
             : 'any',
         listAll: detectListAll(cleaned),
         featured: false,
-        sort: null
+        sort: null,
+        strictUseCase: false
       },
       lastActive: Date.now()
     };
@@ -2691,6 +2741,7 @@ app.event('app_mention', async ({ event, client }) => {
         plan.__featured = existing.filters.featured === true;
         plan.__sort = existing.filters.sort || null;
         plan.__listAll = existing.filters.listAll === true;
+        plan.__forceUseCases = existing.filters.strictUseCase === true;
 
         const voices = await fetchVoicesByKeywords(plan, existing.originalQuery, traceCb);
         if (!voices.length) {
@@ -2736,6 +2787,7 @@ app.event('app_mention', async ({ event, client }) => {
       refinedPlan.__featured = existing.filters.featured === true;
       refinedPlan.__sort = existing.filters.sort || null;
       refinedPlan.__listAll = existing.filters.listAll === true;
+      refinedPlan.__forceUseCases = existing.filters.strictUseCase === true;
       const combinedQuery = [existing.originalQuery || '', cleaned].join(' ').trim();
       const searchTrace = [];
       const traceCb = (entry) => {
