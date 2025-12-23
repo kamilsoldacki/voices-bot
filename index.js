@@ -10,7 +10,7 @@ const recentRequests = new Map();
 const REQUEST_DEDUP_TTL_MS = 15000;
 const SESSION_TTL_MS = 45 * 60 * 1000; // 45 minutes
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
-const KEYWORD_SEARCH_CONCURRENCY = 4; // limit concurrent keyword searches
+const KEYWORD_SEARCH_CONCURRENCY = 6; // limit concurrent keyword searches
 
 // -------------------------------------------------------------
 // Small helpers
@@ -272,9 +272,12 @@ function hasExplicitLanguageMention(text) {
 
 // Generic/noise keywords – skip unless explicitly present in user text
 const GENERIC_NOISE_KEYWORDS = new Set([
-  'narration', 'narrator', 'voiceover', 'trailer', 'video', 'content', 'media',
+  'narration', 'narrator', 'voiceover',
+  'trailer', 'video', 'content', 'media',
   'youtube', 'tiktok', 'podcast', 'explainer',
-  'gaming', 'music', 'song', 'audio', 'storytime', 'stream', 'streaming'
+  'gaming', 'music', 'song', 'audio', 'storytime', 'stream', 'streaming',
+  'commercial', 'advertising', 'advertisement', 'ad', 'ads', 'promo', 'promotion',
+  'marketing', 'brand', 'branding', 'campaign', 'corporate', 'tv', 'radio', 'sizzle'
 ]);
 
 // Very short words allowed despite length rule
@@ -311,6 +314,71 @@ function filterKeywordsGlobally(userText, keywords) {
       seen.add(k);
     }
   }
+  return out;
+}
+
+// Intent enrichment – front-load keywords tied to common intents
+function enrichKeywordsByIntent(userText, keywords) {
+  const lower = (userText || '').toLowerCase();
+  const has = (...ts) => ts.some((t) => lower.includes(t));
+  const pushFront = (arr, items) => {
+    const seen = new Set(arr.map((x) => (x || '').toLowerCase()));
+    const front = [];
+    for (const it of items) {
+      const k = (it || '').toLowerCase().trim();
+      if (k && !seen.has(k)) {
+        front.push(k);
+        seen.add(k);
+      }
+    }
+    return [...front, ...arr.filter((k) => !!k)];
+  };
+
+  let out = [...keywords];
+
+  // Military
+  if (has('military','soldier','army','navy','marine','air force')) {
+    out = pushFront(out, [
+      'military','soldier','officer','commander','sergeant','drill sergeant',
+      'authoritative','commanding','tactical','disciplined','battle-hardened',
+      'radio','comms','veteran','gritty','deep','bassy'
+    ]);
+    // remove commercial styles unless explicitly present
+    const commercialish = new Set([
+      'commercial','advertising','advertisement','ad','ads','promo','promotion',
+      'marketing','brand','branding','campaign','corporate','tv','radio','sizzle'
+    ]);
+    out = out.filter((k) => !(commercialish.has(k) && !explicitlyMentionedInText(k, userText)));
+  }
+
+  // Cartoon/negative tone / antagonist
+  const isCartoon = has('cartoon','animated','animation','character');
+  const isNegative = has('bad','evil','villain','antagonist','sinister','menacing','wicked','angry','aggressive','dark','ominous','threatening');
+  if (isCartoon || isNegative) {
+    out = pushFront(out, [
+      'villain','evil','antagonist','sinister','menacing','wicked',
+      'angry','aggressive','dark','ominous','threatening','intense',
+      'gravelly','raspy','growl','harsh','diabolical','cackling',
+      'cartoonish','animated','character'
+    ]);
+    const banPos = new Set(['playful','whimsical','friendly','cheerful','uplifting','calm','warm']);
+    out = out.filter((k) => !(banPos.has((k || '').toLowerCase()) && !explicitlyMentionedInText(k, userText)));
+  }
+
+  // Deduplicate
+  {
+    const uniq = [];
+    const seen = new Set();
+    for (const k of out) {
+      const v = (k || '').toLowerCase().trim();
+      if (v && !seen.has(v)) {
+        uniq.push(v);
+        seen.add(v);
+      }
+    }
+    out = uniq;
+  }
+
   return out;
 }
 
@@ -1006,8 +1074,8 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   const extraKw = Array.from(new Set((plan.extra_keywords || []).map((s) => (s || '').toLowerCase().trim()).filter(Boolean)));
 
   // Budgeted selection: prioritize use/style/character over tone
-  const MAX_KEYWORD_QUERIES = 10;
-  const budgets = { tone: 2, use: 3, style: 3, character: 2 };
+  const MAX_KEYWORD_QUERIES = 14;
+  const budgets = { tone: 3, use: 4, style: 4, character: 3 };
   const pick = (arr, n) => arr.slice(0, Math.max(0, n));
   let selectedKeywords = [
     ...pick(useKw, budgets.use),
@@ -1032,11 +1100,40 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   }
 
   // Global prune of generic/noise keywords unless user explicitly asked
-  selectedKeywords = filterKeywordsGlobally(userText, selectedKeywords);
-  // Safety: if nothing left, fall back to raw user text (filtered once)
-  if (!selectedKeywords.length && userText) {
-    const fallback = filterKeywordsGlobally(userText, [(userText || '').toLowerCase()]);
-    selectedKeywords = fallback.length ? fallback : [(userText || '').toLowerCase()];
+  {
+    const before = selectedKeywords.slice();
+    let filtered = filterKeywordsGlobally(userText, before);
+
+    // Ensure a minimum count after filtering by refilling from dropped ones
+    const MIN_KEYWORDS_AFTER_FILTER = 12;
+    if (filtered.length < MIN_KEYWORDS_AFTER_FILTER) {
+      const dropped = before.filter((k) => !filtered.includes(k));
+      // Prioritize those explicitly mentioned by the user
+      dropped.sort((a, b) => {
+        const ea = explicitlyMentionedInText(a, userText) ? 1 : 0;
+        const eb = explicitlyMentionedInText(b, userText) ? 1 : 0;
+        return eb - ea;
+      });
+      while (
+        filtered.length < Math.min(MIN_KEYWORDS_AFTER_FILTER, before.length) &&
+        dropped.length
+      ) {
+        const next = dropped.shift();
+        if (next && !filtered.includes(next)) filtered.push(next);
+      }
+    }
+
+    // Intent-aware enrichment (military / villain / negative tone, etc.)
+    filtered = enrichKeywordsByIntent(userText, filtered);
+
+    // Safety: if nothing left, fall back to raw user text (filtered once, then enriched)
+    if (!filtered.length && userText) {
+      const fb = filterKeywordsGlobally(userText, [(userText || '').toLowerCase()]);
+      filtered = enrichKeywordsByIntent(userText, fb.length ? fb : [(userText || '').toLowerCase()]);
+    }
+
+    // Cap to max
+    selectedKeywords = filtered.slice(0, MAX_KEYWORD_QUERIES);
   }
 
   // 1) separate search for EACH keyword, with limited concurrency
