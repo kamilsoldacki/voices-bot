@@ -1030,6 +1030,75 @@ function normalizeKeywordPlan(plan, userText) {
 
   return out;
 }
+
+function ensureKeywordFloor(userText, plan) {
+  const out = JSON.parse(JSON.stringify(plan || {}));
+  const lower = (userText || '').toLowerCase();
+  const countAll =
+    (out.tone_keywords?.length || 0) +
+    (out.use_case_keywords?.length || 0) +
+    (out.character_keywords?.length || 0) +
+    (out.style_keywords?.length || 0) +
+    (out.extra_keywords?.length || 0);
+  if (countAll >= 8) return out;
+
+  const addUnique = (arr, items, cap) => {
+    const base = Array.isArray(arr) ? arr : [];
+    const set = new Set(base);
+    for (const it of items) {
+      const v = (it || '').toLowerCase().trim();
+      if (v && !set.has(v)) {
+        base.push(v);
+        set.add(v);
+      }
+      if (cap && base.length >= cap) break;
+    }
+    return base;
+  };
+
+  const domainMap = [
+    {
+      name: 'healthcare',
+      test: (s) => /\b(healthcare|medical|hospital|patient|clinic|pharma|nurse|doctor|clinical)\b/.test(s)
+    },
+    {
+      name: 'finance',
+      test: (s) => /\b(bank|finance|financial|credit|loan|mortgage|investment|trading)\b/.test(s)
+    },
+    {
+      name: 'ecommerce',
+      test: (s) => /\b(ecommerce|e-commerce|shop|store|retail|cart|order|fulfillment)\b/.test(s)
+    },
+    {
+      name: 'telco',
+      test: (s) => /\b(telecom|telco|carrier|mobile|network|broadband)\b/.test(s)
+    }
+  ];
+  const domain = (domainMap.find((d) => d.test(lower)) || {}).name || null;
+
+  out.use_case_keywords = addUnique(out.use_case_keywords, [
+    'conversational','support','customer support','call center','contact center','ivr'
+  ], 6);
+  out.tone_keywords = addUnique(out.tone_keywords, [
+    'calm','reassuring','clear','warm','professional','empathetic','confident'
+  ], 8);
+  out.style_keywords = addUnique(out.style_keywords, [
+    'friendly','helpful','service'
+  ], 6);
+
+  if (domain === 'healthcare') {
+    out.extra_keywords = addUnique(out.extra_keywords, ['healthcare','medical','patient','clinical'], 12);
+  } else if (domain === 'finance') {
+    out.extra_keywords = addUnique(out.extra_keywords, ['finance','bank','account','transaction'], 12);
+  } else if (domain === 'ecommerce') {
+    out.extra_keywords = addUnique(out.extra_keywords, ['ecommerce','order','delivery','refund'], 12);
+  } else if (domain === 'telco') {
+    out.extra_keywords = addUnique(out.extra_keywords, ['telco','network','plan','coverage'], 12);
+  }
+
+  out.__floorDomain = domain;
+  return out;
+}
 RULES:
 
 - user_interface_language:
@@ -1182,6 +1251,25 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   const XI_KEY = process.env.ELEVENLABS_API_KEY;
   const seen = new Map(); // voice_id -> { voice, matchedKeywords: Set<string> }
   const trace = typeof traceCb === 'function' ? traceCb : () => {};
+
+  // Apply keyword floor enrichment if the plan is too thin
+  plan = ensureKeywordFloor(userText, plan);
+  try {
+    const totalKw =
+      (plan.tone_keywords?.length || 0) +
+      (plan.use_case_keywords?.length || 0) +
+      (plan.character_keywords?.length || 0) +
+      (plan.style_keywords?.length || 0) +
+      (plan.extra_keywords?.length || 0);
+    trace({
+      stage: 'keyword_floor',
+      params: { domain: plan.__floorDomain || '-', total_keywords: String(totalKw) }
+    });
+    if (totalKw < 6 && hasExplicitUseCaseMention(userText)) {
+      plan.__forceUseCases = true;
+      trace({ stage: 'keyword_floor_force_use_cases', params: { reason: 'explicit_use_case_low_kw' } });
+    }
+  } catch (_) {}
 
   async function callSharedVoices(params) {
     const url = `https://api.elevenlabs.io/v1/shared-voices?${params.toString()}`;
@@ -2333,7 +2421,9 @@ function hasExplicitUseCaseMention(userText) {
     'cartoon', 'character', 'villain',
     'game', 'gaming',
     'trailer', 'commercial', 'ad ', 'advertising',
-    'podcast', 'youtube', 'tiktok', 'explainer', 'video'
+    'podcast', 'youtube', 'tiktok', 'explainer', 'video',
+    // Expanded variants:
+    'customer service', 'service support', 'tech support', 'technical support'
   ];
   return useCaseTokens.some((t) => lower.includes(t));
 }
