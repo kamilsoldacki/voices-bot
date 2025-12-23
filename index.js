@@ -1867,7 +1867,9 @@ function buildMessageFromSession(session) {
     const nonEmpty = order.filter((key) => (groups[key] || []).length > 0);
     if (!nonEmpty.length) return; // skip entire section if empty
 
-    lines.push(`*${title}*`);
+    // Quality section titles as code blocks
+    const qualityTitle = sectionKey === 'standard' ? 'STANDARD:' : 'HIGH QUALITY:';
+    lines.push('```' + qualityTitle + '```');
     nonEmpty.forEach((key) => {
       const label = genderLabels[key];
       const arr = groups[key];
@@ -1886,13 +1888,7 @@ function buildMessageFromSession(session) {
     appendSection(labels.highHeader, 'high');
   }
 
-  if (genderFilter === 'female') {
-    lines.push(labels.femaleFilterFooter || labels.genericFooter);
-  } else if (genderFilter === 'male') {
-    lines.push(labels.maleFilterFooter || labels.genericFooter);
-  } else {
-    lines.push(labels.genericFooter);
-  }
+  // Removed follow-up hints/footers
 
   return lines.join('\n');
 }
@@ -1940,37 +1936,7 @@ function buildBlocksFromText(text) {
   return blocks;
 }
 
-// Post one or two messages depending on quality filter
-async function postSessionMessages(client, channel, threadTs, session) {
-  const quality = (session.filters?.quality || 'any').toString();
-  if (quality !== 'any') {
-    let message = buildMessageFromSession(session);
-    message = await translateForUserLanguage(message, session.uiLanguage);
-    const blocks = buildBlocksFromText(message);
-    await client.chat.postMessage({
-      channel,
-      thread_ts: threadTs,
-      text: message,
-      blocks: blocks || undefined
-    });
-    return;
-  }
-  // Split into standard-only and high-only
-  const qualities = ['no_high', 'high_only'];
-  for (const q of qualities) {
-    const copy = JSON.parse(JSON.stringify(session));
-    copy.filters.quality = q;
-    let message = buildMessageFromSession(copy);
-    message = await translateForUserLanguage(message, copy.uiLanguage);
-    const blocks = buildBlocksFromText(message);
-    await client.chat.postMessage({
-      channel,
-      thread_ts: threadTs,
-      text: message,
-      blocks: blocks || undefined
-    });
-  }
-}
+// (Removed splitting helper; we now always send a single unified result message)
 
 function paramsToObject(params) {
   const obj = {};
@@ -2123,13 +2089,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
     let uiLang =
       (guessUiLanguageFromText(cleaned) || 'en').toString().slice(0, 2).toLowerCase();
 
-    const searchingText = await translateForUserLanguage(labels.searching, uiLang);
-
-    await client.chat.postMessage({
-      channel: event.channel,
-      thread_ts: threadTs,
-      text: searchingText
-    });
+    // Removed initial progress message; first message will be the results
 
     // Similar voices: if user asks "similar to <voice_id>"
     const voiceIdForSimilarity = extractVoiceIdCandidate(cleaned);
@@ -2168,7 +2128,16 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         lastActive: Date.now()
       };
       sessions[threadTs] = session;
-      await postSessionMessages(client, event.channel, threadTs, session);
+      // Single unified result message
+      let message = buildMessageFromSession(session);
+      message = await translateForUserLanguage(message, session.uiLanguage);
+      const blocks = buildBlocksFromText(message);
+      await client.chat.postMessage({
+        channel: event.channel,
+        thread_ts: threadTs,
+        text: message,
+        blocks: blocks || undefined
+      });
       if (process.env.POC_SEARCH_REPORT === 'true') {
         let report = buildSearchReport(searchTrace, keywordPlan, 'similar_voices', {
           unique_count: Array.isArray(voices) ? voices.length : 0
@@ -2287,7 +2256,16 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
 
     sessions[threadTs] = session;
 
-    await postSessionMessages(client, event.channel, threadTs, session);
+    // Single unified result message
+    let message = buildMessageFromSession(session);
+    message = await translateForUserLanguage(message, session.uiLanguage);
+    const blocks = buildBlocksFromText(message);
+    await client.chat.postMessage({
+      channel: event.channel,
+      thread_ts: threadTs,
+      text: message,
+      blocks: blocks || undefined
+    });
 
     if (process.env.POC_SEARCH_REPORT === 'true') {
       const coverage = Array.isArray(voices)
@@ -2379,7 +2357,16 @@ app.event('app_mention', async ({ event, client }) => {
     }
 
     if (filtersChanged) {
-      await postSessionMessages(client, event.channel, threadTs, existing);
+      // Single unified result message
+      let msg = buildMessageFromSession(existing);
+      msg = await translateForUserLanguage(msg, existing.uiLanguage);
+      const blocks = buildBlocksFromText(msg);
+      await client.chat.postMessage({
+        channel: event.channel,
+        thread_ts: threadTs,
+        text: msg,
+        blocks: blocks || undefined
+      });
       return;
     }
 
@@ -2414,7 +2401,16 @@ app.event('app_mention', async ({ event, client }) => {
       existing.ranking = ranked.scoreMap;
       existing.lastActive = Date.now();
 
-      await postSessionMessages(client, event.channel, threadTs, existing);
+      // Single unified result message
+      let msg = buildMessageFromSession(existing);
+      msg = await translateForUserLanguage(msg, existing.uiLanguage);
+      const blocks = buildBlocksFromText(msg);
+      await client.chat.postMessage({
+        channel: event.channel,
+        thread_ts: threadTs,
+        text: msg,
+        blocks: blocks || undefined
+      });
       if (process.env.POC_SEARCH_REPORT === 'true') {
         const coverage = Array.isArray(voices)
           ? voices.map((v) => ({
