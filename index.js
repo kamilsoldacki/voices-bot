@@ -1702,18 +1702,21 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   return voices;
 }
 
-// Special mode: "top by language" – most used voices in a given language
-async function fetchTopVoicesByLanguage(languageCode, qualityPreference, traceCb) {
+// Special mode: "top by language" – most used voices in a given language (with optional filters)
+async function fetchTopVoicesByLanguage(languageCode, qualityPreference, plan, userText, traceCb) {
   const XI_KEY = process.env.ELEVENLABS_API_KEY;
   const trace = typeof traceCb === 'function' ? traceCb : () => {};
 
   try {
     const params = new URLSearchParams();
     params.set('page_size', '100');
-    if (languageCode) params.set('language', languageCode);
-    if (qualityPreference === 'high_only') {
-      params.set('category', 'high_quality');
-    }
+    appendQueryFiltersToParams(params, plan || {}, userText || '', {
+      language: languageCode,
+      qualityPref: qualityPreference,
+      featured: plan?.__featured === true,
+      sort: typeof plan?.__sort === 'string' ? plan.__sort : null,
+      forceUseCases: plan?.__forceUseCases === true
+    });
 
     const url = `https://api.elevenlabs.io/v1/shared-voices?${params.toString()}`;
 
@@ -2035,10 +2038,13 @@ function buildMessageFromSession(session) {
   }
 
   if (showStandardSection) {
-    appendSection(labels.standardHeader, 'standard');
+    // defer standard after high if both visible
   }
   if (showHighSection) {
     appendSection(labels.highHeader, 'high');
+  }
+  if (showStandardSection) {
+    appendSection(labels.standardHeader, 'standard');
   }
 
   // Removed follow-up hints/footers
@@ -2535,6 +2541,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
       voices = await fetchTopVoicesByLanguage(
         special.languageCode,
         keywordPlan.quality_preference,
+        keywordPlan,
+        cleaned,
         traceCb
       );
 
@@ -2570,6 +2578,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         voices = await fetchTopVoicesByLanguage(
           special.languageCode,
           keywordPlan.quality_preference,
+          keywordPlan,
+          cleaned,
           traceCb
         );
         if (!voices.length) {
