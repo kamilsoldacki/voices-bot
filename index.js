@@ -266,6 +266,54 @@ function hasExplicitLanguageMention(text) {
   return tokens.some((t) => lower.includes(t));
 }
 
+// -------------------------------------------------------------
+// Global keyword noise filters
+// -------------------------------------------------------------
+
+// Generic/noise keywords – skip unless explicitly present in user text
+const GENERIC_NOISE_KEYWORDS = new Set([
+  'narration', 'narrator', 'voiceover', 'trailer', 'video', 'content', 'media',
+  'youtube', 'tiktok', 'podcast', 'explainer',
+  'gaming', 'music', 'song', 'audio', 'storytime', 'stream', 'streaming'
+]);
+
+// Very short words allowed despite length rule
+const SHORT_WHITELIST = new Set(['evil', 'dark', 'deep', 'raw', 'warm', 'slow', 'fast', 'calm']);
+
+function normalizeKw(s) {
+  return (s || '').toString().toLowerCase().trim();
+}
+
+function explicitlyMentionedInText(kw, text) {
+  const k = normalizeKw(kw);
+  const lower = (text || '').toLowerCase();
+  return lower.includes(k);
+}
+
+function isGenericNoiseKeyword(kw) {
+  return GENERIC_NOISE_KEYWORDS.has(normalizeKw(kw));
+}
+
+function filterKeywordsGlobally(userText, keywords) {
+  const out = [];
+  const seen = new Set();
+  for (let kw of keywords) {
+    const k = normalizeKw(kw);
+    if (!k) continue;
+    if (k.length < 3 && !SHORT_WHITELIST.has(k) && !explicitlyMentionedInText(k, userText)) {
+      continue;
+    }
+    if (isGenericNoiseKeyword(k) && !explicitlyMentionedInText(k, userText)) {
+      continue;
+    }
+    if (!seen.has(k)) {
+      out.push(k);
+      seen.add(k);
+    }
+  }
+  return out;
+}
+
 // Heuristic: is this voice effectively in langCode?
 function isVoiceInLanguage(voice, langCode) {
   if (!voice || !langCode) return false;
@@ -983,6 +1031,14 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     selectedKeywords.push((userText || '').toLowerCase());
   }
 
+  // Global prune of generic/noise keywords unless user explicitly asked
+  selectedKeywords = filterKeywordsGlobally(userText, selectedKeywords);
+  // Safety: if nothing left, fall back to raw user text (filtered once)
+  if (!selectedKeywords.length && userText) {
+    const fallback = filterKeywordsGlobally(userText, [(userText || '').toLowerCase()]);
+    selectedKeywords = fallback.length ? fallback : [(userText || '').toLowerCase()];
+  }
+
   // 1) separate search for EACH keyword, with limited concurrency
   async function runWithLimit(items, limit, worker) {
     const results = new Array(items.length);
@@ -1270,6 +1326,21 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     return v;
   });
 
+  // Post-filter: prefer candidates matching at least one non-generic keyword
+  {
+    const nonGeneric = [];
+    const maybeGeneric = [];
+    for (const v of voices) {
+      const mk = Array.isArray(v._matched_keywords) ? v._matched_keywords.map(normalizeKw) : [];
+      const hasNonNoise = mk.some((k) => !GENERIC_NOISE_KEYWORDS.has(k));
+      if (hasNonNoise) nonGeneric.push(v);
+      else maybeGeneric.push(v);
+    }
+    if (nonGeneric.length >= 10) {
+      voices = [...nonGeneric, ...maybeGeneric];
+    }
+  }
+
   // extra language filter (heuristic)
   if (language && voices.length) {
     const langFiltered = voices.filter((v) => isVoiceInLanguage(v, language));
@@ -1306,6 +1377,19 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     ...(plan.style_keywords || []),
     ...(plan.character_keywords || [])
   ]);
+
+  // Deprioritize candidates that matched only generic/noise keywords; prefer those with any high-signal match
+  voices = voices.sort((a, b) => {
+    const aMk = (a._matched_keywords || []).map(normalizeKw);
+    const bMk = (b._matched_keywords || []).map(normalizeKw);
+    const aHS = aMk.some((k) => highSignal.has(k));
+    const bHS = bMk.some((k) => highSignal.has(k));
+    if (aHS !== bHS) return aHS ? -1 : 1;
+    const aGenericOnly = aMk.length > 0 && aMk.every((k) => GENERIC_NOISE_KEYWORDS.has(k));
+    const bGenericOnly = bMk.length > 0 && bMk.every((k) => GENERIC_NOISE_KEYWORDS.has(k));
+    if (aGenericOnly !== bGenericOnly) return aGenericOnly ? 1 : -1;
+    return 0;
+  });
 
   const byKeywordBucket = new Map();
   voices.forEach((v) => {
@@ -1759,6 +1843,38 @@ function buildBlocksFromText(text) {
   return blocks;
 }
 
+// Post one or two messages depending on quality filter
+async function postSessionMessages(client, channel, threadTs, session) {
+  const quality = (session.filters?.quality || 'any').toString();
+  if (quality !== 'any') {
+    let message = buildMessageFromSession(session);
+    message = await translateForUserLanguage(message, session.uiLanguage);
+    const blocks = buildBlocksFromText(message);
+    await client.chat.postMessage({
+      channel,
+      thread_ts: threadTs,
+      text: message,
+      blocks: blocks || undefined
+    });
+    return;
+  }
+  // Split into standard-only and high-only
+  const qualities = ['no_high', 'high_only'];
+  for (const q of qualities) {
+    const copy = JSON.parse(JSON.stringify(session));
+    copy.filters.quality = q;
+    let message = buildMessageFromSession(copy);
+    message = await translateForUserLanguage(message, copy.uiLanguage);
+    const blocks = buildBlocksFromText(message);
+    await client.chat.postMessage({
+      channel,
+      thread_ts: threadTs,
+      text: message,
+      blocks: blocks || undefined
+    });
+  }
+}
+
 function paramsToObject(params) {
   const obj = {};
   try {
@@ -1955,15 +2071,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         lastActive: Date.now()
       };
       sessions[threadTs] = session;
-      let message = buildMessageFromSession(session);
-      message = await translateForUserLanguage(message, session.uiLanguage);
-      const blocks = buildBlocksFromText(message);
-      await client.chat.postMessage({
-        channel: event.channel,
-        thread_ts: threadTs,
-        text: message,
-        blocks: blocks || undefined
-      });
+      await postSessionMessages(client, event.channel, threadTs, session);
       if (process.env.POC_SEARCH_REPORT === 'true') {
         let report = buildSearchReport(searchTrace, keywordPlan, 'similar_voices', {
           unique_count: Array.isArray(voices) ? voices.length : 0
@@ -2082,16 +2190,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
 
     sessions[threadTs] = session;
 
-    let message = buildMessageFromSession(session);
-    message = await translateForUserLanguage(message, session.uiLanguage);
-    const blocks = buildBlocksFromText(message);
-
-    await client.chat.postMessage({
-      channel: event.channel,
-      thread_ts: threadTs,
-      text: message,
-      blocks: blocks || undefined
-    });
+    await postSessionMessages(client, event.channel, threadTs, session);
 
     if (process.env.POC_SEARCH_REPORT === 'true') {
       const coverage = Array.isArray(voices)
@@ -2183,15 +2282,7 @@ app.event('app_mention', async ({ event, client }) => {
     }
 
     if (filtersChanged) {
-      let msg = buildMessageFromSession(existing);
-      msg = await translateForUserLanguage(msg, existing.uiLanguage);
-      const blocks = buildBlocksFromText(msg);
-      await client.chat.postMessage({
-        channel: event.channel,
-        thread_ts: threadTs,
-        text: msg,
-        blocks: blocks || undefined
-      });
+      await postSessionMessages(client, event.channel, threadTs, existing);
       return;
     }
 
@@ -2226,15 +2317,7 @@ app.event('app_mention', async ({ event, client }) => {
       existing.ranking = ranked.scoreMap;
       existing.lastActive = Date.now();
 
-      let msg = buildMessageFromSession(existing);
-      msg = await translateForUserLanguage(msg, existing.uiLanguage);
-      const blocks = buildBlocksFromText(msg);
-      await client.chat.postMessage({
-        channel: event.channel,
-        thread_ts: threadTs,
-        text: msg,
-        blocks: blocks || undefined
-      });
+      await postSessionMessages(client, event.channel, threadTs, existing);
       if (process.env.POC_SEARCH_REPORT === 'true') {
         const coverage = Array.isArray(voices)
           ? voices.map((v) => ({
