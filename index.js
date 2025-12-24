@@ -1267,7 +1267,8 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
       (plan.extra_keywords?.length || 0);
     trace({
       stage: 'keyword_floor',
-      params: { domain: plan.__floorDomain || '-', total_keywords: String(totalKw) }
+      params: { domain: plan.__floorDomain || '-', total_keywords: String(totalKw) },
+      count: totalKw
     });
     if (totalKw < 6 && hasExplicitUseCaseMention(userText)) {
       plan.__forceUseCases = true;
@@ -1413,19 +1414,27 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
       });
       params.set('search', kw);
       try {
-        try {
-          trace({
-            stage: 'gates',
-            keyword: kw,
-            params: {
-              use_cases: String((appended.useCases || []).length),
-              descriptives: String((appended.descriptives || []).length)
-            },
-            count:
-              ((appended.useCases || []).length) +
-              ((appended.descriptives || []).length)
-          });
-        } catch (_) {}
+        // Emit gates trace only when gate signature changes (or inline into per_keyword)
+        const inlineGates = readEnvBoolean('TRACE_GATES_INLINE', false);
+        const ucLen = (appended.useCases || []).length;
+        const descLen = (appended.descriptives || []).length;
+        const gateSig = `${ucLen}|${descLen}`;
+        if (!inlineGates) {
+          if (!global.__lastGateSig || global.__lastGateSig !== gateSig) {
+            try {
+              trace({
+                stage: 'gates',
+                keyword: kw,
+                params: {
+                  use_cases: String(ucLen),
+                  descriptives: String(descLen)
+                },
+                count: ucLen + descLen
+              });
+            } catch (_) {}
+            global.__lastGateSig = gateSig;
+          }
+        }
         let voicesForKeyword;
         const wantMore = detectListAll(userText) === true || plan.__listAll === true;
         if (wantMore) {
@@ -1437,10 +1446,15 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
           });
         }
         try {
+          const baseParams = paramsToObject(params);
+          if (inlineGates) {
+            baseParams.gates_use_cases = String(ucLen);
+            baseParams.gates_descriptives = String(descLen);
+          }
           trace({
             stage: 'per_keyword',
             keyword: kw,
-            params: paramsToObject(params),
+            params: baseParams,
             count: Array.isArray(voicesForKeyword) ? voicesForKeyword.length : 0
           });
         } catch (_) {}
