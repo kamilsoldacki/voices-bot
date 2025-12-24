@@ -303,6 +303,10 @@ function isGenericNoiseKeyword(kw) {
 function filterKeywordsGlobally(userText, keywords) {
   const out = [];
   const seen = new Set();
+  const lower = (userText || '').toLowerCase();
+  const isCommercialIntent = /\b(commercial|advertising|ad|promo|promotion|brand|campaign)\b/.test(lower);
+  const isPodcastIntent = /\b(podcast|broadcaster|radio|host)\b/.test(lower);
+  const whitelistCommercial = new Set(['commercial','advertising','ad','ads','promo','promotion','marketing','brand','branding','campaign']);
   for (let kw of keywords) {
     const k = normalizeKw(kw);
     if (!k) continue;
@@ -310,7 +314,14 @@ function filterKeywordsGlobally(userText, keywords) {
       continue;
     }
     if (isGenericNoiseKeyword(k) && !explicitlyMentionedInText(k, userText)) {
-      continue;
+      // allow commercial/podcast tokens when those intents are active
+      if (isCommercialIntent && whitelistCommercial.has(k)) {
+        // keep
+      } else if (isPodcastIntent && (k === 'podcast' || k === 'radio' || k === 'host')) {
+        // keep
+      } else {
+        continue;
+      }
     }
     if (!seen.has(k)) {
       out.push(k);
@@ -1094,6 +1105,20 @@ function ensureKeywordFloor(userText, plan) {
     out.extra_keywords = addUnique(out.extra_keywords, ['ecommerce','order','delivery','refund'], 12);
   } else if (domain === 'telco') {
     out.extra_keywords = addUnique(out.extra_keywords, ['telco','network','plan','coverage'], 12);
+  } else if (/\b(presentation|presenter|company presentation)\b/.test(lower)) {
+    out.use_case_keywords = addUnique(out.use_case_keywords, ['explainer','video'], 6);
+    out.tone_keywords = addUnique(out.tone_keywords, ['slow','low','deep','calm'], 8);
+    out.style_keywords = addUnique(out.style_keywords, ['corporate','professional','clear'], 6);
+  } else if (/\b(commercial|advertising|ad|promo|promotion|brand|campaign)\b/.test(lower)) {
+    out.use_case_keywords = addUnique(out.use_case_keywords, ['commercial','advertising','ad','promo','brand','campaign'], 6);
+    out.style_keywords = addUnique(out.style_keywords, ['energetic','upbeat','dynamic','lively','punchy'], 6);
+  } else if (/\b(podcast|podcaster|host|broadcaster|radio host)\b/.test(lower)) {
+    out.use_case_keywords = addUnique(out.use_case_keywords, ['podcast'], 6);
+    out.character_keywords = addUnique(out.character_keywords, ['host','presenter','broadcaster'], 6);
+    out.style_keywords = addUnique(out.style_keywords, ['warm','engaging','conversational','friendly'], 6);
+  } else if (/\b(kid|child|children|young girl|young boy|dziecko|dziecięcy|dzieciecy)\b/.test(lower)) {
+    out.character_keywords = addUnique(out.character_keywords, ['kid','child','young girl','young boy'], 6);
+    out.style_keywords = addUnique(out.style_keywords, ['playful','cheerful','cute','youthful','high pitch','squeaky'], 6);
   }
 
   out.__floorDomain = domain;
@@ -1275,6 +1300,13 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
       trace({ stage: 'keyword_floor_force_use_cases', params: { reason: 'explicit_use_case_low_kw' } });
     }
   } catch (_) {}
+  // Negatives from user brief
+  try {
+    plan.__negatives = Array.from(extractNegativeTokens(userText) || []);
+    if (plan.__negatives.length) {
+      trace({ stage: 'negatives', params: { applied: plan.__negatives.join(',') } });
+    }
+  } catch (_) {}
 
   async function callSharedVoices(params) {
     const url = `https://api.elevenlabs.io/v1/shared-voices?${params.toString()}`;
@@ -1427,7 +1459,9 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
                 keyword: kw,
                 params: {
                   use_cases: String(ucLen),
-                  descriptives: String(descLen)
+                  descriptives: String(descLen),
+                  locale_inferred: String(Boolean(appended.localeInferred)),
+                  bilingual: String(Boolean(appended.bilingual))
                 },
                 count: ucLen + descLen
               });
@@ -1458,26 +1492,6 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             count: Array.isArray(voicesForKeyword) ? voicesForKeyword.length : 0
           });
         } catch (_) {}
-        // Quick relax: if empty, retry without use_cases and accent
-        if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0) {
-          const pQuick = new URLSearchParams(params.toString());
-          const keysQuick = Array.from(pQuick.keys());
-          keysQuick.forEach((k) => {
-            if (k === 'use_cases' || k === 'accent') pQuick.delete(k);
-          });
-          try {
-            const vQuick = await callSharedVoices(pQuick);
-            try {
-              trace({
-                stage: 'per_keyword_quick_relax',
-                keyword: kw,
-                params: paramsToObject(pQuick),
-                count: Array.isArray(vQuick) ? vQuick.length : 0
-              });
-            } catch (_) {}
-            if (Array.isArray(vQuick) && vQuick.length) voicesForKeyword = vQuick;
-          } catch (_) {}
-        }
         // Progressive relaxation if empty and we added filters
         if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0) {
           // 1) drop descriptives
@@ -1523,6 +1537,26 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
               if (Array.isArray(v3) && v3.length) voicesForKeyword = v3;
             } catch (_) {}
           }
+        }
+        // Quick relax (after triage): if still empty, retry without use_cases/accent/age
+        if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0) {
+          const pQuick = new URLSearchParams(params.toString());
+          const keysQuick = Array.from(pQuick.keys());
+          keysQuick.forEach((k) => {
+            if (k === 'use_cases' || k === 'accent' || k === 'age') pQuick.delete(k);
+          });
+          try {
+            const vQuick = await callSharedVoices(pQuick);
+            try {
+              trace({
+                stage: 'per_keyword_quick_relax',
+                keyword: kw,
+                params: paramsToObject(pQuick),
+                count: Array.isArray(vQuick) ? vQuick.length : 0
+              });
+            } catch (_) {}
+            if (Array.isArray(vQuick) && vQuick.length) voicesForKeyword = vQuick;
+          } catch (_) {}
         }
         // Early language alias retry if empty
         if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0 && language) {
@@ -1604,20 +1638,24 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     }
 
     try {
-      // Combined fallback: with and without use_cases
+      // Combined fallback triad: with both, without use_cases, without descriptives
       const paramsWith = new URLSearchParams(params.toString());
       const paramsNoUC = new URLSearchParams(params.toString());
       const keysNoUC = Array.from(paramsNoUC.keys());
       keysNoUC.forEach((k) => { if (k === 'use_cases') paramsNoUC.delete(k); });
+      const paramsNoDesc = new URLSearchParams(params.toString());
+      const keysNoDesc = Array.from(paramsNoDesc.keys());
+      keysNoDesc.forEach((k) => { if (k === 'descriptives') paramsNoDesc.delete(k); });
 
       const wantMore = detectListAll(userText) === true || plan.__listAll === true;
-      const [fa, fb] = await Promise.all([
+      const [fa, fb, fc] = await Promise.all([
         wantMore ? callSharedVoicesAllPages(paramsWith, { maxPages: 2, cap: 160 }) : callSharedVoicesCached(paramsWith, async (p) => { const { voices } = await callSharedVoicesRaw(p); return voices; }),
-        wantMore ? callSharedVoicesAllPages(paramsNoUC, { maxPages: 2, cap: 160 }) : callSharedVoicesCached(paramsNoUC, async (p) => { const { voices } = await callSharedVoicesRaw(p); return voices; })
+        wantMore ? callSharedVoicesAllPages(paramsNoUC, { maxPages: 2, cap: 160 }) : callSharedVoicesCached(paramsNoUC, async (p) => { const { voices } = await callSharedVoicesRaw(p); return voices; }),
+        wantMore ? callSharedVoicesAllPages(paramsNoDesc, { maxPages: 2, cap: 160 }) : callSharedVoicesCached(paramsNoDesc, async (p) => { const { voices } = await callSharedVoicesRaw(p); return voices; })
       ]);
       const seenIdsCF = new Set();
       const fallbackVoices = [];
-      for (const v of [...(fa || []), ...(fb || [])]) {
+      for (const v of [...(fa || []), ...(fb || []), ...(fc || [])]) {
         if (v && v.voice_id && !seenIdsCF.has(v.voice_id)) {
           seenIdsCF.add(v.voice_id);
           fallbackVoices.push(v);
@@ -1879,7 +1917,39 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     const style = (plan.style_keywords || []).filter((k) => set.has(k)).length;
     const character = (plan.character_keywords || []).filter((k) => set.has(k)).length;
     const tone = (plan.tone_keywords || []).filter((k) => set.has(k)).length;
-    const coverage = 3 * useCase + 3 * style + 2 * character + 1 * tone;
+    let coverage = 3 * useCase + 3 * style + 2 * character + 1 * tone;
+    // domain-aware boosts (pre-GPT)
+    const hasAny = (...tokens) => tokens.some((t) => set.has(t));
+    // villain/cartoon
+    if (hasAny('villain','evil','demon','cartoon','cartoonish','raspy','gravelly','growl','menacing','wicked','sinister','dark')) {
+      coverage += 1.5;
+    }
+    // corporate/presentation
+    if (hasAny('corporate','clear','professional','slow','low','deep','presentation','explainer','video')) {
+      coverage += 1.0;
+    }
+    // podcast
+    if (hasAny('podcast','host','presenter','broadcaster','warm','engaging','conversational')) {
+      coverage += 1.0;
+    }
+    // support
+    if (hasAny('support','customer support','conversational','call center','contact center')) {
+      coverage += 0.8;
+    }
+    // negatives: penalize forbidden descriptors if present in metadata blob
+    try {
+      const negatives = Array.isArray(plan.__negatives) ? plan.__negatives : [];
+      if (negatives.length) {
+        const blob = (
+          (v.name || '') + ' ' +
+          (v.description || '') + ' ' +
+          (v.descriptive || '') + ' ' +
+          (v.accent || '')
+        ).toLowerCase();
+        const violates = negatives.some((b) => blob.includes(b));
+        if (violates) coverage -= 2.0;
+      }
+    } catch (_) {}
     const matchedCount = mk.length;
     const usage = v.usage_character_count_1y || v.usage_character_count_7d || 0;
     return { coverage, matchedCount, usage };
@@ -2368,6 +2438,47 @@ function paramsToObject(params) {
   return obj;
 }
 
+function splitMultiIntents(text) {
+  try {
+    const raw = (text || '').toString().trim();
+    if (!raw) return [];
+    // Split on semicolons, or explicit connectors 'and'/'oraz'
+    const semiParts = raw
+      .split(/\s*;+\s*/g)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    if (semiParts.length >= 2) return semiParts;
+    const andParts = raw
+      .split(/\s+(?:and|oraz)\s+/i)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    if (andParts.length >= 2) return andParts;
+    return [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function detectBilingualEnEs(userText) {
+  const lower = (userText || '').toLowerCase();
+  const hasBilingual = /\bbilingual\b/.test(lower) || /\ben\s*\/\s*es\b/.test(lower);
+  const hasEn = /\benglish\b|\ben\b/.test(lower);
+  const hasEs = /\bspanish\b|\bes\b/.test(lower);
+  return hasBilingual && hasEn && hasEs;
+}
+
+function extractNegativeTokens(userText) {
+  const lower = (userText || '').toLowerCase();
+  const neg = new Set();
+  const rules = [
+    { pat: /\bnot\s+whisper\b/, tok: 'whisper' },
+    { pat: /\bno\s+whisper\b/, tok: 'whisper' },
+    { pat: /\bbez\s+szeptu\b/, tok: 'whisper' }
+  ];
+  for (const r of rules) if (r.pat.test(lower)) neg.add(r.tok);
+  return neg;
+}
+
 async function buildControlsBlocks(session) {
   try {
     const uiLang = session.uiLanguage;
@@ -2440,8 +2551,9 @@ function hasExplicitDescriptiveMention(userText) {
   const lower = (userText || '').toLowerCase();
   const tokens = [
     'whisper','cinematic','dramatic','meditative','asmr','slow','fast','calm','warm',
-    'friendly','energetic','deep','gravelly','raspy','growl','harsh','dark','ominous',
-    'booming','bassy','soft','soothing','confident','expressive','relaxed','storytelling'
+    'friendly','energetic','deep','low','gravelly','raspy','growl','harsh','dark','ominous',
+    'booming','bassy','soft','soothing','confident','expressive','relaxed','storytelling',
+    'playful','cheerful','cute','youthful','high pitch','squeaky'
   ];
   return tokens.some((t) => lower.includes(t));
 }
@@ -2490,7 +2602,9 @@ function shouldApplyParam(kind, plan, userText, flags = {}) {
       return readEnvBoolean('ENABLE_GENDER_BY_DEFAULT', true);
     }
     case 'age': {
-      if (detectAgeFromText(userText)) return true;
+      const lower = (userText || '').toLowerCase();
+      const strong = /\b(age:\s*child|tylko\s*dzieci(e|ęcy)|kids?\s*only)\b/.test(lower);
+      if (strong) return true;
       return readEnvBoolean('ENABLE_AGE_BY_DEFAULT', false);
     }
     case 'featured': {
@@ -2563,38 +2677,79 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   const sort = typeof options.sort === 'string' ? options.sort : null;
   const forceUseCases = options.forceUseCases === true;
   const forceDescriptives = options.forceDescriptives === true;
+  const lowerText = (userText || '').toLowerCase();
+  const isBilingualEnEs = detectBilingualEnEs(userText);
+  const isSpanishMexico = (language === 'es' || /spanish|es\b/.test(lowerText)) &&
+    (/\bmexico\b|\bmexican\b|\bes-mx\b|\bmx\b/.test(lowerText));
   const age =
     typeof options.age === 'string' && options.age
       ? options.age
       : detectAgeFromText(userText);
 
   // Existing filters
-  if (language && shouldApplyParam('language', plan, userText)) params.set('language', language);
-  if (accent && shouldApplyParam('accent', plan, userText)) params.set('accent', accent);
+  // Bilingual: avoid constraining language to let both EN/ES candidates through
+  if (!isBilingualEnEs && language && shouldApplyParam('language', plan, userText)) params.set('language', language);
+  // Accent: allow Spanish Mexico heuristic even without explicit "accent"
+  if (isSpanishMexico) {
+    params.set('accent', 'mexican');
+  } else if (accent && shouldApplyParam('accent', plan, userText)) {
+    params.set('accent', accent);
+  }
   if (gender && shouldApplyParam('gender', plan, userText)) params.set('gender', gender);
   if (qualityPref === 'high_only') {
     params.set('category', 'high_quality');
   }
 
   // New filters
-  const useCases = (forceUseCases || shouldApplyParam('use_cases', plan, userText, { __forceUseCases: forceUseCases }))
+  let useCases = (forceUseCases || shouldApplyParam('use_cases', plan, userText, { __forceUseCases: forceUseCases }))
     ? pickQueryUseCases(plan)
     : [];
+  // Prefer conversational for bilingual and Spanish Mexico briefs
+  if (isBilingualEnEs || isSpanishMexico) {
+    const ucSet = new Set(useCases);
+    if (ucSet.has('conversational')) {
+      useCases = ['conversational'];
+    } else {
+      useCases = ['conversational'];
+    }
+  }
   for (const uc of useCases) params.append('use_cases', uc);
 
-  const descriptives = (forceDescriptives || shouldApplyParam('descriptives', plan, userText, { __forceDescriptives: forceDescriptives }))
+  let descriptives = (forceDescriptives || shouldApplyParam('descriptives', plan, userText, { __forceDescriptives: forceDescriptives }))
     ? pickQueryDescriptives(plan, userText)
     : [];
+  // Add 'low' when deep present and 'low' missing
+  if (/\bdeep\b/.test(lowerText) && !descriptives.includes('low')) descriptives.push('low');
+  // Remove banned negatives from descriptives
+  const banned = Array.from(extractNegativeTokens(userText) || []);
+  if (banned.length) {
+    descriptives = descriptives.filter((d) => !banned.includes(d));
+  }
   for (const d of descriptives) params.append('descriptives', d);
 
-  const loc = inferLocale(language, accent);
+  let loc = inferLocale(language, isSpanishMexico ? 'mexican' : accent);
   if (loc && shouldApplyParam('locale', plan, userText)) params.set('locale', loc);
+  // Force es-MX locale for Spanish Mexico heuristic
+  if (isSpanishMexico) {
+    params.set('locale', 'es-MX');
+    loc = 'es-MX';
+  }
 
   if (featured && shouldApplyParam('featured', plan, userText, { featured })) params.set('featured', 'true');
   if (age && shouldApplyParam('age', plan, userText)) params.set('age', age);
   if (sort && shouldApplyParam('sort', plan, userText, { sort })) params.set('sort', sort);
 
-  return { useCases, descriptives, locale: loc, featured, age, sort };
+  return {
+    useCases,
+    descriptives,
+    locale: loc,
+    featured,
+    age,
+    sort,
+    localeInferred: Boolean(isSpanishMexico),
+    bilingual: Boolean(isBilingualEnEs),
+    negatives: banned || []
+  };
 }
 
 // ---- Shared-voices cache & pagination helpers ----
@@ -2798,6 +2953,81 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
     keywordPlan.__listAll = detectListAll(cleaned);
     keywordPlan.__forceUseCases = false;
     keywordPlan.__forceDescriptives = false;
+
+    // Multi-intent: split by semicolons and run separate sub-searches, then group
+    const parts = splitMultiIntents(cleaned);
+    if (parts.length >= 2) {
+      const subSessions = [];
+      const searchTrace = [];
+      const traceCb = (entry) => {
+        try { searchTrace.push(entry); } catch (_) {}
+      };
+      for (const part of parts) {
+        const subPlan = await buildKeywordPlan(part);
+        subPlan.__featured = false;
+        subPlan.__sort = null;
+        subPlan.__listAll = detectListAll(part);
+        subPlan.__forceUseCases = false;
+        subPlan.__forceDescriptives = false;
+        let voices = await fetchVoicesByKeywords(subPlan, part, traceCb);
+        if (!voices.length) {
+          continue;
+        }
+        const ranked = await rankVoicesWithGPT(part, subPlan, voices);
+        subSessions.push({
+          title: part,
+          session: {
+            originalQuery: part,
+            keywordPlan: subPlan,
+            voices,
+            ranking: ranked.scoreMap,
+            uiLanguage: (guessUiLanguageFromText(part) || uiLang).toString().slice(0,2).toLowerCase(),
+            filters: {
+              quality: subPlan.quality_preference || 'any',
+              gender:
+                subPlan.target_gender === 'male' || subPlan.target_gender === 'female'
+                  ? subPlan.target_gender
+                  : 'any',
+              listAll: detectListAll(part),
+              featured: false,
+              sort: null
+            },
+            lastActive: Date.now()
+          }
+        });
+      }
+      if (subSessions.length) {
+        // Build grouped message
+        let message = '';
+        for (const { title, session } of subSessions) {
+          const sectionHeader = '```FOR: ' + title + '```';
+          let body = buildMessageFromSession(session);
+          body = await translateForUserLanguage(body, session.uiLanguage);
+          message += sectionHeader + '\n' + body + '\n\n';
+        }
+        // cap blocks and post
+        const blocks = buildBlocksFromText(message);
+        await client.chat.postMessage({
+          channel: event.channel,
+          thread_ts: threadTs,
+          text: message,
+          blocks: blocks || undefined
+        });
+        if (process.env.POC_SEARCH_REPORT === 'true') {
+          let report = buildSearchReport(searchTrace, keywordPlan, 'multi_intent', { unique_count: subSessions.reduce((acc, s) => acc + (Array.isArray(s.session.voices) ? s.session.voices.length : 0), 0) });
+          report = await translateForUserLanguage(report, uiLang);
+          const reportBlocks = buildBlocksFromText(report);
+          await client.chat.postMessage({
+            channel: event.channel,
+            thread_ts: threadTs,
+            text: report,
+            blocks: reportBlocks || undefined
+          });
+        }
+        return;
+      }
+      // fall through to single search if multisplit yielded no results
+    }
 
     // Similar voices: if user asks "similar to <voice_id>"
     const voiceIdForSimilarity = extractVoiceIdCandidate(cleaned);
