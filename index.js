@@ -1099,6 +1099,8 @@ function ensureKeywordFloor(userText, plan) {
 
   if (domain === 'healthcare') {
     out.extra_keywords = addUnique(out.extra_keywords, ['healthcare','medical','patient','clinical'], 12);
+    out.use_case_keywords = ['conversational'];
+    out.style_keywords = addUnique(out.style_keywords, ['clear','reassuring','professional','calm'], 6);
   } else if (domain === 'finance') {
     out.extra_keywords = addUnique(out.extra_keywords, ['finance','bank','account','transaction'], 12);
   } else if (domain === 'ecommerce') {
@@ -1248,6 +1250,10 @@ IMPORTANT:
     if (!explicitLanguage) {
       plan.target_voice_language = null;
     }
+    // Bilingual EN+ES: avoid constraining by language
+    if (detectBilingualEnEs(userText)) {
+      plan.target_voice_language = null;
+    }
 
     return plan;
   } catch (error) {
@@ -1284,6 +1290,15 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     plan = ensureKeywordFloor(userText, plan);
   }
   try {
+    // First-shot template telemetry
+    const lt = (userText || '').toLowerCase();
+    let template = 'default';
+    if (/\bivr\b/.test(lt)) template = 'ivr_triad';
+    else if (detectBilingualEnEs(userText)) template = 'bilingual_mode';
+    else if (/\b(commercial|advertising|ad|promo|promotion|brand|campaign)\b/.test(lt)) template = 'commercial_triage';
+    else if (/\b(healthcare|medical|hospital|patient|clinic|clinical)\b/.test(lt)) template = 'healthcare_conversational';
+    trace({ stage: 'first_shot', params: { template } });
+
     const totalKw =
       (plan.tone_keywords?.length || 0) +
       (plan.use_case_keywords?.length || 0) +
@@ -1936,6 +1951,35 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     if (hasAny('support','customer support','conversational','call center','contact center')) {
       coverage += 0.8;
     }
+    // healthcare boost / audiobook/podcast downweight in healthcare intent
+    try {
+      if ((plan.__floorDomain || '') === 'healthcare') {
+        if (hasAny('healthcare','medical','patient','clinical','clear','reassuring','professional','calm')) {
+          coverage += 1.0;
+        }
+        if (hasAny('audiobook','podcast','storytelling')) {
+          coverage -= 0.8;
+        }
+      }
+    } catch (_) {}
+    // locale boost for mexican/es-MX
+    try {
+      const locale = (v.locale || '').toLowerCase();
+      const accent = (v.accent || '').toLowerCase();
+      if (locale === 'es-mx' || accent.includes('mexican')) {
+        coverage += 0.5;
+      }
+    } catch (_) {}
+    // bilingual boost: verified EN+ES
+    try {
+      const vlangs = Array.isArray(v.verified_languages) ? v.verified_languages : [];
+      const langs = new Set(
+        vlangs.map((e) => ((e && e.language) ? String(e.language).toLowerCase().slice(0,2) : null)).filter(Boolean)
+      );
+      if (langs.has('en') && langs.has('es')) {
+        coverage += 0.8;
+      }
+    } catch (_) {}
     // negatives: penalize forbidden descriptors if present in metadata blob
     try {
       const negatives = Array.isArray(plan.__negatives) ? plan.__negatives : [];
@@ -2473,7 +2517,11 @@ function extractNegativeTokens(userText) {
   const rules = [
     { pat: /\bnot\s+whisper\b/, tok: 'whisper' },
     { pat: /\bno\s+whisper\b/, tok: 'whisper' },
-    { pat: /\bbez\s+szeptu\b/, tok: 'whisper' }
+    { pat: /\bbez\s+szeptu\b/, tok: 'whisper' },
+    { pat: /\bnot\s+raspy\b/, tok: 'raspy' },
+    { pat: /\bno\s+raspy\b/, tok: 'raspy' },
+    { pat: /\bnot\s+growl(ing)?\b/, tok: 'growl' },
+    { pat: /\bno\s+growl(ing)?\b/, tok: 'growl' }
   ];
   for (const r of rules) if (r.pat.test(lower)) neg.add(r.tok);
   return neg;
@@ -2712,6 +2760,10 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
     } else {
       useCases = ['conversational'];
     }
+  }
+  // IVR fast path: if ivr present in the text, start with only ivr
+  if (/\bivr\b/i.test(lowerText)) {
+    useCases = ['ivr'];
   }
   for (const uc of useCases) params.append('use_cases', uc);
 
