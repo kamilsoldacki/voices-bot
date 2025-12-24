@@ -1417,10 +1417,13 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
           trace({
             stage: 'gates',
             keyword: kw,
-            gates: {
-              use_cases: (appended.useCases || []).length,
-              descriptives: (appended.descriptives || []).length
-            }
+            params: {
+              use_cases: String((appended.useCases || []).length),
+              descriptives: String((appended.descriptives || []).length)
+            },
+            count:
+              ((appended.useCases || []).length) +
+              ((appended.descriptives || []).length)
           });
         } catch (_) {}
         let voicesForKeyword;
