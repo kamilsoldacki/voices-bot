@@ -1077,8 +1077,8 @@ function ensureKeywordFloor(userText, plan) {
   const domain = (domainMap.find((d) => d.test(lower)) || {}).name || null;
 
   out.use_case_keywords = addUnique(out.use_case_keywords, [
-    'conversational','support','customer support','call center','contact center','ivr'
-  ], 6);
+    'conversational','support','customer support','call center','contact center'
+  ], 5);
   out.tone_keywords = addUnique(out.tone_keywords, [
     'calm','reassuring','clear','warm','professional','empathetic','confident'
   ], 8);
@@ -1444,6 +1444,26 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             count: Array.isArray(voicesForKeyword) ? voicesForKeyword.length : 0
           });
         } catch (_) {}
+        // Quick relax: if empty, retry without use_cases and accent
+        if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0) {
+          const pQuick = new URLSearchParams(params.toString());
+          const keysQuick = Array.from(pQuick.keys());
+          keysQuick.forEach((k) => {
+            if (k === 'use_cases' || k === 'accent') pQuick.delete(k);
+          });
+          try {
+            const vQuick = await callSharedVoices(pQuick);
+            try {
+              trace({
+                stage: 'per_keyword_quick_relax',
+                keyword: kw,
+                params: paramsToObject(pQuick),
+                count: Array.isArray(vQuick) ? vQuick.length : 0
+              });
+            } catch (_) {}
+            if (Array.isArray(vQuick) && vQuick.length) voicesForKeyword = vQuick;
+          } catch (_) {}
+        }
         // Progressive relaxation if empty and we added filters
         if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0) {
           // 1) drop descriptives
@@ -1570,20 +1590,29 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     }
 
     try {
-      let fallbackVoices;
+      // Combined fallback: with and without use_cases
+      const paramsWith = new URLSearchParams(params.toString());
+      const paramsNoUC = new URLSearchParams(params.toString());
+      const keysNoUC = Array.from(paramsNoUC.keys());
+      keysNoUC.forEach((k) => { if (k === 'use_cases') paramsNoUC.delete(k); });
+
       const wantMore = detectListAll(userText) === true || plan.__listAll === true;
-      if (wantMore) {
-        fallbackVoices = await callSharedVoicesAllPages(params, { maxPages: 3, cap: 200 });
-      } else {
-        fallbackVoices = await callSharedVoicesCached(params, async (p) => {
-          const { voices } = await callSharedVoicesRaw(p);
-          return voices;
-        });
+      const [fa, fb] = await Promise.all([
+        wantMore ? callSharedVoicesAllPages(paramsWith, { maxPages: 2, cap: 160 }) : callSharedVoicesCached(paramsWith, async (p) => { const { voices } = await callSharedVoicesRaw(p); return voices; }),
+        wantMore ? callSharedVoicesAllPages(paramsNoUC, { maxPages: 2, cap: 160 }) : callSharedVoicesCached(paramsNoUC, async (p) => { const { voices } = await callSharedVoicesRaw(p); return voices; })
+      ]);
+      const seenIdsCF = new Set();
+      const fallbackVoices = [];
+      for (const v of [...(fa || []), ...(fb || [])]) {
+        if (v && v.voice_id && !seenIdsCF.has(v.voice_id)) {
+          seenIdsCF.add(v.voice_id);
+          fallbackVoices.push(v);
+        }
       }
       try {
         trace({
           stage: 'combined',
-          params: paramsToObject(params),
+          params: paramsToObject(paramsWith),
           count: Array.isArray(fallbackVoices) ? fallbackVoices.length : 0
         });
       } catch (_) {}
@@ -1735,6 +1764,58 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     } catch (err) {
       console.error('Error in hq-local fallback fetchVoicesByKeywords:', err.message || err);
     }
+  }
+
+  // Global minimum results guard: broaden if too few candidates
+  if (seen.size > 0 && seen.size < 12) {
+    const paramsG = new URLSearchParams();
+    paramsG.set('page_size', '80');
+    // keep language and category if set, drop accent/use_cases/locale/descriptives
+    if (language) paramsG.set('language', language);
+    if (qualityPref === 'high_only') paramsG.set('category', 'high_quality');
+    const searchG =
+      (selectedKeywords.length ? selectedKeywords.join(' ') : '') ||
+      ((userText ? userText.toLowerCase() : '') || '');
+    if (searchG) paramsG.set('search', searchG);
+    try {
+      const wantMore = detectListAll(userText) === true || plan.__listAll === true;
+      // First pass: drop accent/use_cases/locale/descriptives
+      const keysG = Array.from(paramsG.keys());
+      keysG.forEach((k) => {
+        if (k === 'use_cases' || k === 'accent' || k === 'locale' || k === 'descriptives') paramsG.delete(k);
+      });
+      const broadened = wantMore
+        ? await callSharedVoicesAllPages(paramsG, { maxPages: 2, cap: 160 })
+        : await callSharedVoicesCached(paramsG, async (p) => { const { voices } = await callSharedVoicesRaw(p); return voices; });
+      try {
+        trace({ stage: 'global_broaden', params: paramsToObject(paramsG), count: Array.isArray(broadened) ? broadened.length : 0 });
+      } catch (_) {}
+      (broadened || []).forEach((voice) => {
+        if (!voice || !voice.voice_id) return;
+        if (!seen.has(voice.voice_id)) {
+          seen.set(voice.voice_id, { voice, matchedKeywords: new Set() });
+        }
+      });
+      // HQ local relax if still low and high_only
+      if (seen.size < 12 && qualityPref === 'high_only') {
+        const pH = new URLSearchParams();
+        pH.set('page_size', '80');
+        if (language) pH.set('language', language);
+        const vH = wantMore
+          ? await callSharedVoicesAllPages(pH, { maxPages: 2, cap: 160 })
+          : await callSharedVoicesCached(pH, async (p) => { const { voices } = await callSharedVoicesRaw(p); return voices; });
+        const onlyHigh = (vH || []).filter(isHighQuality);
+        try {
+          trace({ stage: 'global_broaden_hq_local', params: paramsToObject(pH), count: onlyHigh.length });
+        } catch (_) {}
+        onlyHigh.forEach((voice) => {
+          if (!voice || !voice.voice_id) return;
+          if (!seen.has(voice.voice_id)) {
+            seen.set(voice.voice_id, { voice, matchedKeywords: new Set() });
+          }
+        });
+      }
+    } catch (_) {}
   }
 
   // 4) convert map -> list, attach matched_keywords
@@ -2319,21 +2400,16 @@ async function buildControlsBlocks(session) {
 
 function pickQueryUseCases(plan) {
   const src = Array.isArray(plan?.use_case_keywords) ? plan.use_case_keywords : [];
-  const allow = new Set([
-    'conversational', 'conversation', 'agent', 'support', 'customer support',
-    'call center', 'contact center', 'ivr', 'voicemail',
-    'audiobook', 'audiobooks', 'narration', 'narrator',
-    'cartoon', 'character', 'gaming', 'trailer',
-    'commercial', 'advertising', 'podcast', 'youtube', 'tiktok',
-    'explainer', 'video'
-  ]);
-  const out = [];
-  for (const k of src) {
-    const v = (k || '').toLowerCase().trim();
-    if (v && allow.has(v) && !out.includes(v)) out.push(v);
-    if (out.length >= 4) break;
-  }
-  return out;
+  const priority = [
+    'conversational','support','customer support','call center','contact center',
+    'ivr','voicemail',
+    'audiobook','audiobooks','narration','narrator',
+    'cartoon','character','gaming','trailer',
+    'commercial','advertising','podcast','youtube','tiktok','explainer','video'
+  ];
+  const set = new Set(src.map((s) => (s || '').toLowerCase().trim()).filter(Boolean));
+  const ordered = priority.filter((p) => set.has(p));
+  return ordered.slice(0, 2);
 }
 
 function pickQueryDescriptives(plan, userText) {
@@ -2385,8 +2461,10 @@ function shouldApplyParam(kind, plan, userText, flags = {}) {
       return readEnvBoolean('ENABLE_LANGUAGE_BY_DEFAULT', false);
     }
     case 'accent': {
+      const lower = (userText || '').toLowerCase();
+      const hasAccentWord = /\b(accent|akcent)\b/.test(lower);
       const accentRegex = /\b(american|british|uk|us|australian|irish|scottish|canadian|polish)\b/i;
-      if (accentRegex.test(userText || '')) return true;
+      if (hasAccentWord && accentRegex.test(userText || '')) return true;
       return readEnvBoolean('ENABLE_ACCENT_BY_DEFAULT', false);
     }
     case 'gender': {
