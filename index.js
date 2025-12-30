@@ -577,6 +577,151 @@ function isVoiceInLanguage(voice, langCode) {
   return false;
 }
 
+// -------------------------------------------------------------
+// Strong-language request helpers (Strict vs Verified buckets)
+// -------------------------------------------------------------
+
+function extractIso2FromLanguageField(val) {
+  const s = (val || '').toString().trim();
+  if (!s) return null;
+  return s.toLowerCase().slice(0, 2);
+}
+
+function extractLocaleFromField(val) {
+  const s = (val || '').toString().trim();
+  if (!s) return null;
+  // normalize to xx-YY
+  const m = s.match(/^([a-z]{2})[-_ ]([a-z]{2})$/i);
+  if (!m) return null;
+  return `${m[1].toLowerCase()}-${m[2].toUpperCase()}`;
+}
+
+function getRequestedLocale(userText, keywordPlan) {
+  const text = (userText || '').toString();
+  const lower = text.toLowerCase();
+  const hint = parseUserLanguageHints(text);
+  if (hint && hint.locale) return hint.locale;
+
+  const iso2 =
+    (keywordPlan?.target_voice_language || hint?.iso2 || '').toString().toLowerCase().slice(0, 2);
+  if (!iso2) return null;
+
+  // Best-effort regional inference for common cases (keep small & conservative)
+  if (iso2 === 'pt') {
+    if (/\b(brazil|brasil|brazilian|brasile|pt-br)\b/.test(lower)) return 'pt-BR';
+    if (/\b(portugal|pt-pt|european)\b/.test(lower)) return 'pt-PT';
+  }
+  if (iso2 === 'es') {
+    if (/\b(mexico|mexican|es-mx|mx)\b/.test(lower)) return 'es-MX';
+    if (/\b(spain|castilian|es-es)\b/.test(lower)) return 'es-ES';
+  }
+  return null;
+}
+
+function isStrongLanguageRequest(userText, keywordPlan) {
+  const text = (userText || '').toString();
+  const lower = text.toLowerCase();
+  const hint = parseUserLanguageHints(text);
+  const explicit = hasExplicitLanguageMention(text);
+  const iso2 = (keywordPlan?.target_voice_language || hint?.iso2 || '').toString().toLowerCase().slice(0, 2);
+  if (!explicit || !iso2) return false;
+
+  // Locale is strong by definition
+  if (hint?.locale) return true;
+
+  // Region markers imply strong locale intent
+  if (iso2 === 'pt' && /\b(brazil|brasil|brazilian|brasile|pt-br)\b/.test(lower)) return true;
+  if (iso2 === 'es' && /\b(mexico|mexican|es-mx|mx)\b/.test(lower)) return true;
+
+  // Any explicit language mention with a set target language counts as strong
+  return true;
+}
+
+function voiceHasVerifiedIso2(voice, iso2) {
+  const target = (iso2 || '').toString().toLowerCase().slice(0, 2);
+  if (!voice || !target) return false;
+  const vIso2 = extractIso2FromLanguageField(voice.language);
+  if (vIso2 === target) return true;
+  const verified = Array.isArray(voice.verified_languages) ? voice.verified_languages : [];
+  for (const entry of verified) {
+    const el = extractIso2FromLanguageField(entry?.language);
+    if (el === target) return true;
+  }
+  return false;
+}
+
+function voiceMatchesRequestedLocale(voice, requestedLocale) {
+  const req = extractLocaleFromField(requestedLocale);
+  if (!voice || !req) return false;
+  const vLoc = extractLocaleFromField(voice.locale);
+  if (vLoc && vLoc === req) return true;
+  const verified = Array.isArray(voice.verified_languages) ? voice.verified_languages : [];
+  for (const entry of verified) {
+    const eloc = extractLocaleFromField(entry?.locale);
+    if (eloc && eloc === req) return true;
+  }
+  return false;
+}
+
+function voicePrimaryLooksLikeIso2(voice, iso2, requestedLocale) {
+  const target = (iso2 || '').toString().toLowerCase().slice(0, 2);
+  if (!voice || !target) return false;
+
+  const primaryLang = extractIso2FromLanguageField(voice.language);
+  if (primaryLang && primaryLang !== target) return false;
+
+  const vLoc = extractLocaleFromField(voice.locale);
+  if (vLoc) {
+    const vLocIso2 = extractIso2FromLanguageField(vLoc);
+    if (vLocIso2 && vLocIso2 !== target) return false;
+    const reqLoc = extractLocaleFromField(requestedLocale);
+    if (reqLoc && vLoc !== reqLoc) return false;
+  }
+
+  // Conservative “clearly different language” heuristic from visible metadata.
+  // This is intentionally limited to obvious cases to avoid over-filtering.
+  const blob = (
+    (voice.name || '') +
+    ' ' +
+    (voice.description || '') +
+    ' ' +
+    (voice.descriptive || '') +
+    ' ' +
+    (voice.accent || '') +
+    ' ' +
+    (voice.locale || '')
+  )
+    .toString()
+    .toLowerCase();
+
+  if (target === 'pt') {
+    const looksHindi = /\bhindi\b|\bindia\b/.test(blob);
+    const looksSpanish = /\bspanish\b|\blatin american\b|\bespañol\b|\bespanol\b/.test(blob);
+    if (looksHindi || looksSpanish) return false;
+  }
+
+  return true;
+}
+
+function buildVerifiedFallbackMessage(voices, ranking, iso2, requestedLocale, limit = 20) {
+  const labels = getLabels();
+  const sorted = [...(voices || [])].sort((a, b) => (ranking?.[b.voice_id] || 0) - (ranking?.[a.voice_id] || 0));
+  const max = Math.min(sorted.length, limit);
+
+  const locSuffix = requestedLocale ? ` (${requestedLocale})` : '';
+  const header = `\`\`\`ALSO VERIFIED FOR ${String(iso2 || '').toUpperCase()}${locSuffix} (may not sound primary)\`\`\``;
+
+  const lines = [header];
+  if (max === 0) {
+    lines.push(labels.noVoices);
+    return lines.join('\n');
+  }
+  for (let i = 0; i < max; i++) {
+    lines.push(`- ${formatVoiceLine(sorted[i])}`);
+  }
+  return lines.join('\n');
+}
+
 // Detect if user explicitly wants only high quality / no high quality
 function detectQualityPreferenceFromText(text) {
   if (!text) return null;
@@ -3435,16 +3580,81 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         lastActive: Date.now()
       };
       sessions[threadTs] = session;
-      // Single unified result message
-      let message = buildMessageFromSession(session);
-      message = await translateForUserLanguage(message, session.uiLanguage);
-      const blocks = buildBlocksFromText(message);
-      await client.chat.postMessage({
-        channel: event.channel,
-        thread_ts: threadTs,
-        text: message,
-        blocks: blocks || undefined
-      });
+      // Results message (single by default, strict+verified when query is strongly language-specific)
+      {
+        const isStrong = isStrongLanguageRequest(cleaned, keywordPlan);
+        const iso2 = (keywordPlan?.target_voice_language || '').toString().slice(0, 2).toLowerCase();
+        const requestedLocale = isStrong ? getRequestedLocale(cleaned, keywordPlan) : null;
+
+        if (isStrong && iso2) {
+          const sorted = [...(voices || [])].sort(
+            (a, b) => (session.ranking?.[b.voice_id] || 0) - (session.ranking?.[a.voice_id] || 0)
+          );
+          const strictIds = new Set();
+          const strictVoices = [];
+          const verifiedFallback = [];
+
+          for (const v of sorted) {
+            const hasVerified = voiceHasVerifiedIso2(v, iso2);
+            if (!hasVerified) continue;
+
+            const primaryOk = voicePrimaryLooksLikeIso2(v, iso2, requestedLocale);
+            const localeOk = requestedLocale ? voiceMatchesRequestedLocale(v, requestedLocale) : true;
+            const strictOk = primaryOk && localeOk;
+
+            if (strictOk) {
+              strictIds.add(v.voice_id);
+              strictVoices.push(v);
+            }
+          }
+
+          for (const v of sorted) {
+            if (!voiceHasVerifiedIso2(v, iso2)) continue;
+            if (strictIds.has(v.voice_id)) continue;
+            verifiedFallback.push(v);
+          }
+
+          const locSuffix = requestedLocale ? ` (${requestedLocale})` : '';
+          const strictHeader = `\`\`\`STRICT MATCHES ${iso2.toUpperCase()}${locSuffix}\`\`\``;
+          const strictSession = { ...session, voices: strictVoices };
+          let strictMessage = strictHeader + '\n' + buildMessageFromSession(strictSession);
+          strictMessage = await translateForUserLanguage(strictMessage, session.uiLanguage);
+          const strictBlocks = buildBlocksFromText(strictMessage);
+          await client.chat.postMessage({
+            channel: event.channel,
+            thread_ts: threadTs,
+            text: strictMessage,
+            blocks: strictBlocks || undefined
+          });
+
+          let fallbackMsg = buildVerifiedFallbackMessage(
+            verifiedFallback,
+            session.ranking,
+            iso2,
+            requestedLocale,
+            20
+          );
+          fallbackMsg = await translateForUserLanguage(fallbackMsg, session.uiLanguage);
+          const fbBlocks = buildBlocksFromText(fallbackMsg);
+          await client.chat.postMessage({
+            channel: event.channel,
+            thread_ts: threadTs,
+            text: fallbackMsg,
+            blocks: fbBlocks || undefined
+          });
+        } else {
+          // Single unified result message
+          let message = buildMessageFromSession(session);
+          message = await translateForUserLanguage(message, session.uiLanguage);
+          const blocks = buildBlocksFromText(message);
+          await client.chat.postMessage({
+            channel: event.channel,
+            thread_ts: threadTs,
+            text: message,
+            blocks: blocks || undefined
+          });
+        }
+      }
       if (process.env.POC_SEARCH_REPORT === 'true') {
         let report = buildSearchReport(searchTrace, keywordPlan, 'similar_voices', {
           unique_count: Array.isArray(voices) ? voices.length : 0
@@ -3566,16 +3776,81 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
 
     sessions[threadTs] = session;
 
-    // Single unified result message
-    let message = buildMessageFromSession(session);
-    message = await translateForUserLanguage(message, session.uiLanguage);
-    const blocks = buildBlocksFromText(message);
-    await client.chat.postMessage({
-      channel: event.channel,
-      thread_ts: threadTs,
-      text: message,
-      blocks: blocks || undefined
-    });
+    // Results message (single by default, strict+verified when query is strongly language-specific)
+    {
+      const isStrong = isStrongLanguageRequest(cleaned, keywordPlan);
+      const iso2 = (keywordPlan?.target_voice_language || '').toString().slice(0, 2).toLowerCase();
+      const requestedLocale = isStrong ? getRequestedLocale(cleaned, keywordPlan) : null;
+
+      if (isStrong && iso2) {
+        const sorted = [...(voices || [])].sort(
+          (a, b) => (session.ranking?.[b.voice_id] || 0) - (session.ranking?.[a.voice_id] || 0)
+        );
+        const strictIds = new Set();
+        const strictVoices = [];
+        const verifiedFallback = [];
+
+        for (const v of sorted) {
+          const hasVerified = voiceHasVerifiedIso2(v, iso2);
+          if (!hasVerified) continue;
+
+          const primaryOk = voicePrimaryLooksLikeIso2(v, iso2, requestedLocale);
+          const localeOk = requestedLocale ? voiceMatchesRequestedLocale(v, requestedLocale) : true;
+          const strictOk = primaryOk && localeOk;
+
+          if (strictOk) {
+            strictIds.add(v.voice_id);
+            strictVoices.push(v);
+          }
+        }
+
+        for (const v of sorted) {
+          if (!voiceHasVerifiedIso2(v, iso2)) continue;
+          if (strictIds.has(v.voice_id)) continue;
+          verifiedFallback.push(v);
+        }
+
+        const locSuffix = requestedLocale ? ` (${requestedLocale})` : '';
+        const strictHeader = `\`\`\`STRICT MATCHES ${iso2.toUpperCase()}${locSuffix}\`\`\``;
+        const strictSession = { ...session, voices: strictVoices };
+        let strictMessage = strictHeader + '\n' + buildMessageFromSession(strictSession);
+        strictMessage = await translateForUserLanguage(strictMessage, session.uiLanguage);
+        const strictBlocks = buildBlocksFromText(strictMessage);
+        await client.chat.postMessage({
+          channel: event.channel,
+          thread_ts: threadTs,
+          text: strictMessage,
+          blocks: strictBlocks || undefined
+        });
+
+        let fallbackMsg = buildVerifiedFallbackMessage(
+          verifiedFallback,
+          session.ranking,
+          iso2,
+          requestedLocale,
+          20
+        );
+        fallbackMsg = await translateForUserLanguage(fallbackMsg, session.uiLanguage);
+        const fbBlocks = buildBlocksFromText(fallbackMsg);
+        await client.chat.postMessage({
+          channel: event.channel,
+          thread_ts: threadTs,
+          text: fallbackMsg,
+          blocks: fbBlocks || undefined
+        });
+      } else {
+        // Single unified result message
+        let message = buildMessageFromSession(session);
+        message = await translateForUserLanguage(message, session.uiLanguage);
+        const blocks = buildBlocksFromText(message);
+        await client.chat.postMessage({
+          channel: event.channel,
+          thread_ts: threadTs,
+          text: message,
+          blocks: blocks || undefined
+        });
+      }
+    }
 
     if (process.env.POC_SEARCH_REPORT === 'true') {
       const coverage = Array.isArray(voices)
