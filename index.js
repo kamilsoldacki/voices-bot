@@ -16,6 +16,184 @@ const sharedVoicesCache = new Map(); // key -> { at:number, voices:any[] }
 const SHARED_VOICES_CACHE_TTL_MS = 7 * 60 * 1000; // 7 minutes
 
 // -------------------------------------------------------------
+// Language detection & normalization (ISO 639-1 + locale)
+// -------------------------------------------------------------
+// Goal: avoid hardcoded language lists and prevent "random-language" results when user
+// explicitly requested a language (e.g., "Brazilian Portuguese").
+//
+// Per ElevenLabs support: requests must use ISO 639-1 (2-letter) codes.
+const LANGUAGE_INDEX_TTL_MS = 24 * 60 * 60 * 1000; // 24h
+const languageIndex = {
+  loadedAt: 0,
+  // language display name (lowercase) -> iso2 (e.g., "portuguese" -> "pt")
+  byName: new Map(),
+  // cached set of supported iso2 codes (strings)
+  iso2Set: new Set(),
+  // names sorted by length desc for safer substring matching
+  namesSorted: [],
+  // in-flight loader (to dedupe)
+  _loading: null
+};
+
+function normalizeLangName(s) {
+  return (s || '')
+    .toString()
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+function rebuildLanguageIndexCaches() {
+  try {
+    languageIndex.iso2Set = new Set(Array.from(languageIndex.byName.values()).filter((v) => /^[a-z]{2}$/.test(v)));
+    const names = Array.from(languageIndex.byName.keys())
+      .map((n) => normalizeLangName(n))
+      .filter((n) => n && n.length >= 4);
+    names.sort((a, b) => b.length - a.length);
+    languageIndex.namesSorted = names;
+  } catch (_) {}
+}
+
+function extractLanguagesFromModelsResponse(data) {
+  // The /v1/models response shape can vary. Handle a few common variants.
+  const models = Array.isArray(data) ? data : Array.isArray(data?.models) ? data.models : [];
+  const out = [];
+  for (const m of models) {
+    const langs = Array.isArray(m?.languages) ? m.languages : [];
+    for (const entry of langs) {
+      out.push(entry);
+    }
+  }
+  return out;
+}
+
+async function ensureLanguageIndexLoaded(traceCb) {
+  const trace = typeof traceCb === 'function' ? traceCb : () => {};
+  try {
+    if (languageIndex.byName.size && Date.now() - languageIndex.loadedAt < LANGUAGE_INDEX_TTL_MS) return;
+    if (languageIndex._loading) return await languageIndex._loading;
+
+    languageIndex._loading = (async () => {
+      try {
+        const res = await httpGetWithRetry('https://api.elevenlabs.io/v1/models', {
+          headers: {
+            'xi-api-key': process.env.ELEVENLABS_API_KEY,
+            'Content-Type': 'application/json'
+          },
+          timeout: 15000
+        });
+        const langs = extractLanguagesFromModelsResponse(res?.data);
+
+        const byName = new Map();
+        for (const l of langs) {
+          const name = normalizeLangName(l?.name);
+          // Support says: use ISO639-1 in requests. Some responses expose language_id; we accept any field that is iso2.
+          const maybe = normalizeLangName(l?.language_code || l?.language || l?.code || l?.language_id);
+          const iso2 = /^[a-z]{2}$/.test(maybe) ? maybe : null;
+          if (name && iso2) {
+            byName.set(name, iso2);
+          }
+        }
+
+        // Keep any previously-known entries (in case API returns partial list)
+        for (const [k, v] of languageIndex.byName.entries()) {
+          if (!byName.has(k)) byName.set(k, v);
+        }
+        languageIndex.byName = byName;
+        languageIndex.loadedAt = Date.now();
+        rebuildLanguageIndexCaches();
+        try {
+          trace({ stage: 'language_index_loaded', params: { names: String(languageIndex.byName.size) } });
+        } catch (_) {}
+      } catch (e) {
+        // Don't fail the whole request on index load; fall back to minimal static aliases
+        try {
+          trace({ stage: 'language_index_load_failed', params: { reason: e?.message || 'error' } });
+        } catch (_) {}
+      } finally {
+        languageIndex._loading = null;
+      }
+    })();
+
+    return await languageIndex._loading;
+  } catch (_) {
+    languageIndex._loading = null;
+  }
+}
+
+const STATIC_LANGUAGE_ALIASES = new Map([
+  // minimal safety net; the dynamic language index is preferred
+  ['english', 'en'],
+  ['polish', 'pl'],
+  ['polski', 'pl'],
+  ['spanish', 'es'],
+  ['español', 'es'],
+  ['espanol', 'es'],
+  ['german', 'de'],
+  ['deutsch', 'de'],
+  ['french', 'fr'],
+  ['français', 'fr'],
+  ['francais', 'fr'],
+  ['italian', 'it'],
+  ['portuguese', 'pt'],
+  ['português', 'pt'],
+  ['portugues', 'pt'],
+  ['brazilian portuguese', 'pt']
+]);
+
+function parseUserLanguageHints(userText) {
+  const text = (userText || '').toString();
+  const lower = text.toLowerCase();
+
+  // 1) locale like pt-BR, es-MX
+  const mLocale = lower.match(/\b([a-z]{2})[-_ ]([a-z]{2})\b/);
+  if (mLocale) {
+    const iso2 = mLocale[1].toLowerCase();
+    const locale = `${iso2}-${mLocale[2].toUpperCase()}`;
+    const ok = languageIndex.iso2Set.size ? languageIndex.iso2Set.has(iso2) : /^[a-z]{2}$/.test(iso2);
+    if (ok) return { iso2, locale, explicit: true, reason: 'locale' };
+  }
+
+  // 2) ISO2 token (validate against supported set to avoid picking random words like "in")
+  const candidates = lower.match(/\b[a-z]{2}\b/g) || [];
+  for (const iso2 of candidates) {
+    const ok = languageIndex.iso2Set.size ? languageIndex.iso2Set.has(iso2) : false;
+    if (ok) return { iso2, locale: null, explicit: true, reason: 'iso2' };
+  }
+
+  // 3) language names from dynamic index
+  for (const name of languageIndex.namesSorted || []) {
+    if (!name) continue;
+    if (lower.includes(name)) {
+      const iso2 = languageIndex.byName.get(name);
+      if (iso2) {
+        // locale inference for common variants (best-effort)
+        let locale = null;
+        if (iso2 === 'pt') {
+          if (/\b(brazil|brasil|brazilian|brasile)\b/.test(lower)) locale = 'pt-BR';
+          if (/\b(portugal|european)\b/.test(lower)) locale = 'pt-PT';
+        }
+        if (iso2 === 'es') {
+          if (/\b(mexico|mexican|mx|es-mx)\b/.test(lower)) locale = 'es-MX';
+        }
+        return { iso2, locale, explicit: true, reason: 'name' };
+      }
+    }
+  }
+
+  // 4) minimal static aliases
+  for (const [alias, iso2] of STATIC_LANGUAGE_ALIASES.entries()) {
+    if (lower.includes(alias)) {
+      let locale = null;
+      if (iso2 === 'pt' && /\b(brazil|brasil|brazilian|brasile)\b/.test(lower)) locale = 'pt-BR';
+      return { iso2, locale, explicit: true, reason: 'static_alias' };
+    }
+  }
+
+  return { iso2: null, locale: null, explicit: false, reason: 'none' };
+}
+
+// -------------------------------------------------------------
 // Small helpers
 // -------------------------------------------------------------
 
@@ -208,65 +386,15 @@ function guessUiLanguageFromText(text) {
 // Try to detect which VOICE language user wants (Polish, English, Spanish, etc.)
 function detectVoiceLanguageFromText(text) {
   if (!text) return null;
-  const lower = text.toLowerCase();
-
-  if (
-    lower.includes('polish') ||
-    lower.includes('po polsku') ||
-    lower.includes('polski głos') ||
-    lower.includes('polski glos') ||
-    lower.includes('polski')
-  ) {
-    return 'pl';
-  }
-
-  if (
-    lower.includes('english') ||
-    lower.includes('american accent') ||
-    lower.includes('us accent') ||
-    lower.includes('angielski')
-  ) {
-    return 'en';
-  }
-
-  if (
-    lower.includes('spanish') ||
-    lower.includes('español') ||
-    lower.includes('espanol') ||
-    lower.includes('hiszpań') ||
-    lower.includes('hiszpansk')
-  ) {
-    return 'es';
-  }
-
-  if (lower.includes('german') || lower.includes('deutsch') || lower.includes('niemieck')) {
-    return 'de';
-  }
-
-  if (lower.includes('french') || lower.includes('francus')) {
-    return 'fr';
-  }
-
-  if (lower.includes('italian') || lower.includes('włoski') || lower.includes('wloski')) {
-    return 'it';
-  }
-
-  return null;
+  const hint = parseUserLanguageHints(text);
+  return hint && hint.iso2 ? hint.iso2 : null;
 }
 
 // Detect if user explicitly mentioned a language (so we should constrain by language)
 function hasExplicitLanguageMention(text) {
   if (!text) return false;
-  const lower = text.toLowerCase();
-  const tokens = [
-    'polish', 'po polsku', 'polski głos', 'polski glos', 'polski',
-    'english', 'american accent', 'us accent', 'angielski',
-    'spanish', 'español', 'espanol', 'hiszpań', 'hiszpansk',
-    'german', 'deutsch', 'niemieck',
-    'french', 'francus',
-    'italian', 'włoski', 'wloski'
-  ];
-  return tokens.some((t) => lower.includes(t));
+  const hint = parseUserLanguageHints(text);
+  return !!(hint && hint.explicit && hint.iso2);
 }
 
 // -------------------------------------------------------------
