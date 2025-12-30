@@ -3115,6 +3115,49 @@ function buildSearchReport(trace, plan, mode, summary) {
 }
 
 // -------------------------------------------------------------
+// POC_SEARCH_REPORT -> DM (owner only)
+//
+// Required Slack scopes:
+// - im:write (for conversations.open)
+// - chat:write (already required)
+//
+// Env:
+// - POC_SEARCH_REPORT=true
+// - POC_SEARCH_REPORT_DM_USER_ID=Uxxxxxxxx (owner Slack user id)
+//
+// Manual test:
+// - Trigger the bot in a public channel thread:
+//   - results should be posted in-thread
+//   - POC report should NOT be posted in-thread
+//   - POC report should arrive in owner's DM, with first line == user's `cleaned` message
+// -------------------------------------------------------------
+
+function getPocReportDmUserId() {
+  const id = String(process.env.POC_SEARCH_REPORT_DM_USER_ID || '').trim();
+  return id ? id : null;
+}
+
+async function postPocReportDm(client, text) {
+  try {
+    const userId = getPocReportDmUserId();
+    if (!client || !userId || !text) return;
+
+    const opened = await client.conversations.open({ users: userId });
+    const dmChannel = opened?.channel?.id;
+    if (!dmChannel) return;
+
+    const blocks = buildBlocksFromText(text);
+    await client.chat.postMessage({
+      channel: dmChannel,
+      text,
+      blocks: blocks || undefined
+    });
+  } catch (e) {
+    console.error('postPocReportDm error', e?.message || e);
+  }
+}
+
+// -------------------------------------------------------------
 // New search handler
 // -------------------------------------------------------------
 
@@ -3196,13 +3239,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         if (process.env.POC_SEARCH_REPORT === 'true') {
           let report = buildSearchReport(searchTrace, keywordPlan, 'multi_intent', { unique_count: subSessions.reduce((acc, s) => acc + (Array.isArray(s.session.voices) ? s.session.voices.length : 0), 0) });
           report = await translateForUserLanguage(report, uiLang);
-          const reportBlocks = buildBlocksFromText(report);
-          await client.chat.postMessage({
-            channel: event.channel,
-            thread_ts: threadTs,
-            text: report,
-            blocks: reportBlocks || undefined
-          });
+          const dmText = `${cleaned}\n\n${report}`;
+          await postPocReportDm(client, dmText);
         }
         return;
       }
@@ -3265,13 +3303,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           unique_count: Array.isArray(voices) ? voices.length : 0
         });
         report = await translateForUserLanguage(report, uiLang);
-        const reportBlocks = buildBlocksFromText(report);
-        await client.chat.postMessage({
-          channel: event.channel,
-          thread_ts: threadTs,
-          text: report,
-          blocks: reportBlocks || undefined
-        });
+        const dmText = `${cleaned}\n\n${report}`;
+        await postPocReportDm(client, dmText);
       }
       return;
     }
@@ -3408,13 +3441,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
       const summary = { unique_count: Array.isArray(voices) ? voices.length : 0, top_coverage: coverage.slice(0, 10) };
       let report = buildSearchReport(searchTrace, keywordPlan, special.mode, summary);
       report = await translateForUserLanguage(report, uiLang);
-      const reportBlocks = buildBlocksFromText(report);
-      await client.chat.postMessage({
-        channel: event.channel,
-        thread_ts: threadTs,
-        text: report,
-        blocks: reportBlocks || undefined
-      });
+      const dmText = `${cleaned}\n\n${report}`;
+      await postPocReportDm(client, dmText);
     }
   } catch (error) {
     console.error('Error in handleNewSearch:', error);
@@ -3588,13 +3616,8 @@ app.event('app_mention', async ({ event, client }) => {
         const summary = { unique_count: Array.isArray(voices) ? voices.length : 0, top_coverage: coverage.slice(0, 10) };
         let report = buildSearchReport(searchTrace, refinedPlan, 'refine', summary);
         report = await translateForUserLanguage(report, existing.uiLanguage);
-        const reportBlocks = buildBlocksFromText(report);
-        await client.chat.postMessage({
-          channel: event.channel,
-          thread_ts: threadTs,
-          text: report,
-          blocks: reportBlocks || undefined
-        });
+        const dmText = `${cleaned}\n\n${report}`;
+        await postPocReportDm(client, dmText);
       }
       return;
     } catch (e) {
