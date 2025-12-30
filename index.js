@@ -1635,6 +1635,40 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             count: Array.isArray(voicesForKeyword) ? voicesForKeyword.length : 0
           });
         } catch (_) {}
+        // Try-both for use_cases enum formatting:
+        // If strict query returned 0 AND we used use_cases, retry with hyphenated values.
+        if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0) {
+          try {
+            const ucs = typeof params.getAll === 'function' ? params.getAll('use_cases') : [];
+            const hasUseCases = Array.isArray(ucs) && ucs.length > 0;
+            if (hasUseCases) {
+              const altUcs = ucs.map(toHyphenUseCase).filter(Boolean);
+              const changed = altUcs.some((v, i) => v !== ucs[i]);
+              if (changed) {
+                const pAlt = new URLSearchParams(params.toString());
+                // remove existing use_cases
+                pAlt.delete('use_cases');
+                for (const uc of altUcs) pAlt.append('use_cases', uc);
+                let altVoices = [];
+                try {
+                  // Use a simple one-page call; if it works, we get >0 and stop early.
+                  altVoices = await callSharedVoices(pAlt);
+                } catch (_) {}
+                try {
+                  trace({
+                    stage: 'per_keyword_alt_use_cases',
+                    keyword: kw,
+                    params: paramsToObject(pAlt),
+                    count: Array.isArray(altVoices) ? altVoices.length : 0
+                  });
+                } catch (_) {}
+                if (Array.isArray(altVoices) && altVoices.length > 0) {
+                  voicesForKeyword = altVoices;
+                }
+              }
+            }
+          } catch (_) {}
+        }
         // Progressive relaxation if empty and we added filters
         if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0) {
           // 1) drop descriptives
@@ -2701,16 +2735,127 @@ async function buildControlsBlocks(session) {
 
 function pickQueryUseCases(plan) {
   const src = Array.isArray(plan?.use_case_keywords) ? plan.use_case_keywords : [];
+  const tokens = src.map((s) => (s || '').toString().toLowerCase().trim()).filter(Boolean);
+
+  // Voice Library categories (per support/UI):
+  // advertisement, characters_animation, conversational, entertainment_tv,
+  // informative_educational, narrative_story, social_media
+  const mapTokenToCategory = (t) => {
+    if (!t) return null;
+
+    // Conversational / customer support / call center / IVR
+    if (
+      t.includes('call center') ||
+      t.includes('contact center') ||
+      t.includes('customer support') ||
+      t.includes('customer service') ||
+      t.includes('support') ||
+      t.includes('agent') ||
+      t.includes('conversational') ||
+      t.includes('conversation') ||
+      t.includes('ivr') ||
+      t.includes('voicemail')
+    ) {
+      return 'conversational';
+    }
+
+    // Ads / commercials
+    if (
+      t.includes('commercial') ||
+      t.includes('advertis') ||
+      t === 'ad' ||
+      t === 'ads' ||
+      t.includes('promo') ||
+      t.includes('campaign') ||
+      t.includes('branding') ||
+      t.includes('brand')
+    ) {
+      return 'advertisement';
+    }
+
+    // Characters / animation / games
+    if (
+      t.includes('character') ||
+      t.includes('cartoon') ||
+      t.includes('animation') ||
+      t.includes('animated') ||
+      t.includes('gaming') ||
+      t.includes('game') ||
+      t.includes('villain')
+    ) {
+      return 'characters_animation';
+    }
+
+    // Entertainment / TV / podcasts / trailers / news
+    if (
+      t.includes('podcast') ||
+      t.includes('trailer') ||
+      t.includes('news') ||
+      t.includes('sports') ||
+      t.includes('tv') ||
+      t.includes('radio')
+    ) {
+      return 'entertainment_tv';
+    }
+
+    // Educational / informative
+    if (
+      t.includes('documentary') ||
+      t.includes('e-learning') ||
+      t.includes('elearning') ||
+      t.includes('presentation') ||
+      t.includes('explainer') ||
+      t.includes('educational') ||
+      t.includes('informative')
+    ) {
+      return 'informative_educational';
+    }
+
+    // Narrative / audiobooks / storytelling
+    if (
+      t.includes('audiobook') ||
+      t.includes('narration') ||
+      t.includes('narrator') ||
+      t.includes('story') ||
+      t.includes('storytelling') ||
+      t.includes('dramatic')
+    ) {
+      return 'narrative_story';
+    }
+
+    // Social media
+    if (t.includes('tiktok') || t.includes('youtube') || t.includes('social')) {
+      return 'social_media';
+    }
+
+    return null;
+  };
+
+  const set = new Set();
+  for (const t of tokens) {
+    const cat = mapTokenToCategory(t);
+    if (cat) set.add(cat);
+  }
+
+  // Deterministic priority: prefer conversational for support/call-center intents
   const priority = [
-    'conversational','support','customer support','call center','contact center',
-    'ivr','voicemail',
-    'audiobook','audiobooks','narration','narrator',
-    'cartoon','character','gaming','trailer',
-    'commercial','advertising','podcast','youtube','tiktok','explainer','video'
+    'conversational',
+    'advertisement',
+    'characters_animation',
+    'entertainment_tv',
+    'informative_educational',
+    'narrative_story',
+    'social_media'
   ];
-  const set = new Set(src.map((s) => (s || '').toLowerCase().trim()).filter(Boolean));
+
   const ordered = priority.filter((p) => set.has(p));
   return ordered.slice(0, 2);
+}
+
+function toHyphenUseCase(value) {
+  const v = (value || '').toString().trim();
+  if (!v) return v;
+  return v.includes('_') ? v.replace(/_/g, '-') : v;
 }
 
 function pickQueryDescriptives(plan, userText) {
@@ -3091,6 +3236,8 @@ function buildSearchReport(trace, plan, mode, summary) {
       const params = t.params ? Object.entries(t.params).map(([k, v]) => `${k}=${v}`).join('&') : '';
       if (t.stage === 'per_keyword') {
         lines.push(`• per_keyword: "${t.keyword}" (${params}) → ${t.count}`);
+      } else if (t.stage === 'per_keyword_alt_use_cases') {
+        lines.push(`• per_keyword_alt_use_cases: "${t.keyword}" (${params}) → ${t.count}`);
       } else if (t.stage === 'combined') {
         lines.push(`• combined (${params}) → ${t.count}`);
       } else if (t.stage === 'broad') {
