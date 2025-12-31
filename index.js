@@ -1689,6 +1689,66 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     // Intent-aware enrichment (military / villain / negative tone, etc.)
     filtered = enrichKeywordsByIntent(userText, filtered);
 
+    // Commercial keyword pruning: avoid spending keyword queries on low-yield marketing adjectives,
+    // while keeping commercial intent via use_cases=advertisement and ranking.
+    try {
+      const lt = (userText || '').toLowerCase();
+      const isCommercialIntent = /\b(commercial|advertising|advertisement|ad|ads|promo|promotion|brand|branding|campaign)\b/.test(lt);
+      if (isCommercialIntent && filtered.length) {
+        const lowYield = new Set(['upbeat', 'cheerful', 'dynamic', 'branding', 'campaign']);
+        const highYield = ['commercial', 'advertisement', 'ad', 'promo', 'spokesperson'];
+
+        const beforePrune = filtered.slice();
+        const pruned = [];
+        for (const k of beforePrune) {
+          const key = normalizeKw(k);
+          if (lowYield.has(key) && !explicitlyMentionedInText(key, userText)) {
+            continue;
+          }
+          pruned.push(key);
+        }
+
+        // Ensure at least one high-yield commercial token exists (unless user explicitly avoided them)
+        const hasAnyHigh = pruned.some((k) => highYield.includes(k));
+        if (!hasAnyHigh) {
+          for (const k of highYield) {
+            if (explicitlyMentionedInText(k, userText) || beforePrune.includes(k)) {
+              pruned.unshift(k);
+              break;
+            }
+          }
+        }
+
+        // Dedup & keep order
+        {
+          const uniq = [];
+          const seen = new Set();
+          for (const k of pruned) {
+            const v = normalizeKw(k);
+            if (v && !seen.has(v)) {
+              uniq.push(v);
+              seen.add(v);
+            }
+          }
+          filtered = uniq;
+        }
+
+        // Optional trace for POC report
+        if (process.env.POC_SEARCH_REPORT === 'true') {
+          try {
+            const dropped = beforePrune.filter((k) => !filtered.includes(normalizeKw(k)));
+            if (dropped.length) {
+              trace({
+                stage: 'keyword_prune',
+                params: { mode: 'commercial', dropped: dropped.slice(0, 12).join(',') },
+                count: dropped.length
+              });
+            }
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+
     // Safety: if nothing left, fall back to raw user text (filtered once, then enriched)
     if (!filtered.length && userText) {
       const fb = filterKeywordsGlobally(userText, [(userText || '').toLowerCase()]);
@@ -1909,37 +1969,8 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             if (Array.isArray(vQuick) && vQuick.length) voicesForKeyword = vQuick;
           } catch (_) {}
         }
-        // Early language alias retry if empty
-        if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0 && language) {
-          const LANGUAGE_PARAM_MAP = {
-            pl: ['pl', 'polish'],
-            en: ['en', 'english'],
-            es: ['es', 'spanish', 'español', 'espanol'],
-            de: ['de', 'german', 'deutsch'],
-            fr: ['fr', 'french', 'français', 'francais'],
-            it: ['it', 'italian', 'italiano']
-          };
-          const candidates = Array.from(new Set(LANGUAGE_PARAM_MAP[language] || [language]));
-          const alt = candidates.find((v) => v !== language);
-          if (alt) {
-            const altParams = new URLSearchParams(params.toString());
-            altParams.set('language', alt);
-            try {
-              const altVoicesQuick = await callSharedVoices(altParams);
-              try {
-                trace({
-                  stage: 'per_keyword_alt_lang',
-                  keyword: kw,
-                  params: paramsToObject(altParams),
-                  count: Array.isArray(altVoicesQuick) ? altVoicesQuick.length : 0
-                });
-              } catch (_) {}
-              if (Array.isArray(altVoicesQuick) && altVoicesQuick.length) {
-                voicesForKeyword = altVoicesQuick;
-              }
-            } catch (_) {}
-          }
-        }
+        // Note: we do NOT retry with non-ISO language aliases (e.g., "french").
+        // Requests must use ISO 639-1 language codes only.
         return { kw, voices: voicesForKeyword || [] };
       } catch (err) {
         console.error('Error fetching voices for keyword:', kw, err.message || err);
@@ -2070,47 +2101,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     }
   }
 
-  // 2b) extra broad fallback with alternative language name (e.g., 'polish')
-  if (seen.size === 0 && language) {
-    const LANGUAGE_PARAM_MAP = {
-      pl: ['pl', 'polish'],
-      en: ['en', 'english'],
-      es: ['es', 'spanish', 'español', 'espanol'],
-      de: ['de', 'german', 'deutsch'],
-      fr: ['fr', 'french', 'français', 'francais'],
-      it: ['it', 'italian', 'italiano']
-    };
-    const candidates = Array.from(new Set(LANGUAGE_PARAM_MAP[language] || [language]));
-    const alt = candidates.find((v) => v !== language);
-    if (alt) {
-      const params = new URLSearchParams();
-      params.set('page_size', '100');
-      params.set('language', alt);
-      if (accent) params.set('accent', accent);
-      if (gender) params.set('gender', gender);
-      if (qualityPref === 'high_only') {
-        params.set('category', 'high_quality');
-      }
-      try {
-        const altVoices = await callSharedVoices(params);
-        try {
-          trace({
-            stage: 'alt_language',
-            params: paramsToObject(params),
-            count: Array.isArray(altVoices) ? altVoices.length : 0
-          });
-        } catch (_) {}
-        altVoices.forEach((voice) => {
-          if (!voice || !voice.voice_id) return;
-          if (!seen.has(voice.voice_id)) {
-            seen.set(voice.voice_id, { voice, matchedKeywords: new Set() });
-          }
-        });
-      } catch (err) {
-        console.error('Error in alt-language broad fallback:', err.message || err);
-      }
-    }
-  }
+  // Note: we do NOT attempt non-ISO language aliases here either.
 
   // 2c) last-resort: no language param, then filter heuristically
   if (seen.size === 0 && language) {
