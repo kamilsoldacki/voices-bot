@@ -615,6 +615,9 @@ function getRequestedLocale(userText, keywordPlan) {
     if (/\b(mexico|mexican|es-mx|mx)\b/.test(lower)) return 'es-MX';
     if (/\b(spain|castilian|es-es)\b/.test(lower)) return 'es-ES';
   }
+  if (iso2 === 'fr') {
+    if (/\b(fr-ca|french canadian|canadian french|quebec|québec|qc)\b/.test(lower)) return 'fr-CA';
+  }
   return null;
 }
 
@@ -632,6 +635,7 @@ function isStrongLanguageRequest(userText, keywordPlan) {
   // Region markers imply strong locale intent
   if (iso2 === 'pt' && /\b(brazil|brasil|brazilian|brasile|pt-br)\b/.test(lower)) return true;
   if (iso2 === 'es' && /\b(mexico|mexican|es-mx|mx)\b/.test(lower)) return true;
+  if (iso2 === 'fr' && /\b(fr-ca|french canadian|canadian french|quebec|québec|qc)\b/.test(lower)) return true;
 
   // Any explicit language mention with a set target language counts as strong
   return true;
@@ -1837,6 +1841,31 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
               if (Array.isArray(v2) && v2.length) voicesForKeyword = v2;
             } catch (_) {}
           }
+        }
+        // Early descriptives relax for "low results" (keeps recall high when descriptives are too strict)
+        if (
+          Array.isArray(voicesForKeyword) &&
+          voicesForKeyword.length > 0 &&
+          voicesForKeyword.length < 3 &&
+          appended.descriptives &&
+          appended.descriptives.length
+        ) {
+          const p2 = new URLSearchParams(params.toString());
+          p2.delete('descriptives');
+          try {
+            const v2 = await callSharedVoices(p2);
+            try {
+              trace({
+                stage: 'per_keyword_relax_descriptives',
+                keyword: kw,
+                params: paramsToObject(p2),
+                count: Array.isArray(v2) ? v2.length : 0
+              });
+            } catch (_) {}
+            if (Array.isArray(v2) && v2.length > voicesForKeyword.length) {
+              voicesForKeyword = v2;
+            }
+          } catch (_) {}
         }
         if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0) {
           // 2) drop use_cases
@@ -3107,9 +3136,10 @@ function hasExplicitUseCaseMention(userText) {
   return useCaseTokens.some((t) => lower.includes(t));
 }
 
-function inferLocale(language, accent) {
+function inferLocale(language, accent, userText) {
   const lang = (language || '').toString().slice(0, 2).toLowerCase();
   const acc = (accent || '').toString().toLowerCase();
+  const lower = (userText || '').toString().toLowerCase();
   if (lang === 'en') {
     if (acc.includes('american') || acc === 'us' || acc.includes('usa')) return 'en-US';
     if (acc.includes('british') || acc === 'uk' || acc.includes('england')) return 'en-GB';
@@ -3121,6 +3151,15 @@ function inferLocale(language, accent) {
   if (lang === 'es') {
     if (acc.includes('mexican') || acc.includes('mx')) return 'es-MX';
     if (acc.includes('castilian') || acc.includes('spain')) return 'es-ES';
+  }
+  if (lang === 'pt') {
+    if (/\b(pt-br|brazil|brasil|brazilian|brasile)\b/.test(lower) || acc.includes('brazil')) return 'pt-BR';
+    if (/\b(pt-pt|portugal|european)\b/.test(lower) || acc.includes('portugal')) return 'pt-PT';
+  }
+  if (lang === 'fr') {
+    if (/\b(fr-ca|french canadian|canadian french|quebec|québec|qc)\b/.test(lower) || acc.includes('canadian')) {
+      return 'fr-CA';
+    }
   }
   return null;
 }
@@ -3145,6 +3184,9 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   const forceDescriptives = options.forceDescriptives === true;
   const lowerText = (userText || '').toLowerCase();
   const isBilingualEnEs = detectBilingualEnEs(userText);
+  const isFrenchCanadian =
+    (language === 'fr' || /\bfrench\b|\bfr\b/.test(lowerText)) &&
+    (/\b(canadian|quebec|québec|fr-ca|qc|french canadian|canadian french)\b/.test(lowerText));
   const isSpanishMexico = (language === 'es' || /spanish|es\b/.test(lowerText)) &&
     (/\bmexico\b|\bmexican\b|\bes-mx\b|\bmx\b/.test(lowerText));
   const age =
@@ -3158,6 +3200,9 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   // Accent: allow Spanish Mexico heuristic even without explicit "accent"
   if (isSpanishMexico) {
     params.set('accent', 'mexican');
+  } else if (isFrenchCanadian) {
+    // Prefer locale=fr-CA over hard accent filtering (accent metadata can be inconsistent)
+    // Keep accent as a soft preference via keywords/ranking, not as a strict query param.
   } else if (accent && shouldApplyParam('accent', plan, userText)) {
     params.set('accent', accent);
   }
@@ -3197,12 +3242,17 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   }
   for (const d of descriptives) params.append('descriptives', d);
 
-  let loc = inferLocale(language, isSpanishMexico ? 'mexican' : accent);
+  let loc = inferLocale(language, isSpanishMexico ? 'mexican' : accent, userText);
   if (loc && shouldApplyParam('locale', plan, userText)) params.set('locale', loc);
   // Force es-MX locale for Spanish Mexico heuristic
   if (isSpanishMexico) {
     params.set('locale', 'es-MX');
     loc = 'es-MX';
+  }
+  // Force fr-CA locale for French Canadian briefs
+  if (isFrenchCanadian) {
+    params.set('locale', 'fr-CA');
+    loc = 'fr-CA';
   }
 
   if (featured && shouldApplyParam('featured', plan, userText, { featured })) params.set('featured', 'true');
