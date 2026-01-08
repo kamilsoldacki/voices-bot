@@ -749,6 +749,26 @@ function buildVerifiedFallbackMessage(voices, ranking, iso2, requestedLocale, li
   return lines.join('\n');
 }
 
+function buildSimilarNotVerifiedMessage(voices, ranking, iso2, requestedLocale, limit = 20) {
+  const labels = getLabels();
+  const sorted = [...(voices || [])].sort(
+    (a, b) => (ranking?.[b.voice_id] || 0) - (ranking?.[a.voice_id] || 0)
+  );
+  const max = Math.min(sorted.length, limit);
+
+  const locSuffix = requestedLocale ? ` (${requestedLocale})` : '';
+  const header = `\`\`\`ALSO SIMILAR (NOT VERIFIED FOR ${String(iso2 || '').toUpperCase()}${locSuffix})\`\`\``;
+  const lines = [header];
+  if (max === 0) {
+    lines.push(labels.noVoices);
+    return lines.join('\n');
+  }
+  for (let i = 0; i < max; i++) {
+    lines.push(`- ${formatVoiceLine(sorted[i])}`);
+  }
+  return lines.join('\n');
+}
+
 // Detect if user explicitly wants only high quality / no high quality
 function detectQualityPreferenceFromText(text) {
   if (!text) return null;
@@ -3390,17 +3410,123 @@ async function fetchSharedVoiceByIdOrSearch(voiceId, traceCb) {
   }
 }
 
+async function fetchPrivateVoiceById(voiceId, traceCb) {
+  const XI_KEY = process.env.ELEVENLABS_API_KEY;
+  try {
+    const url = `https://api.elevenlabs.io/v1/voices/${encodeURIComponent(voiceId)}`;
+    const res = await httpGetWithRetry(url, {
+      headers: { 'xi-api-key': XI_KEY, 'Content-Type': 'application/json' },
+      timeout: 10000
+    });
+    const voice = res?.data || null;
+    try {
+      traceCb?.({
+        stage: 'fetch_by_id_private',
+        params: { ok: String(Boolean(voice && voice.voice_id)) },
+        count: voice ? 1 : 0
+      });
+    } catch (_) {}
+    return voice;
+  } catch (err) {
+    try {
+      traceCb?.({
+        stage: 'fetch_by_id_private',
+        params: { ok: 'false', reason: err?.response?.status ? String(err.response.status) : 'error' },
+        count: 0
+      });
+    } catch (_) {}
+    return null;
+  }
+}
+
 async function downloadToBuffer(url) {
   const res = await axios.get(url, { responseType: 'arraybuffer', timeout: 15000 });
+  return Buffer.from(res.data);
+}
+
+function extractFirstSampleId(voice) {
+  try {
+    const samples = Array.isArray(voice?.samples) ? voice.samples : [];
+    const first = samples.find((s) => s && s.sample_id);
+    return first?.sample_id ? String(first.sample_id) : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function downloadPrivateSampleToBuffer(voiceId, sampleId) {
+  const url = `https://api.elevenlabs.io/v1/voices/${encodeURIComponent(voiceId)}/samples/${encodeURIComponent(sampleId)}/audio`;
+  const res = await axios.get(url, {
+    responseType: 'arraybuffer',
+    timeout: 20000,
+    headers: {
+      'xi-api-key': process.env.ELEVENLABS_API_KEY
+    }
+  });
   return Buffer.from(res.data);
 }
 
 async function findSimilarVoicesByVoiceId(voiceId, traceCb) {
   const XI_KEY = process.env.ELEVENLABS_API_KEY;
   try {
-    const baseVoice = await fetchSharedVoiceByIdOrSearch(voiceId, traceCb);
-    if (!baseVoice || !baseVoice.preview_url) return [];
-    const audioBuf = await downloadToBuffer(baseVoice.preview_url);
+    // 1) Resolve base voice (shared, then private)
+    const baseShared = await fetchSharedVoiceByIdOrSearch(voiceId, traceCb);
+    try {
+      traceCb?.({
+        stage: 'fetch_by_id_shared',
+        params: { ok: String(Boolean(baseShared && baseShared.voice_id)), has_preview: String(Boolean(baseShared?.preview_url)) },
+        count: baseShared ? 1 : 0
+      });
+    } catch (_) {}
+
+    let baseVoice = baseShared;
+    if (!baseVoice || (!baseVoice.preview_url && !extractFirstSampleId(baseVoice))) {
+      const basePrivate = await fetchPrivateVoiceById(voiceId, traceCb);
+      if (basePrivate) baseVoice = basePrivate;
+    }
+
+    if (!baseVoice) {
+      try {
+        traceCb?.({
+          stage: 'similar_base_audio',
+          params: { ok: 'false', reason: 'base_not_found' },
+          count: 0
+        });
+      } catch (_) {}
+      return { voices: [], reason: 'base_not_found' };
+    }
+
+    // 2) Obtain audio (preview_url preferred; else first sample audio)
+    let audioBuf = null;
+    let audioSource = null;
+    if (baseVoice.preview_url) {
+      audioBuf = await downloadToBuffer(baseVoice.preview_url);
+      audioSource = 'preview_url';
+    } else {
+      const sampleId = extractFirstSampleId(baseVoice);
+      if (sampleId) {
+        audioBuf = await downloadPrivateSampleToBuffer(voiceId, sampleId);
+        audioSource = 'sample_id';
+      }
+    }
+    if (!audioBuf) {
+      try {
+        traceCb?.({
+          stage: 'similar_base_audio',
+          params: { ok: 'false', reason: 'no_preview_or_sample' },
+          count: 0
+        });
+      } catch (_) {}
+      return { voices: [], reason: 'no_preview' };
+    }
+    try {
+      traceCb?.({
+        stage: 'similar_base_audio',
+        params: { ok: 'true', source: audioSource || '-' },
+        count: 1
+      });
+    } catch (_) {}
+
     const form = new FormData();
     form.append('audio_file', audioBuf, { filename: `${voiceId}.mp3`, contentType: 'audio/mpeg' });
     const res = await axios.post('https://api.elevenlabs.io/v1/similar-voices', form, {
@@ -3414,14 +3540,21 @@ async function findSimilarVoicesByVoiceId(voiceId, traceCb) {
     try {
       traceCb?.({
         stage: 'similar_voices',
-        params: { top_k: 'default' },
+        params: { top_k: 'default', source: audioSource || '-' },
         count: out.length
       });
     } catch (_) {}
-    return out;
+    return { voices: out, reason: 'ok' };
   } catch (err) {
     safeLogAxiosError('findSimilarVoicesByVoiceId', err);
-    return [];
+    try {
+      traceCb?.({
+        stage: 'similar_voices',
+        params: { ok: 'false', reason: err?.response?.status ? String(err.response.status) : 'error' },
+        count: 0
+      });
+    } catch (_) {}
+    return { voices: [], reason: 'error' };
   }
 }
 
@@ -3668,13 +3801,23 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         } catch (_) {}
       };
       await ensureLanguageIndexLoaded(traceCb);
-      let voices = await findSimilarVoicesByVoiceId(voiceIdForSimilarity, traceCb);
+      const simRes = await findSimilarVoicesByVoiceId(voiceIdForSimilarity, traceCb);
+      let voices = Array.isArray(simRes?.voices) ? simRes.voices : [];
       if (!voices.length) {
         const noResText = await translateForUserLanguage(labels.noResults, uiLang);
+        let hint = '';
+        try {
+          if (simRes?.reason === 'base_not_found' || simRes?.reason === 'no_preview') {
+            hint =
+              '\n\nTip: this voice_id may not be in the public Voice Library (or has no preview). ' +
+              'Try a Voice Library (shared) voice_id, or share an audio sample link.';
+          }
+        } catch (_) {}
+        const outText = hint ? (noResText + (await translateForUserLanguage(hint, uiLang))) : noResText;
         await client.chat.postMessage({
           channel: event.channel,
           thread_ts: threadTs,
-          text: noResText
+          text: outText
         });
         return;
       }
@@ -3700,10 +3843,13 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         lastActive: Date.now()
       };
       sessions[threadTs] = session;
-      // Results message (single by default, strict+verified when query is strongly language-specific)
+      // Similarity results: if query is strongly language-specific, enforce strict verified language matches.
       {
         const isStrong = isStrongLanguageRequest(cleaned, keywordPlan);
-        const iso2 = (keywordPlan?.target_voice_language || '').toString().slice(0, 2).toLowerCase();
+        const iso2 = (keywordPlan?.target_voice_language || detectVoiceLanguageFromText(cleaned) || '')
+          .toString()
+          .slice(0, 2)
+          .toLowerCase();
         const requestedLocale = isStrong ? getRequestedLocale(cleaned, keywordPlan) : null;
 
         if (isStrong && iso2) {
@@ -3712,16 +3858,12 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           );
           const strictIds = new Set();
           const strictVoices = [];
-          const verifiedFallback = [];
+          const notVerified = [];
 
           for (const v of sorted) {
             const hasVerified = voiceHasVerifiedIso2(v, iso2);
-            if (!hasVerified) continue;
-
-            const primaryOk = voicePrimaryLooksLikeIso2(v, iso2, requestedLocale);
             const localeOk = requestedLocale ? voiceMatchesRequestedLocale(v, requestedLocale) : true;
-            const strictOk = primaryOk && localeOk;
-
+            const strictOk = hasVerified && localeOk;
             if (strictOk) {
               strictIds.add(v.voice_id);
               strictVoices.push(v);
@@ -3729,10 +3871,17 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           }
 
           for (const v of sorted) {
-            if (!voiceHasVerifiedIso2(v, iso2)) continue;
             if (strictIds.has(v.voice_id)) continue;
-            verifiedFallback.push(v);
+            notVerified.push(v);
           }
+
+          try {
+            traceCb?.({
+              stage: 'similar_strict_filter',
+              params: { iso2, locale: requestedLocale || '-', total: String(sorted.length) },
+              count: strictVoices.length
+            });
+          } catch (_) {}
 
           const locSuffix = requestedLocale ? ` (${requestedLocale})` : '';
           const strictHeader = `\`\`\`STRICT MATCHES ${iso2.toUpperCase()}${locSuffix}\`\`\``;
@@ -3747,8 +3896,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
             blocks: strictBlocks || undefined
           });
 
-          let fallbackMsg = buildVerifiedFallbackMessage(
-            verifiedFallback,
+          let fallbackMsg = buildSimilarNotVerifiedMessage(
+            notVerified,
             session.ranking,
             iso2,
             requestedLocale,
