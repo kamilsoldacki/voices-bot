@@ -141,6 +141,13 @@ const STATIC_LANGUAGE_ALIASES = new Map([
   ['brazilian portuguese', 'pt']
 ]);
 
+// Fallback allowlist for ISO639-1 codes when the dynamic language index isn't loaded.
+// This prevents false positives like "to" being interpreted as a language code.
+const FALLBACK_ISO2_ALLOWLIST = new Set([
+  'en','pl','es','de','fr','it','pt','nl','sv','no','da','fi','cs','sk','hu','ro','bg','el','tr',
+  'ar','he','hi','ja','ko','zh','id','ms','th','vi','uk','ru'
+]);
+
 function parseUserLanguageHints(userText) {
   const text = (userText || '').toString();
   const lower = text.toLowerCase();
@@ -150,15 +157,26 @@ function parseUserLanguageHints(userText) {
   if (mLocale) {
     const iso2 = mLocale[1].toLowerCase();
     const locale = `${iso2}-${mLocale[2].toUpperCase()}`;
-    const ok = languageIndex.iso2Set.size ? languageIndex.iso2Set.has(iso2) : /^[a-z]{2}$/.test(iso2);
+    const ok = languageIndex.iso2Set.size
+      ? languageIndex.iso2Set.has(iso2)
+      : FALLBACK_ISO2_ALLOWLIST.has(iso2);
     if (ok) return { iso2, locale, explicit: true, reason: 'locale' };
   }
 
-  // 2) ISO2 token (validate against supported set to avoid picking random words like "in")
-  const candidates = lower.match(/\b[a-z]{2}\b/g) || [];
-  for (const iso2 of candidates) {
-    const ok = languageIndex.iso2Set.size ? languageIndex.iso2Set.has(iso2) : false;
-    if (ok) return { iso2, locale: null, explicit: true, reason: 'iso2' };
+  // 2) ISO2 token ONLY when explicitly marked (to avoid false positives like "to", "in", "an")
+  // Examples we accept:
+  // - "language: en", "lang=en"
+  // - "język: pl"
+  // - "(en)" or "[en]"
+  const mExplicitIso =
+    lower.match(/\b(?:language|lang(?:uage)?|język|jezyk|idioma)\s*[:=]\s*([a-z]{2})\b/) ||
+    lower.match(/[\(\[]\s*([a-z]{2})\s*[\)\]]/);
+  if (mExplicitIso) {
+    const iso2 = (mExplicitIso[1] || '').toLowerCase();
+    const ok = languageIndex.iso2Set.size
+      ? languageIndex.iso2Set.has(iso2)
+      : FALLBACK_ISO2_ALLOWLIST.has(iso2);
+    if (ok) return { iso2, locale: null, explicit: true, reason: 'iso2_explicit' };
   }
 
   // 3) language names from dynamic index
@@ -395,6 +413,11 @@ function hasExplicitLanguageMention(text) {
   if (!text) return false;
   const hint = parseUserLanguageHints(text);
   return !!(hint && hint.explicit && hint.iso2);
+}
+
+function detectLanguageMetaIntent(text) {
+  const lower = (text || '').toString().toLowerCase();
+  return /\b(language|lang(?:uage)?|język|jezyk|idioma|idiomas)\b/.test(lower);
 }
 
 // -------------------------------------------------------------
@@ -2813,18 +2836,28 @@ function splitMultiIntents(text) {
   try {
     const raw = (text || '').toString().trim();
     if (!raw) return [];
-    // Split on semicolons, or explicit connectors 'and'/'oraz'
-    const semiParts = raw
-      .split(/\s*;+\s*/g)
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0);
-    if (semiParts.length >= 2) return semiParts;
-    const andParts = raw
-      .split(/\s+(?:and|oraz)\s+/i)
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0);
-    if (andParts.length >= 2) return andParts;
-    return [];
+    // Split ONLY on explicit multi-brief formatting.
+    // Important: do NOT split on "and"/"oraz" because it commonly appears inside a single brief.
+    const lines = raw.split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
+    if (lines.length < 2) return [];
+
+    const numberRe = /^\s*\d+\s*[\)\.\:]\s+/;      // 1) foo, 2. foo, 3: foo
+    const bulletRe = /^\s*[-*•]\s+/;              // - foo, * foo, • foo
+    const briefRe = /^\s*brief\s*[:\-]\s+/i;      // brief: foo, brief - foo
+
+    const isExplicitItem = (l) => numberRe.test(l) || bulletRe.test(l) || briefRe.test(l);
+    const explicitLines = lines.filter(isExplicitItem);
+    if (explicitLines.length < 2) return [];
+
+    const stripPrefix = (l) =>
+      l
+        .replace(numberRe, '')
+        .replace(bulletRe, '')
+        .replace(briefRe, '')
+        .trim();
+
+    const out = explicitLines.map(stripPrefix).filter((s) => s.length > 0);
+    return out.length >= 2 ? out : [];
   } catch (_) {
     return [];
   }
@@ -3448,6 +3481,47 @@ function buildSearchReport(trace, plan, mode, summary) {
 }
 
 // -------------------------------------------------------------
+// DEV-only regression assertions (no external deps)
+// -------------------------------------------------------------
+function devAssert(cond, msg) {
+  if (!cond) throw new Error(`DEV_ASSERT failed: ${msg}`);
+}
+
+function runDevAsserts() {
+  const enabled = String(process.env.DEV_ASSERTS || '').trim().toLowerCase();
+  if (!(enabled === 'true' || enabled === '1' || enabled === 'yes')) return;
+
+  // Multi-intent should NOT split on conjunctions
+  devAssert(splitMultiIntents('expressive and engaging and fast-paced').length === 0, 'no split on "and"');
+
+  // Multi-intent should split on explicit list formats
+  devAssert(
+    splitMultiIntents('1) first brief\n2) second brief').length === 2,
+    'split numbered list'
+  );
+  devAssert(
+    splitMultiIntents('- first brief\n- second brief').length === 2,
+    'split bullet list'
+  );
+  devAssert(
+    splitMultiIntents('brief: first\nbrief: second').length === 2,
+    'split brief: list'
+  );
+
+  // Language should not accidentally infer from common words
+  const h1 = parseUserLanguageHints('I want to find a voice');
+  devAssert(!h1.iso2, 'do not infer iso2 from common words');
+
+  // Explicit ISO2 should work (even without dynamic index)
+  const h2 = parseUserLanguageHints('lang=en');
+  devAssert(h2.iso2 === 'en', 'explicit lang=en parses');
+
+  // Locale should parse
+  const h3 = parseUserLanguageHints('pt-BR');
+  devAssert(h3.iso2 === 'pt' && h3.locale === 'pt-BR', 'locale parses');
+}
+
+// -------------------------------------------------------------
 // POC_SEARCH_REPORT -> DM (owner only)
 //
 // Required Slack scopes:
@@ -3496,6 +3570,9 @@ async function postPocReportDm(client, text) {
 
 async function handleNewSearch(event, cleaned, threadTs, client) {
   try {
+    // Load language index early so ISO2 validation is accurate and language-name matching works.
+    await ensureLanguageIndexLoaded();
+
     const keywordPlan = await buildKeywordPlan(cleaned);
     const labels = getLabels();
 
@@ -3519,6 +3596,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         try { searchTrace.push(entry); } catch (_) {}
       };
       for (const part of parts) {
+        await ensureLanguageIndexLoaded(traceCb);
         const subPlan = await buildKeywordPlan(part);
         subPlan.__featured = false;
         subPlan.__sort = null;
@@ -3589,6 +3667,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           searchTrace.push(entry);
         } catch (_) {}
       };
+      await ensureLanguageIndexLoaded(traceCb);
       let voices = await findSimilarVoicesByVoiceId(voiceIdForSimilarity, traceCb);
       if (!voices.length) {
         const noResText = await translateForUserLanguage(labels.noResults, uiLang);
@@ -3883,6 +3962,15 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         // Single unified result message
         let message = buildMessageFromSession(session);
         message = await translateForUserLanguage(message, session.uiLanguage);
+        // If the user is asking about language but we couldn't infer a safe ISO2, give them the explicit syntax.
+        try {
+          const wantsLangMeta = detectLanguageMetaIntent(cleaned) || checkLanguagesIntent(cleaned.toLowerCase());
+          const hint = parseUserLanguageHints(cleaned);
+          if (wantsLangMeta && !(hint && hint.iso2)) {
+            const tip = '\n\nTip: specify language as `lang=en` / `język: pl` / `pt-BR`.';
+            message = message + (await translateForUserLanguage(tip, session.uiLanguage));
+          }
+        } catch (_) {}
         const blocks = buildBlocksFromText(message);
         await client.chat.postMessage({
           channel: event.channel,
@@ -4214,6 +4302,7 @@ app.action('cycle_quality', async ({ ack, body, client }) => {
 
 (async () => {
   validateEnvOrExit();
+  runDevAsserts();
   startMemoryCleanup();
   const port = process.env.PORT || 3000;
   await app.start(port);
