@@ -1638,6 +1638,8 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   // Negatives from user brief
   try {
     plan.__negatives = Array.from(extractNegativeTokens(userText) || []);
+    // Ensure negated tokens (e.g. "not audiobook") never influence use_cases/descriptives/search keywords.
+    plan = applyNegativesToPlan(plan);
     if (plan.__negatives.length) {
       trace({ stage: 'negatives', params: { applied: plan.__negatives.join(',') } });
     }
@@ -1707,8 +1709,9 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
 
   // Global prune of generic/noise keywords unless user explicitly asked
   {
-    const before = selectedKeywords.slice();
+    const before = pruneNegativesFromList(selectedKeywords.slice(), plan.__negatives);
     let filtered = filterKeywordsGlobally(userText, before);
+    filtered = pruneNegativesFromList(filtered, plan.__negatives);
 
     // Ensure a minimum count after filtering by refilling from dropped ones
     const MIN_KEYWORDS_AFTER_FILTER = 12;
@@ -1731,6 +1734,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
 
     // Intent-aware enrichment (military / villain / negative tone, etc.)
     filtered = enrichKeywordsByIntent(userText, filtered);
+    filtered = pruneNegativesFromList(filtered, plan.__negatives);
 
     // Commercial keyword pruning: avoid spending keyword queries on low-yield marketing adjectives,
     // while keeping commercial intent via use_cases=advertisement and ranking.
@@ -1796,6 +1800,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     if (!filtered.length && userText) {
       const fb = filterKeywordsGlobally(userText, [(userText || '').toLowerCase()]);
       filtered = enrichKeywordsByIntent(userText, fb.length ? fb : [(userText || '').toLowerCase()]);
+      filtered = pruneNegativesFromList(filtered, plan.__negatives);
     }
 
     // Cap to max
@@ -2901,10 +2906,49 @@ function extractNegativeTokens(userText) {
     { pat: /\bnot\s+raspy\b/, tok: 'raspy' },
     { pat: /\bno\s+raspy\b/, tok: 'raspy' },
     { pat: /\bnot\s+growl(ing)?\b/, tok: 'growl' },
-    { pat: /\bno\s+growl(ing)?\b/, tok: 'growl' }
+    { pat: /\bno\s+growl(ing)?\b/, tok: 'growl' },
+
+    // Expanded negatives: common "not X / no X / without X" constraints
+    { pat: /\b(?:not|no|without)\s+(?:an?\s+)?audiobooks?\b/, tok: 'audiobook' },
+    { pat: /\b(?:not|no|without)\s+(?:an?\s+)?narration\b/, tok: 'narration' },
+    { pat: /\b(?:not|no|without)\s+(?:an?\s+)?storytelling\b/, tok: 'storytelling' },
+    { pat: /\b(?:not|no|without)\s+(?:an?\s+)?podcasts?\b/, tok: 'podcast' },
+    { pat: /\b(?:not|no|without)\s+(?:an?\s+)?commercials?\b/, tok: 'commercial' },
+    { pat: /\b(?:not|no|without)\s+(?:an?\s+)?trailers?\b/, tok: 'trailer' },
+    { pat: /\b(?:not|no|without)\s+(?:an?\s+)?cartoons?\b/, tok: 'cartoon' }
   ];
   for (const r of rules) if (r.pat.test(lower)) neg.add(r.tok);
   return neg;
+}
+
+function pruneNegativesFromList(items, negatives) {
+  try {
+    const arr = Array.isArray(items) ? items : [];
+    const neg = Array.isArray(negatives) ? negatives : [];
+    if (!arr.length || !neg.length) return arr;
+    const negSet = new Set(neg.map((x) => normalizeKw(x)).filter(Boolean));
+    return arr.filter((k) => !negSet.has(normalizeKw(k)));
+  } catch (_) {
+    return Array.isArray(items) ? items : [];
+  }
+}
+
+function applyNegativesToPlan(plan) {
+  try {
+    if (!plan || typeof plan !== 'object') return plan;
+    const negatives = Array.isArray(plan.__negatives) ? plan.__negatives : [];
+    if (!negatives.length) return plan;
+
+    const pruneArr = (arr) => pruneNegativesFromList(arr, negatives);
+    plan.tone_keywords = pruneArr(plan.tone_keywords);
+    plan.use_case_keywords = pruneArr(plan.use_case_keywords);
+    plan.character_keywords = pruneArr(plan.character_keywords);
+    plan.style_keywords = pruneArr(plan.style_keywords);
+    plan.extra_keywords = pruneArr(plan.extra_keywords);
+    return plan;
+  } catch (_) {
+    return plan;
+  }
 }
 
 async function buildControlsBlocks(session) {
@@ -3175,7 +3219,9 @@ function hasExplicitUseCaseMention(userText) {
     'trailer', 'commercial', 'ad ', 'advertising',
     'podcast', 'youtube', 'tiktok', 'explainer', 'video',
     // Expanded variants:
-    'customer service', 'service support', 'tech support', 'technical support'
+    'customer service', 'service support', 'tech support', 'technical support',
+    // Informative/educational variants:
+    'documentary', 'informative', 'educational', 'presentation'
   ];
   return useCaseTokens.some((t) => lower.includes(t));
 }
@@ -3652,6 +3698,18 @@ function runDevAsserts() {
   // Locale should parse
   const h3 = parseUserLanguageHints('pt-BR');
   devAssert(h3.iso2 === 'pt' && h3.locale === 'pt-BR', 'locale parses');
+
+  // Negatives: "not audiobook" should be recognized and pruned
+  const n1 = extractNegativeTokens('not audiobook');
+  devAssert(n1.has('audiobook'), 'negatives: not audiobook recognized');
+  const p1 = { use_case_keywords: ['audiobook', 'documentary'], __negatives: Array.from(n1) };
+  applyNegativesToPlan(p1);
+  devAssert(
+    !Array.isArray(p1.use_case_keywords) || !p1.use_case_keywords.includes('audiobook'),
+    'negatives: audiobook pruned from plan.use_case_keywords'
+  );
+  const kw1 = pruneNegativesFromList(['audiobook', 'clear', 'documentary'], Array.from(n1));
+  devAssert(!kw1.includes('audiobook'), 'negatives: audiobook pruned from selected keywords');
 }
 
 // -------------------------------------------------------------
