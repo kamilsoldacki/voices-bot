@@ -135,6 +135,8 @@ const STATIC_LANGUAGE_ALIASES = new Map([
   ['français', 'fr'],
   ['francais', 'fr'],
   ['italian', 'it'],
+  ['japanese', 'ja'],
+  ['korean', 'ko'],
   ['portuguese', 'pt'],
   ['português', 'pt'],
   ['portugues', 'pt'],
@@ -153,7 +155,9 @@ function parseUserLanguageHints(userText) {
   const lower = text.toLowerCase();
 
   // 1) locale like pt-BR, es-MX
-  const mLocale = lower.match(/\b([a-z]{2})[-_ ]([a-z]{2})\b/);
+  // NOTE: allow only '-' or '_' (optionally with spaces around), never plain space.
+  // This prevents false positives like "It is" -> it-IS.
+  const mLocale = text.match(/\b([A-Za-z]{2})\s*[-_]\s*([A-Za-z]{2})\b/);
   if (mLocale) {
     const iso2 = mLocale[1].toLowerCase();
     const locale = `${iso2}-${mLocale[2].toUpperCase()}`;
@@ -3699,6 +3703,16 @@ function runDevAsserts() {
   const h3 = parseUserLanguageHints('pt-BR');
   devAssert(h3.iso2 === 'pt' && h3.locale === 'pt-BR', 'locale parses');
 
+  // Locale false-positive: "It is" must NOT be treated as it-IS
+  const h4 = parseUserLanguageHints('It is soft, empathetic, and encouraging');
+  devAssert(!h4.iso2 && !h4.locale, 'do not parse "it is" as a locale');
+
+  // Language-name fallback (STATIC_LANGUAGE_ALIASES) should cover common follow-ups
+  const h5 = parseUserLanguageHints('japanese');
+  devAssert(h5.iso2 === 'ja', 'static alias: japanese -> ja');
+  const h6 = parseUserLanguageHints('korean');
+  devAssert(h6.iso2 === 'ko', 'static alias: korean -> ko');
+
   // Negatives: "not audiobook" should be recognized and pruned
   const n1 = extractNegativeTokens('not audiobook');
   devAssert(n1.has('audiobook'), 'negatives: not audiobook recognized');
@@ -4239,6 +4253,10 @@ app.event('app_mention', async ({ event, client }) => {
   const existing = sessions[threadTs];
 
   if (existing) {
+    // Follow-ups rely on language-name detection (e.g., "Japanese", "Korean").
+    // Ensure the dynamic language index is available here too (it is loaded in handleNewSearch already).
+    await ensureLanguageIndexLoaded();
+
     const lower = cleaned.toLowerCase();
     existing.lastActive = Date.now();
 
