@@ -918,8 +918,10 @@ function buildSoftStrictBuckets(voices, ranking, iso2, requestedLocale, requeste
   for (const v of sorted) {
     if (!voiceHasVerifiedIso2(v, target)) continue;
 
-    // Keep the conservative primary-language heuristic (avoid obvious mismatches)
-    if (!voicePrimaryLooksLikeIso2(v, target, reqLocale)) continue;
+    // Primary-language heuristic:
+    // - used to qualify "Exact" matches
+    // - but MUST NOT drop verified voices entirely (many voices are verified for a language but have primary language != target)
+    const primaryOk = voicePrimaryLooksLikeIso2(v, target, reqLocale);
 
     const locs = voiceVerifiedLocales(v, target);
     const accs = voiceVerifiedAccents(v, target);
@@ -932,7 +934,7 @@ function buildSoftStrictBuckets(voices, ranking, iso2, requestedLocale, requeste
 
     // Exact requires exact match IF the user requested it and metadata exists.
     // If metadata is missing OR does not match, it goes to verifiedOnly bucket (soft strict).
-    const canBeExact = (!reqLocale || localeExact) && (!reqAccent || accentExact);
+    const canBeExact = primaryOk && (!reqLocale || localeExact) && (!reqAccent || accentExact);
 
     if (canBeExact) exact.push(v);
     else verifiedOnly.push(v);
@@ -4065,6 +4067,22 @@ function runDevAsserts() {
     const b = buildSoftStrictBuckets([v1, v2], ranking, 'pt', 'pt-BR', 'brazilian');
     devAssert(Array.isArray(b.exact) && b.exact.some((x) => x.voice_id === 'v1'), 'strict exact includes v1');
     devAssert(Array.isArray(b.verifiedOnly) && b.verifiedOnly.some((x) => x.voice_id === 'v2'), 'verified-only includes v2');
+  }
+
+  // Primary mismatch must NOT drop verified voices (common in Voice Library)
+  {
+    const v3 = {
+      voice_id: 'v3',
+      name: 'v3',
+      language: 'en',
+      locale: null,
+      accent: null,
+      verified_languages: [{ language: 'ko' }] // verified for Korean, but primary is English
+    };
+    const ranking = { v3: 1.0 };
+    const b = buildSoftStrictBuckets([v3], ranking, 'ko', null, null);
+    devAssert(Array.isArray(b.exact) && b.exact.length === 0, 'primary mismatch should not be exact');
+    devAssert(Array.isArray(b.verifiedOnly) && b.verifiedOnly.some((x) => x.voice_id === 'v3'), 'primary mismatch goes to verified-only');
   }
 
   // Negatives: "not audiobook" should be recognized and pruned
