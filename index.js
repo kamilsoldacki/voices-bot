@@ -1254,6 +1254,36 @@ function applyFilterChangesFromText(session, lower) {
     changed = true;
   }
 
+  // limit / "top N" (per gender bucket)
+  {
+    // Reset to default behavior (6 or 50 when listAll=true)
+    if (
+      lower.includes('reset limit') ||
+      lower.includes('default limit') ||
+      lower.includes('domyślny limit') ||
+      lower.includes('domyslny limit')
+    ) {
+      if (session.filters.limitPerGender != null) {
+        session.filters.limitPerGender = null;
+        changed = true;
+      }
+    } else {
+      // Examples:
+      // - "top 3", "top3", "only 3", "pokaż 3", "show 5", "wyświetl 3"
+      // - "3 voices", "3 głosy"
+      const m =
+        lower.match(/\b(?:top|only|just|show|display|pokaż|pokaz|wyświetl|wyswietl|tylko)\s*(\d{1,2})\b/) ||
+        lower.match(/\b(\d{1,2})\s*(?:voices?|głosy|glosy|propozycje|wyniki|results?)\b/);
+      if (m) {
+        const n = Math.max(1, Math.min(20, Number(m[1] || 0)));
+        if (n && session.filters.limitPerGender !== n) {
+          session.filters.limitPerGender = n;
+          changed = true;
+        }
+      }
+    }
+  }
+
   // strict use case on/off (force use_cases even without explicit mention)
   if (
     lower.includes('strict use case') ||
@@ -3007,7 +3037,10 @@ function buildMessageFromSession(session) {
   const { voices, ranking, filters, originalQuery } = session;
   const labels = getLabels();
 
-  const maxPerGender = filters.listAll ? 50 : 6;
+  const maxPerGender =
+    Number.isFinite(filters.limitPerGender) && filters.limitPerGender > 0
+      ? filters.limitPerGender
+      : (filters.listAll ? 50 : 6);
 
   const sorted = [...voices].sort(
     (a, b) => (ranking[b.voice_id] || 0) - (ranking[a.voice_id] || 0)
@@ -4150,7 +4183,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
                   : 'any',
               listAll: detectListAll(part),
               featured: false,
-              sort: null
+              sort: null,
+              limitPerGender: null
             },
             lastActive: Date.now()
           }
@@ -4231,7 +4265,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           featured: false,
           sort: null,
           strictUseCase: false,
-          strictDescriptives: false
+          strictDescriptives: false,
+          limitPerGender: null
         },
         lastActive: Date.now()
       };
@@ -4454,7 +4489,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         featured: false,
         sort: null,
         strictUseCase: false,
-        strictDescriptives: false
+        strictDescriptives: false,
+        limitPerGender: null
       },
       lastActive: Date.now()
     };
@@ -4802,6 +4838,8 @@ app.action('show_more', async ({ ack, body, client }) => {
     const session = sessions[threadTs];
     if (!session) return;
     session.filters.listAll = true;
+    // Ensure "show more" actually expands output, even if a "top N" limit was set previously.
+    session.filters.limitPerGender = null;
 
     const plan = JSON.parse(JSON.stringify(session.keywordPlan || {}));
     plan.__featured = session.filters.featured === true;
