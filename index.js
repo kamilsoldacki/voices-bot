@@ -150,6 +150,122 @@ const FALLBACK_ISO2_ALLOWLIST = new Set([
   'ar','he','hi','ja','ko','zh','id','ms','th','vi','uk','ru'
 ]);
 
+// -------------------------------------------------------------
+// Locale/accent normalization (UI aliases -> canonical tags)
+// -------------------------------------------------------------
+// NOTE: keep values conservative; these are used to interpret user intent and for soft bucketing.
+const LOCALE_ALIASES = new Map([
+  // English
+  ['en-uk', 'en-GB'],
+  ['en-gb', 'en-GB'],
+  ['uk-en', 'en-GB'],
+  ['en-england', 'en-GB'],
+  ['en-britain', 'en-GB'],
+  ['en-greatbritain', 'en-GB'],
+  ['en-us', 'en-US'],
+  ['en-usa', 'en-US'],
+  ['en-au', 'en-AU'],
+  ['en-ca', 'en-CA'],
+  ['en-ie', 'en-IE'],
+  // Portuguese
+  ['pt-eu', 'pt-PT'],
+  ['pt-europe', 'pt-PT'],
+  ['pt-european', 'pt-PT'],
+  ['pt-pt', 'pt-PT'],
+  ['pt-br', 'pt-BR'],
+  // Spanish
+  ['es-es', 'es-ES'],
+  ['es-mx', 'es-MX'],
+  ['es-419', 'es-419'], // Latin America / Caribbean (UN M.49)
+  ['es-latam', 'es-419'],
+  ['es-latinamerica', 'es-419'],
+  ['es-la', 'es-419'],
+  ['es-latin-america', 'es-419'],
+  // French
+  ['fr-ca', 'fr-CA'],
+  ['fr-qc', 'fr-CA'],
+  // Chinese
+  ['zh-cn', 'zh-CN'],
+  ['zh-tw', 'zh-TW'],
+  ['zh-hk', 'zh-HK']
+]);
+
+const ACCENT_ALIASES = new Map([
+  // English
+  ['general american', 'american'],
+  ['standard american', 'american'],
+  ['general-american', 'american'],
+  ['general_american', 'american'],
+  ['us', 'american'],
+  ['usa', 'american'],
+  ['american', 'american'],
+  ['uk', 'british'],
+  ['british', 'british'],
+  ['english (uk)', 'british'],
+  ['australian', 'australian'],
+  ['canadian', 'canadian'],
+  ['irish', 'irish'],
+  ['scottish', 'scottish'],
+  // Spanish
+  ['mexican', 'mexican'],
+  ['latin american', 'latin american'],
+  ['latam', 'latin american'],
+  ['castilian', 'castilian'],
+  ['spain', 'castilian'],
+  // Portuguese
+  ['brazil', 'brazilian'],
+  ['br', 'brazilian'],
+  ['brazilian', 'brazilian'],
+  ['portugal', 'portuguese'],
+  ['european portuguese', 'portuguese'],
+  ['portuguese', 'portuguese']
+]);
+
+function normalizeRequestedLocale(input) {
+  try {
+    const raw = (input || '').toString().trim();
+    if (!raw) return null;
+    const lower = raw.toLowerCase();
+
+    // Special UI-style tokens (not always written as xx-YY)
+    if (/\b(es)[\s\-_]*(latam|latin\s*america|latinamerica)\b/i.test(raw)) return 'es-419';
+    if (/\b(pt)[\s\-_]*(eu|europe|european)\b/i.test(raw)) return 'pt-PT';
+    if (/\b(en)[\s\-_]*(uk|britain|england)\b/i.test(raw)) return 'en-GB';
+
+    // Normalize separators & whitespace
+    let tag = lower.replace(/_/g, '-').replace(/\s+/g, '');
+    const alias = LOCALE_ALIASES.get(tag);
+    if (alias) return alias;
+
+    // Accept xx-YY or xx-999 (UN M.49 region code like es-419)
+    const m = tag.match(/^([a-z]{2})-([a-z]{2}|\d{3})$/);
+    if (!m) return null;
+    const lang = m[1].toLowerCase();
+    const region = m[2];
+    const reg = /^\d{3}$/.test(region) ? region : region.toUpperCase();
+    return `${lang}-${reg}`;
+  } catch (_) {
+    return null;
+  }
+}
+
+function normalizeRequestedAccent(input) {
+  try {
+    const raw = (input || '').toString().toLowerCase().trim();
+    if (!raw) return null;
+    const cleaned = raw.replace(/[_\-]+/g, ' ').replace(/\s+/g, ' ').trim();
+    if (ACCENT_ALIASES.has(cleaned)) return ACCENT_ALIASES.get(cleaned);
+    // direct pass-through for known single tokens
+    const direct = cleaned.split(' ').slice(0, 3).join(' ');
+    if (ACCENT_ALIASES.has(direct)) return ACCENT_ALIASES.get(direct);
+    // If user typed a single known token (e.g., "mexican"), keep it.
+    if (/^[a-z]{3,20}$/.test(cleaned)) return cleaned;
+    return cleaned;
+  } catch (_) {
+    return null;
+  }
+}
+
 function parseUserLanguageHints(userText) {
   const text = (userText || '').toString();
   const lower = text.toLowerCase();
@@ -160,7 +276,8 @@ function parseUserLanguageHints(userText) {
   const mLocale = text.match(/\b([A-Za-z]{2})\s*[-_]\s*([A-Za-z]{2})\b/);
   if (mLocale) {
     const iso2 = mLocale[1].toLowerCase();
-    const locale = `${iso2}-${mLocale[2].toUpperCase()}`;
+    const localeRaw = `${iso2}-${mLocale[2].toUpperCase()}`;
+    const locale = normalizeRequestedLocale(localeRaw) || localeRaw;
     const ok = languageIndex.iso2Set.size
       ? languageIndex.iso2Set.has(iso2)
       : FALLBACK_ISO2_ALLOWLIST.has(iso2);
@@ -617,17 +734,20 @@ function extractIso2FromLanguageField(val) {
 function extractLocaleFromField(val) {
   const s = (val || '').toString().trim();
   if (!s) return null;
-  // normalize to xx-YY
-  const m = s.match(/^([a-z]{2})[-_ ]([a-z]{2})$/i);
+  // normalize to xx-YY or xx-999 (UN M.49 region like es-419)
+  const m = s.match(/^([a-z]{2})\s*[-_]\s*([a-z]{2}|\d{3})$/i);
   if (!m) return null;
-  return `${m[1].toLowerCase()}-${m[2].toUpperCase()}`;
+  const lang = m[1].toLowerCase();
+  const regionRaw = m[2];
+  const region = /^\d{3}$/.test(regionRaw) ? regionRaw : regionRaw.toUpperCase();
+  return `${lang}-${region}`;
 }
 
 function getRequestedLocale(userText, keywordPlan) {
   const text = (userText || '').toString();
   const lower = text.toLowerCase();
   const hint = parseUserLanguageHints(text);
-  if (hint && hint.locale) return hint.locale;
+  if (hint && hint.locale) return normalizeRequestedLocale(hint.locale) || hint.locale;
 
   const iso2 =
     (keywordPlan?.target_voice_language || hint?.iso2 || '').toString().toLowerCase().slice(0, 2);
@@ -637,15 +757,82 @@ function getRequestedLocale(userText, keywordPlan) {
   if (iso2 === 'pt') {
     if (/\b(brazil|brasil|brazilian|brasile|pt-br)\b/.test(lower)) return 'pt-BR';
     if (/\b(portugal|pt-pt|european)\b/.test(lower)) return 'pt-PT';
+    if (/\b(pt-eu|european union|eu)\b/.test(lower)) return 'pt-PT';
   }
   if (iso2 === 'es') {
     if (/\b(mexico|mexican|es-mx|mx)\b/.test(lower)) return 'es-MX';
     if (/\b(spain|castilian|es-es)\b/.test(lower)) return 'es-ES';
+    if (/\b(latam|latin america|latinamerican|es-419)\b/.test(lower)) return 'es-419';
   }
   if (iso2 === 'fr') {
     if (/\b(fr-ca|french canadian|canadian french|quebec|québec|qc)\b/.test(lower)) return 'fr-CA';
   }
   return null;
+}
+
+function hasExplicitAccentMention(userText) {
+  const lower = (userText || '').toString().toLowerCase();
+  if (/\b(accent|akcent)\b/.test(lower)) return true;
+  // Common implicit accent phrases (no explicit "accent" word)
+  const implicit = [
+    'general american',
+    'standard american',
+    'british',
+    'mexican',
+    'castilian',
+    'brazilian',
+    'european portuguese',
+    'portuguese (portugal)',
+    'portuguese portugal',
+    'pt-eu',
+    'en-uk',
+    'es-mx',
+    'pt-br',
+    'pt-pt'
+  ];
+  return implicit.some((t) => lower.includes(t));
+}
+
+function getRequestedAccent(userText, keywordPlan, requestedLocale) {
+  try {
+    const text = (userText || '').toString();
+    const lower = text.toLowerCase();
+    const loc = normalizeRequestedLocale(requestedLocale);
+
+    // Prefer explicit plan hint if present
+    const planAcc =
+      typeof keywordPlan?.target_accent === 'string' && keywordPlan.target_accent.trim()
+        ? normalizeRequestedAccent(keywordPlan.target_accent)
+        : null;
+    if (planAcc) return planAcc;
+
+    // Infer accent from normalized locale if available
+    if (loc) {
+      if (loc === 'en-GB') return 'british';
+      if (loc === 'en-US') return 'american';
+      if (loc === 'en-AU') return 'australian';
+      if (loc === 'en-CA') return 'canadian';
+      if (loc === 'pt-BR') return 'brazilian';
+      if (loc === 'pt-PT') return 'portuguese';
+      if (loc === 'es-MX') return 'mexican';
+      if (loc === 'es-ES') return 'castilian';
+      if (loc === 'fr-CA') return 'canadian';
+    }
+
+    // Heuristic from text
+    if (/\b(general american|standard american)\b/.test(lower)) return 'american';
+    if (/\b(british|en-uk|uk)\b/.test(lower)) return 'british';
+    if (/\b(australian)\b/.test(lower)) return 'australian';
+    if (/\b(canadian)\b/.test(lower)) return 'canadian';
+    if (/\b(mexico|mexican|es-mx|mx)\b/.test(lower)) return 'mexican';
+    if (/\b(spain|castilian|es-es)\b/.test(lower)) return 'castilian';
+    if (/\b(brazil|brasil|brazilian|pt-br)\b/.test(lower)) return 'brazilian';
+    if (/\b(portugal|pt-pt|pt-eu|european)\b/.test(lower) && /\bportuguese|pt\b/.test(lower)) return 'portuguese';
+
+    return null;
+  } catch (_) {
+    return null;
+  }
 }
 
 function isStrongLanguageRequest(userText, keywordPlan) {
@@ -679,6 +866,79 @@ function voiceHasVerifiedIso2(voice, iso2) {
     if (el === target) return true;
   }
   return false;
+}
+
+function voiceVerifiedEntriesForIso2(voice, iso2) {
+  const target = (iso2 || '').toString().toLowerCase().slice(0, 2);
+  if (!voice || !target) return [];
+  const verified = Array.isArray(voice.verified_languages) ? voice.verified_languages : [];
+  return verified.filter((entry) => extractIso2FromLanguageField(entry?.language) === target);
+}
+
+function voiceVerifiedLocales(voice, iso2) {
+  const out = [];
+  const entries = voiceVerifiedEntriesForIso2(voice, iso2);
+  for (const e of entries) {
+    const loc = normalizeRequestedLocale(e?.locale);
+    if (loc) out.push(loc);
+    // Some APIs may embed locale-like info in `language`
+    const langLoc = normalizeRequestedLocale(e?.language);
+    if (langLoc) out.push(langLoc);
+  }
+  // Fallback: top-level locale
+  const vLoc = normalizeRequestedLocale(voice?.locale);
+  if (vLoc) out.push(vLoc);
+  return Array.from(new Set(out));
+}
+
+function voiceVerifiedAccents(voice, iso2) {
+  const out = [];
+  const entries = voiceVerifiedEntriesForIso2(voice, iso2);
+  for (const e of entries) {
+    const acc = normalizeRequestedAccent(e?.accent);
+    if (acc) out.push(acc);
+  }
+  const vAcc = normalizeRequestedAccent(voice?.accent);
+  if (vAcc) out.push(vAcc);
+  return Array.from(new Set(out));
+}
+
+function buildSoftStrictBuckets(voices, ranking, iso2, requestedLocale, requestedAccent) {
+  const target = (iso2 || '').toString().toLowerCase().slice(0, 2);
+  const reqLocale = normalizeRequestedLocale(requestedLocale);
+  const reqAccent = normalizeRequestedAccent(requestedAccent);
+
+  const sorted = [...(voices || [])].sort(
+    (a, b) => (ranking?.[b.voice_id] || 0) - (ranking?.[a.voice_id] || 0)
+  );
+
+  const exact = [];
+  const verifiedOnly = [];
+
+  for (const v of sorted) {
+    if (!voiceHasVerifiedIso2(v, target)) continue;
+
+    // Keep the conservative primary-language heuristic (avoid obvious mismatches)
+    if (!voicePrimaryLooksLikeIso2(v, target, reqLocale)) continue;
+
+    const locs = voiceVerifiedLocales(v, target);
+    const accs = voiceVerifiedAccents(v, target);
+
+    const hasLocMeta = locs.length > 0;
+    const hasAccMeta = accs.length > 0;
+
+    const localeExact = reqLocale ? (hasLocMeta && locs.includes(reqLocale)) : true;
+    const accentExact = reqAccent ? (hasAccMeta && accs.includes(reqAccent)) : true;
+
+    // Exact requires exact match IF the user requested it and metadata exists.
+    // If metadata is missing OR does not match, it goes to verifiedOnly bucket (soft strict).
+    const canBeExact = (!reqLocale || localeExact) && (!reqAccent || accentExact);
+
+    if (canBeExact) exact.push(v);
+    else verifiedOnly.push(v);
+  }
+
+  return { exact, verifiedOnly, reqLocale, reqAccent };
 }
 
 function voiceMatchesRequestedLocale(voice, requestedLocale) {
@@ -741,6 +1001,30 @@ function buildVerifiedFallbackMessage(voices, ranking, iso2, requestedLocale, li
 
   const locSuffix = requestedLocale ? ` (${requestedLocale})` : '';
   const header = `\`\`\`ALSO VERIFIED FOR ${String(iso2 || '').toUpperCase()}${locSuffix} (may not sound primary)\`\`\``;
+
+  const lines = [header];
+  if (max === 0) {
+    lines.push(labels.noVoices);
+    return lines.join('\n');
+  }
+  for (let i = 0; i < max; i++) {
+    lines.push(`- ${formatVoiceLine(sorted[i])}`);
+  }
+  return lines.join('\n');
+}
+
+function buildVerifiedFallbackMessageSoft(voices, ranking, iso2, requestedLocale, requestedAccent, limit = 20) {
+  const labels = getLabels();
+  const sorted = [...(voices || [])].sort(
+    (a, b) => (ranking?.[b.voice_id] || 0) - (ranking?.[a.voice_id] || 0)
+  );
+  const max = Math.min(sorted.length, limit);
+
+  const loc = normalizeRequestedLocale(requestedLocale);
+  const acc = normalizeRequestedAccent(requestedAccent);
+  const locSuffix = loc ? ` (${loc})` : '';
+  const accSuffix = acc ? ` [accent=${acc}]` : '';
+  const header = `\`\`\`ALSO VERIFIED FOR ${String(iso2 || '').toUpperCase()}${locSuffix}${accSuffix} (missing/unknown or non-exact locale/accent)\`\`\``;
 
   const lines = [header];
   if (max === 0) {
@@ -2001,12 +2285,12 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             } catch (_) {}
           }
         }
-        // Quick relax (after triage): if still empty, retry without use_cases/accent/age
+        // Quick relax (after triage): if still empty, retry without use_cases/accent/locale/age
         if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0) {
           const pQuick = new URLSearchParams(params.toString());
           const keysQuick = Array.from(pQuick.keys());
           keysQuick.forEach((k) => {
-            if (k === 'use_cases' || k === 'accent' || k === 'age') pQuick.delete(k);
+            if (k === 'use_cases' || k === 'accent' || k === 'locale' || k === 'age') pQuick.delete(k);
           });
           try {
             const vQuick = await callSharedVoices(pQuick);
@@ -2072,7 +2356,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     }
 
     try {
-      // Combined fallback triad: with both, without use_cases, without descriptives
+      // Combined fallback: with both, without use_cases, without descriptives, without locale/accent
       const paramsWith = new URLSearchParams(params.toString());
       const paramsNoUC = new URLSearchParams(params.toString());
       const keysNoUC = Array.from(paramsNoUC.keys());
@@ -2080,16 +2364,20 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
       const paramsNoDesc = new URLSearchParams(params.toString());
       const keysNoDesc = Array.from(paramsNoDesc.keys());
       keysNoDesc.forEach((k) => { if (k === 'descriptives') paramsNoDesc.delete(k); });
+      const paramsNoLocAcc = new URLSearchParams(params.toString());
+      const keysNoLocAcc = Array.from(paramsNoLocAcc.keys());
+      keysNoLocAcc.forEach((k) => { if (k === 'locale' || k === 'accent') paramsNoLocAcc.delete(k); });
 
       const wantMore = detectListAll(userText) === true || plan.__listAll === true;
-      const [fa, fb, fc] = await Promise.all([
+      const [fa, fb, fc, fd] = await Promise.all([
         wantMore ? callSharedVoicesAllPages(paramsWith, { maxPages: 2, cap: 160 }) : callSharedVoicesCached(paramsWith, async (p) => { const { voices } = await callSharedVoicesRaw(p); return voices; }),
         wantMore ? callSharedVoicesAllPages(paramsNoUC, { maxPages: 2, cap: 160 }) : callSharedVoicesCached(paramsNoUC, async (p) => { const { voices } = await callSharedVoicesRaw(p); return voices; }),
-        wantMore ? callSharedVoicesAllPages(paramsNoDesc, { maxPages: 2, cap: 160 }) : callSharedVoicesCached(paramsNoDesc, async (p) => { const { voices } = await callSharedVoicesRaw(p); return voices; })
+        wantMore ? callSharedVoicesAllPages(paramsNoDesc, { maxPages: 2, cap: 160 }) : callSharedVoicesCached(paramsNoDesc, async (p) => { const { voices } = await callSharedVoicesRaw(p); return voices; }),
+        wantMore ? callSharedVoicesAllPages(paramsNoLocAcc, { maxPages: 2, cap: 160 }) : callSharedVoicesCached(paramsNoLocAcc, async (p) => { const { voices } = await callSharedVoicesRaw(p); return voices; })
       ]);
       const seenIdsCF = new Set();
       const fallbackVoices = [];
-      for (const v of [...(fa || []), ...(fb || []), ...(fc || [])]) {
+      for (const v of [...(fa || []), ...(fb || []), ...(fc || []), ...(fd || [])]) {
         if (v && v.voice_id && !seenIdsCF.has(v.voice_id)) {
           seenIdsCF.add(v.voice_id);
           fallbackVoices.push(v);
@@ -3713,6 +4001,39 @@ function runDevAsserts() {
   const h6 = parseUserLanguageHints('korean');
   devAssert(h6.iso2 === 'ko', 'static alias: korean -> ko');
 
+  // Locale normalization (UI aliases -> canonical)
+  devAssert(normalizeRequestedLocale('PT-EU') === 'pt-PT', 'normalize PT-EU -> pt-PT');
+  devAssert(normalizeRequestedLocale('en-UK') === 'en-GB', 'normalize en-UK -> en-GB');
+  devAssert(normalizeRequestedLocale('es-LATAM') === 'es-419', 'normalize es-LATAM -> es-419');
+  devAssert(extractLocaleFromField('es-419') === 'es-419', 'parse locale with numeric region (es-419)');
+
+  // Accent normalization
+  devAssert(normalizeRequestedAccent('General American') === 'american', 'normalize accent: General American -> american');
+
+  // Soft strict bucketing: exact vs verified-only (missing/non-exact locale/accent)
+  {
+    const v1 = {
+      voice_id: 'v1',
+      name: 'v1',
+      language: 'pt',
+      locale: null,
+      accent: null,
+      verified_languages: [{ language: 'pt', locale: 'pt-BR', accent: 'brazilian' }]
+    };
+    const v2 = {
+      voice_id: 'v2',
+      name: 'v2',
+      language: 'pt',
+      locale: null,
+      accent: null,
+      verified_languages: [{ language: 'pt' }] // missing locale/accent metadata
+    };
+    const ranking = { v1: 1.0, v2: 0.9 };
+    const b = buildSoftStrictBuckets([v1, v2], ranking, 'pt', 'pt-BR', 'brazilian');
+    devAssert(Array.isArray(b.exact) && b.exact.some((x) => x.voice_id === 'v1'), 'strict exact includes v1');
+    devAssert(Array.isArray(b.verifiedOnly) && b.verifiedOnly.some((x) => x.voice_id === 'v2'), 'verified-only includes v2');
+  }
+
   // Negatives: "not audiobook" should be recognized and pruned
   const n1 = extractNegativeTokens('not audiobook');
   devAssert(n1.has('audiobook'), 'negatives: not audiobook recognized');
@@ -3923,42 +4244,44 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           .slice(0, 2)
           .toLowerCase();
         const requestedLocale = isStrong ? getRequestedLocale(cleaned, keywordPlan) : null;
+        const requestedAccent =
+          isStrong && (hasExplicitAccentMention(cleaned) || requestedLocale)
+            ? getRequestedAccent(cleaned, keywordPlan, requestedLocale)
+            : null;
 
         if (isStrong && iso2) {
-          const sorted = [...(voices || [])].sort(
-            (a, b) => (session.ranking?.[b.voice_id] || 0) - (session.ranking?.[a.voice_id] || 0)
+          const buckets = buildSoftStrictBuckets(
+            voices || [],
+            session.ranking || {},
+            iso2,
+            requestedLocale,
+            requestedAccent
           );
-          const strictIds = new Set();
-          const strictVoices = [];
-          const notVerified = [];
-
-          for (const v of sorted) {
-            const hasVerified = voiceHasVerifiedIso2(v, iso2);
-            const localeOk = requestedLocale ? voiceMatchesRequestedLocale(v, requestedLocale) : true;
-            const strictOk = hasVerified && localeOk;
-            if (strictOk) {
-              strictIds.add(v.voice_id);
-              strictVoices.push(v);
-            }
-          }
-
-          for (const v of sorted) {
-            if (strictIds.has(v.voice_id)) continue;
-            notVerified.push(v);
-          }
+          const strictVoices = buckets.exact || [];
+          const verifiedOnly = buckets.verifiedOnly || [];
+          const verifiedIds = new Set([...(strictVoices || []), ...(verifiedOnly || [])].map((v) => v.voice_id));
+          const notVerified = (voices || []).filter((v) => v && v.voice_id && !verifiedIds.has(v.voice_id));
 
           try {
             traceCb?.({
               stage: 'similar_strict_filter',
-              params: { iso2, locale: requestedLocale || '-', total: String(sorted.length) },
+              params: {
+                iso2,
+                locale: requestedLocale || '-',
+                accent: requestedAccent || '-',
+                total: String(Array.isArray(voices) ? voices.length : 0)
+              },
               count: strictVoices.length
             });
           } catch (_) {}
 
-          const locSuffix = requestedLocale ? ` (${requestedLocale})` : '';
+          const locSuffix = requestedLocale ? ` (${normalizeRequestedLocale(requestedLocale) || requestedLocale})` : '';
           const strictHeader = `\`\`\`STRICT MATCHES ${iso2.toUpperCase()}${locSuffix}\`\`\``;
           const strictSession = { ...session, voices: strictVoices };
-          let strictMessage = strictHeader + '\n' + buildMessageFromSession(strictSession);
+          const labels = getLabels();
+          let strictBody = buildMessageFromSession(strictSession);
+          if (!strictBody || !String(strictBody).trim()) strictBody = labels.noVoices;
+          let strictMessage = strictHeader + '\n' + strictBody;
           strictMessage = await translateForUserLanguage(strictMessage, session.uiLanguage);
           const strictBlocks = buildBlocksFromText(strictMessage);
           await client.chat.postMessage({
@@ -3968,21 +4291,42 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
             blocks: strictBlocks || undefined
           });
 
-          let fallbackMsg = buildSimilarNotVerifiedMessage(
-            notVerified,
-            session.ranking,
-            iso2,
-            requestedLocale,
-            20
-          );
-          fallbackMsg = await translateForUserLanguage(fallbackMsg, session.uiLanguage);
-          const fbBlocks = buildBlocksFromText(fallbackMsg);
-          await client.chat.postMessage({
-            channel: event.channel,
-            thread_ts: threadTs,
-            text: fallbackMsg,
-            blocks: fbBlocks || undefined
-          });
+          if (verifiedOnly.length) {
+            let vMsg = buildVerifiedFallbackMessageSoft(
+              verifiedOnly,
+              session.ranking,
+              iso2,
+              requestedLocale,
+              requestedAccent,
+              20
+            );
+            vMsg = await translateForUserLanguage(vMsg, session.uiLanguage);
+            const vBlocks = buildBlocksFromText(vMsg);
+            await client.chat.postMessage({
+              channel: event.channel,
+              thread_ts: threadTs,
+              text: vMsg,
+              blocks: vBlocks || undefined
+            });
+          }
+
+          if (notVerified.length) {
+            let fallbackMsg = buildSimilarNotVerifiedMessage(
+              notVerified,
+              session.ranking,
+              iso2,
+              requestedLocale,
+              20
+            );
+            fallbackMsg = await translateForUserLanguage(fallbackMsg, session.uiLanguage);
+            const fbBlocks = buildBlocksFromText(fallbackMsg);
+            await client.chat.postMessage({
+              channel: event.channel,
+              thread_ts: threadTs,
+              text: fallbackMsg,
+              blocks: fbBlocks || undefined
+            });
+          }
         } else {
           // Single unified result message
           let message = buildMessageFromSession(session);
@@ -4122,39 +4466,30 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
       const isStrong = isStrongLanguageRequest(cleaned, keywordPlan);
       const iso2 = (keywordPlan?.target_voice_language || '').toString().slice(0, 2).toLowerCase();
       const requestedLocale = isStrong ? getRequestedLocale(cleaned, keywordPlan) : null;
+      const requestedAccent =
+        isStrong && (hasExplicitAccentMention(cleaned) || requestedLocale)
+          ? getRequestedAccent(cleaned, keywordPlan, requestedLocale)
+          : null;
 
       if (isStrong && iso2) {
-        const sorted = [...(voices || [])].sort(
-          (a, b) => (session.ranking?.[b.voice_id] || 0) - (session.ranking?.[a.voice_id] || 0)
+        const buckets = buildSoftStrictBuckets(
+          voices || [],
+          session.ranking || {},
+          iso2,
+          requestedLocale,
+          requestedAccent
         );
-        const strictIds = new Set();
-        const strictVoices = [];
-        const verifiedFallback = [];
+        const strictVoices = buckets.exact || [];
+        const verifiedFallback = buckets.verifiedOnly || [];
 
-        for (const v of sorted) {
-          const hasVerified = voiceHasVerifiedIso2(v, iso2);
-          if (!hasVerified) continue;
-
-          const primaryOk = voicePrimaryLooksLikeIso2(v, iso2, requestedLocale);
-          const localeOk = requestedLocale ? voiceMatchesRequestedLocale(v, requestedLocale) : true;
-          const strictOk = primaryOk && localeOk;
-
-          if (strictOk) {
-            strictIds.add(v.voice_id);
-            strictVoices.push(v);
-          }
-        }
-
-        for (const v of sorted) {
-          if (!voiceHasVerifiedIso2(v, iso2)) continue;
-          if (strictIds.has(v.voice_id)) continue;
-          verifiedFallback.push(v);
-        }
-
-        const locSuffix = requestedLocale ? ` (${requestedLocale})` : '';
+        const locNorm = normalizeRequestedLocale(requestedLocale);
+        const locSuffix = locNorm ? ` (${locNorm})` : requestedLocale ? ` (${requestedLocale})` : '';
         const strictHeader = `\`\`\`STRICT MATCHES ${iso2.toUpperCase()}${locSuffix}\`\`\``;
         const strictSession = { ...session, voices: strictVoices };
-        let strictMessage = strictHeader + '\n' + buildMessageFromSession(strictSession);
+        const labels = getLabels();
+        let strictBody = buildMessageFromSession(strictSession);
+        if (!strictBody || !String(strictBody).trim()) strictBody = labels.noVoices;
+        let strictMessage = strictHeader + '\n' + strictBody;
         strictMessage = await translateForUserLanguage(strictMessage, session.uiLanguage);
         const strictBlocks = buildBlocksFromText(strictMessage);
         await client.chat.postMessage({
@@ -4164,11 +4499,12 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           blocks: strictBlocks || undefined
         });
 
-        let fallbackMsg = buildVerifiedFallbackMessage(
+        let fallbackMsg = buildVerifiedFallbackMessageSoft(
           verifiedFallback,
           session.ranking,
           iso2,
           requestedLocale,
+          requestedAccent,
           20
         );
         fallbackMsg = await translateForUserLanguage(fallbackMsg, session.uiLanguage);
