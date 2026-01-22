@@ -17,6 +17,10 @@ const KEYWORD_SEARCH_CONCURRENCY = 6; // limit concurrent keyword searches
 const sharedVoicesCache = new Map(); // key -> { at:number, voices:any[] }
 const SHARED_VOICES_CACHE_TTL_MS = 7 * 60 * 1000; // 7 minutes
 
+// Keyword translation/expansion cache (LLM) for non-English search terms
+const keywordTranslateCache = new Map(); // key -> { at:number, iso2:string, src:string, out:string[] }
+const KEYWORD_TRANSLATE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
 // -------------------------------------------------------------
 // Accent/locale catalog (loaded from disk + optional refresh)
 // -------------------------------------------------------------
@@ -778,6 +782,44 @@ class FacetKB {
     }
 
     return [];
+  }
+
+  getVariantForFacetKey(iso2, axis, facetKey) {
+    const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    const ax = (axis || '').toString();
+    const key = (facetKey || '').toString().trim();
+    if (!k || !ax || !key) return null;
+
+    if (ax === 'locale') {
+      const norm = normalizeLocaleToken(key);
+      if (!norm) return null;
+      if (this.allowedLocalesByIso2.has(k) && !this.allowedLocalesByIso2.get(k).has(norm)) return null;
+      const apiLocale = this._canonicalizeLocaleForApi(norm) || norm;
+      return {
+        facetType: 'locale',
+        facetKey: norm,
+        facetValue: apiLocale,
+        facetLabel: this._canonicalizeLocaleLabel(norm)
+      };
+    }
+
+    if (ax === 'accent') {
+      const norm = normalizeCatalogToken(key);
+      if (!norm) return null;
+      if (this.allowedAccentsByIso2.has(k) && !this.allowedAccentsByIso2.get(k).has(norm)) return null;
+      const slug = (this.accentSlugByIso2Accent.get(k) || new Map()).get(norm) || null;
+      const count = (this.accentCountByIso2Accent.get(k) || new Map()).get(norm) || 0;
+      return {
+        facetType: 'accent',
+        facetKey: norm,
+        facetValue: norm, // name form
+        facetLabel: norm,
+        slug,
+        count
+      };
+    }
+
+    return null;
   }
 
   // Suggest locales for a language (no popularity data; deterministic ordering)
@@ -1932,6 +1974,136 @@ function detectChineseDialectFromText(userText) {
   if (hasCantonese && !hasMandarin) return 'cantonese';
   if (hasMandarin && !hasCantonese) return 'mandarin';
   return null;
+}
+
+// -------------------------------------------------------------
+// Variant intent detection (specific vs general) – global
+// -------------------------------------------------------------
+// Goal:
+// - if user is specific (dialect/region/locale/accent), do NOT mix variants
+// - if user is general, allow multi-variant sections
+function detectVariantIntent(userText, iso2, kb) {
+  try {
+    const text = (userText || '').toString();
+    const lower = text.toLowerCase();
+    const lang = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    const out = {
+      isSpecific: false,
+      axis: null, // 'locale' | 'accent'
+      requestedFacetKeys: [], // normalized facetKey strings
+      minResults: 10
+    };
+    if (!lang) return out;
+
+    // 1) explicit locale token in text
+    const hint = parseUserLanguageHints(text);
+    const hintLocale = hint && hint.locale ? normalizeRequestedLocale(hint.locale) || hint.locale : null;
+    if (hintLocale) {
+      const key = normalizeLocaleToken(hintLocale);
+      if (key) {
+        out.isSpecific = true;
+        out.axis = 'locale';
+        out.requestedFacetKeys = [key];
+        return out;
+      }
+    }
+
+    // 2) Chinese dialect is inherently specific
+    if (lang === 'zh') {
+      const d = detectChineseDialectFromText(text);
+      if (d) {
+        out.isSpecific = true;
+        out.axis = 'accent';
+        // Use FacetKB to pick matching accents (keys are normalized)
+        const set = kb && kb.allowedAccentsByIso2 && kb.allowedAccentsByIso2.get ? kb.allowedAccentsByIso2.get('zh') : null;
+        const all = set ? Array.from(set.values()) : [];
+        const matches = all.filter((a) => {
+          if (d === 'cantonese') return a.includes('cantonese');
+          if (d === 'mandarin') return a.includes('mandarin');
+          return false;
+        });
+        // Always include standard as fallback option (not shown unless needed)
+        const keys = dedupePreserveOrder([...matches, 'standard']).filter(Boolean);
+        out.requestedFacetKeys = keys.length ? keys : [d === 'cantonese' ? 'hong kong cantonese' : 'beijing mandarin', 'standard'];
+        return out;
+      }
+    }
+
+    // 3) region markers for common languages -> locale specificity
+    if (lang === 'pt') {
+      if (/\b(brazil|brasil|brazilian|brasile|pt-br)\b/.test(lower)) {
+        out.isSpecific = true;
+        out.axis = 'locale';
+        out.requestedFacetKeys = ['pt-br'];
+        return out;
+      }
+      if (/\b(portugal|pt-pt|pt-eu|european)\b/.test(lower)) {
+        out.isSpecific = true;
+        out.axis = 'locale';
+        out.requestedFacetKeys = ['pt-pt'];
+        return out;
+      }
+    }
+    if (lang === 'es') {
+      if (/\b(es-419|latam|latin america|latinamerican|latino|south american|central american|caribbean)\b/.test(lower)) {
+        out.isSpecific = true;
+        out.axis = 'locale';
+        out.requestedFacetKeys = ['es-419'];
+        return out;
+      }
+      if (/\b(mexico|mexican|es-mx|mx)\b/.test(lower)) {
+        out.isSpecific = true;
+        out.axis = 'locale';
+        out.requestedFacetKeys = ['es-mx'];
+        return out;
+      }
+      if (/\b(spain|castilian|es-es)\b/.test(lower) || (/\b(european)\b/.test(lower) && /\bspanish\b/.test(lower))) {
+        out.isSpecific = true;
+        out.axis = 'locale';
+        out.requestedFacetKeys = ['es-es'];
+        return out;
+      }
+    }
+    if (lang === 'en') {
+      if (/\b(en-us|us english|american english|usa)\b/.test(lower)) {
+        out.isSpecific = true;
+        out.axis = 'locale';
+        out.requestedFacetKeys = ['en-us'];
+        return out;
+      }
+      if (/\b(en-gb|en-uk|british english|uk english|england)\b/.test(lower)) {
+        out.isSpecific = true;
+        out.axis = 'locale';
+        out.requestedFacetKeys = ['en-gb'];
+        return out;
+      }
+    }
+    if (lang === 'fr') {
+      if (/\b(fr-ca|quebec|québec|canadian french|french canadian|qc)\b/.test(lower)) {
+        out.isSpecific = true;
+        out.axis = 'locale';
+        out.requestedFacetKeys = ['fr-ca'];
+        return out;
+      }
+    }
+
+    // 4) explicit accent mention => accent specificity (best-effort)
+    if (hasExplicitAccentMention(text)) {
+      const reqLoc = getRequestedLocale(text, { target_voice_language: lang });
+      const reqAcc = getRequestedAccent(text, { target_voice_language: lang }, reqLoc);
+      const key = normalizeCatalogToken(reqAcc);
+      if (key) {
+        out.isSpecific = true;
+        out.axis = 'accent';
+        out.requestedFacetKeys = [key];
+        return out;
+      }
+    }
+
+    return out;
+  } catch (_) {
+    return { isSpecific: false, axis: null, requestedFacetKeys: [], minResults: 10 };
+  }
 }
 
 function preferredLocalesForChineseDialect(dialect) {
@@ -3441,6 +3613,122 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   } catch (_) {}
 
   // -------------------------------------------------------------
+  // LLM keyword translation/expansion (for search=) – improves recall outside EN
+  // -------------------------------------------------------------
+  async function expandSearchKeywordsWithLLM(targetIso2, keywords, traceCb2) {
+    const trace2 = typeof traceCb2 === 'function' ? traceCb2 : () => {};
+    try {
+      const iso = (targetIso2 || '').toString().toLowerCase().slice(0, 2);
+      if (!iso || iso === 'en') return keywords;
+      if (!readEnvBoolean('ENABLE_LLM_KEYWORD_TRANSLATION', true)) return keywords;
+      if (!process.env.OPENAI_API_KEY) return keywords;
+
+      const src = Array.isArray(keywords) ? keywords : [];
+      const compact = src.map((k) => normalizeKw(k)).filter(Boolean).slice(0, 10);
+      if (compact.length === 0) return keywords;
+
+      const MAX_ADDED = 10; // keep search tight; do not over-dilute
+      const out = [];
+      const missing = [];
+      const now = Date.now();
+      let addedSoFar = 0;
+
+      for (const kw of compact) {
+        out.push(kw);
+        const cacheKey = `${iso}|${kw}`;
+        const hit = keywordTranslateCache.get(cacheKey);
+        if (hit && now - (hit.at || 0) < KEYWORD_TRANSLATE_TTL_MS && Array.isArray(hit.out)) {
+          for (const t of hit.out) {
+            if (addedSoFar >= MAX_ADDED) break;
+            const v = normalizeKw(t);
+            if (v) {
+              out.push(v);
+              addedSoFar++;
+            }
+          }
+        } else {
+          missing.push(kw);
+        }
+      }
+
+      if (missing.length) {
+        const system = [
+          'You translate keyword search tokens for a voice library search.',
+          'Return JSON only.',
+          'json',
+          '',
+          'Rules:',
+          '- Translate to the target language given by iso2 (2-letter).',
+          '- Keep outputs short (1-3 words), lowercase, no punctuation.',
+          '- Return up to 3 translations/synonyms per input token.',
+          '',
+          'Return format:',
+          '{ "translations": { "<src>": ["<t1>","<t2>"] } }'
+        ].join('\n');
+
+        const payload = {
+          model: 'gpt-4o-mini',
+          response_format: { type: 'json_object' },
+          messages: [
+            { role: 'system', content: system },
+            {
+              role: 'user',
+              content:
+                'json\n' +
+                JSON.stringify({
+                  iso2: iso,
+                  keywords: missing
+                })
+            }
+          ],
+          temperature: 0
+        };
+
+        const resp = await httpPostWithRetry('https://api.openai.com/v1/chat/completions', payload, {
+          headers: {
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: 20000
+        });
+        const content = resp?.data?.choices?.[0]?.message?.content || '{}';
+        const data = JSON.parse(content);
+        const tr = data && typeof data === 'object' ? data.translations || {} : {};
+
+        let added = 0;
+        for (const srcKw of missing) {
+          const arr = Array.isArray(tr?.[srcKw]) ? tr[srcKw] : [];
+          const cleaned = dedupePreserveOrder(arr.map((x) => normalizeKw(x)).filter(Boolean)).slice(0, 3);
+          const cacheKey = `${iso}|${srcKw}`;
+          keywordTranslateCache.set(cacheKey, { at: Date.now(), iso2: iso, src: srcKw, out: cleaned });
+          for (const t of cleaned) {
+            if (addedSoFar >= MAX_ADDED) break;
+            out.push(t);
+            added++;
+            addedSoFar++;
+          }
+          if (addedSoFar >= MAX_ADDED) break;
+        }
+
+        try {
+          trace2({ stage: 'keyword_translate', params: { iso2: iso, inputs: String(missing.length), added: String(added) }, count: added });
+        } catch (_) {}
+      }
+
+      return dedupePreserveOrder(out).slice(0, 18);
+    } catch (e) {
+      safeLogAxiosError('keyword_translate', e);
+      return keywords;
+    }
+  }
+
+  try {
+    if (language) {
+      selectedKeywords = await expandSearchKeywordsWithLLM(language, selectedKeywords, trace);
+    }
+  } catch (_) {}
+
+  // -------------------------------------------------------------
   // Facet browse mode (UI-like): split results per accent/locale
   // -------------------------------------------------------------
   // Goal: for ANY language with multiple variants in FacetKB, avoid mixing variants by
@@ -3462,14 +3750,37 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
 
     if (canFacetBrowse) {
       const zhDialect = language === 'zh' ? detectChineseDialectFromText(userText) : null;
-      const axis =
-        language === 'zh' && zhDialect
-          ? 'accent'
-          : (facetKB.getAxisForIso2 ? facetKB.getAxisForIso2(language) : null);
-      const maxVariants = axis === 'locale' ? 4 : 6;
-      const variants = facetKB.getFacetVariants ? facetKB.getFacetVariants(language, axis, { maxVariants }) : [];
+      const variantIntent = detectVariantIntent(userText, language, facetKB);
+      const axis = variantIntent?.isSpecific
+        ? (variantIntent.axis || 'accent')
+        : (language === 'zh' && zhDialect ? 'accent' : (facetKB.getAxisForIso2 ? facetKB.getAxisForIso2(language) : null));
+      const maxVariants = 4;
+      let variants = [];
+      if (variantIntent && variantIntent.isSpecific && Array.isArray(variantIntent.requestedFacetKeys) && variantIntent.requestedFacetKeys.length) {
+        const built = [];
+        for (const k of variantIntent.requestedFacetKeys) {
+          const v = facetKB.getVariantForFacetKey ? facetKB.getVariantForFacetKey(language, axis, k) : null;
+          if (v) built.push(v);
+        }
+        variants = built;
+      } else {
+        variants = facetKB.getFacetVariants ? facetKB.getFacetVariants(language, axis, { maxVariants }) : [];
+      }
 
-      if (axis && Array.isArray(variants) && variants.length >= 2) {
+      try {
+        trace({
+          stage: 'variant_intent',
+          params: {
+            iso2: language,
+            specific: variantIntent && variantIntent.isSpecific ? 'true' : 'false',
+            axis: variantIntent && variantIntent.axis ? String(variantIntent.axis) : '-',
+            requested: variantIntent && variantIntent.isSpecific ? (variantIntent.requestedFacetKeys || []).slice(0, 8).join(',') : '-'
+          }
+        });
+      } catch (_) {}
+
+      const minVariants = variantIntent && variantIntent.isSpecific ? 1 : 2;
+      if (axis && Array.isArray(variants) && variants.length >= minVariants) {
         const wantMore = detectListAll(userText) === true || plan.__listAll === true;
         const pageSize = wantMore ? 80 : 50;
         const featured = plan.__featured === true;
@@ -3490,6 +3801,8 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             params: {
               iso2: language,
               axis,
+              specific: variantIntent && variantIntent.isSpecific ? 'true' : 'false',
+              requested: variantIntent && variantIntent.isSpecific ? (variantIntent.requestedFacetKeys || []).slice(0, 6).join(',') : '-',
               variants: String(variants.length),
               page_size: String(pageSize),
               search: combinedSearch ? 'yes' : 'no'
@@ -3585,6 +3898,12 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
 
           for (const voice of fetched || []) {
             if (!voice || !voice.voice_id) continue;
+            // Tag for diagnostics/coverage
+            try {
+              const tag = `${axis}:${String(group.facetKey || '')}`;
+              if (!Array.isArray(voice._matched_keywords)) voice._matched_keywords = [];
+              if (!voice._matched_keywords.includes(tag)) voice._matched_keywords.push(tag);
+            } catch (_) {}
             if (!seenInGroup.has(voice.voice_id)) {
               seenInGroup.add(voice.voice_id);
               group.voices.push(voice);
@@ -3604,6 +3923,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
           allVoices.facetGroups = facetGroups;
           allVoices.facetAxis = axis;
           allVoices.facetIso2 = language;
+          allVoices.variantIntent = variantIntent;
           return allVoices;
         }
       }
@@ -4916,6 +5236,7 @@ function buildMessageFromSession(session) {
   try {
     const facetGroups = voices && Array.isArray(voices.facetGroups) ? voices.facetGroups : null;
     const facetAxis = voices && typeof voices.facetAxis === 'string' ? voices.facetAxis : null;
+    const variantIntent = voices && typeof voices.variantIntent === 'object' ? voices.variantIntent : null;
     if (facetGroups && facetGroups.length) {
       const maxPerGender =
         Number.isFinite(filters.limitPerGender) && filters.limitPerGender > 0
@@ -4969,7 +5290,27 @@ function buildMessageFromSession(session) {
         }
       };
 
-      for (const g of facetGroups) renderGroup(g);
+      // Strict mode: if user asked for a specific variant, show only that variant,
+      // plus STANDARD/OTHER only when results are insufficient.
+      if (variantIntent && variantIntent.isSpecific && Array.isArray(variantIntent.requestedFacetKeys)) {
+        const want = new Set(variantIntent.requestedFacetKeys.map((k) => (k || '').toString()));
+        const primary = facetGroups.filter((g) => g && want.has((g.facetKey || '').toString()));
+        const standard = facetGroups.find((g) => (g?.facetKey || '') === 'standard') || null;
+        const other = facetGroups.find((g) => (g?.facetKey || '') === '__other__' || String(g?.facetLabel || '').toUpperCase().includes('OTHER')) || null;
+
+        const primaryCount = primary.reduce((acc, g) => acc + (Array.isArray(g.voices) ? g.voices.length : 0), 0);
+        for (const g of primary) renderGroup(g);
+
+        if (primaryCount < (variantIntent.minResults || 10) && standard && Array.isArray(standard.voices) && standard.voices.length) {
+          renderGroup(standard);
+        }
+        const afterStd = primaryCount + (standard && standard.voices ? standard.voices.length : 0);
+        if (afterStd < (variantIntent.minResults || 10) && other && Array.isArray(other.voices) && other.voices.length) {
+          renderGroup(other);
+        }
+      } else {
+        for (const g of facetGroups) renderGroup(g);
+      }
       return out.join('\n');
     }
   } catch (_) {}
