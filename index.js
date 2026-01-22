@@ -137,6 +137,10 @@ const STATIC_LANGUAGE_ALIASES = new Map([
   ['italian', 'it'],
   ['japanese', 'ja'],
   ['korean', 'ko'],
+  // Chinese
+  ['chinese', 'zh'],
+  ['mandarin', 'zh'],
+  ['cantonese', 'zh'],
   ['portuguese', 'pt'],
   ['português', 'pt'],
   ['portugues', 'pt'],
@@ -329,7 +333,180 @@ function parseUserLanguageHints(userText) {
     }
   }
 
+  // 5) fuzzy language/alias matching (bounded, conservative)
+  try {
+    const tokens = tokenizeForTypos(lower, { minLen: 5 });
+    if (tokens.length) {
+      const candidates = dedupePreserveOrder([
+        ...((languageIndex.namesSorted || []).filter(Boolean) || []),
+        ...Array.from(STATIC_LANGUAGE_ALIASES.keys()).map((x) => normalizeLangName(x)).filter(Boolean)
+      ]).filter((c) => c.length >= 4);
+
+      let best = null; // { token, match, dist }
+
+      for (const tok of tokens) {
+        // Only try to correct single-word alphabetic-ish tokens
+        if (!/^[a-z0-9]{5,}$/i.test(tok)) continue;
+        const maxDist = maxTypoDistanceForToken(tok);
+        const sugg = suggestClosest(tok, candidates, { maxDist, maxSuggestions: 2 });
+        for (const m of sugg) {
+          if (!m || m === tok) continue;
+          const d = boundedLevenshtein(tok, m, maxDist);
+          if (d > maxDist) continue;
+          if (!best || d < best.dist || (d === best.dist && m.length < best.match.length)) {
+            best = { token: tok, match: m, dist: d };
+          }
+        }
+      }
+
+      if (best && best.match) {
+        const name = normalizeLangName(best.match);
+        const iso2 = languageIndex.byName.get(name) || STATIC_LANGUAGE_ALIASES.get(name) || null;
+        if (iso2) {
+          let locale = null;
+          if (iso2 === 'pt') {
+            if (/\b(brazil|brasil|brazilian|brasile|pt-br)\b/.test(lower)) locale = 'pt-BR';
+            if (/\b(portugal|european|pt-pt|pt-eu)\b/.test(lower)) locale = 'pt-PT';
+          }
+          if (iso2 === 'es') {
+            if (/\b(mexico|mexican|mx|es-mx)\b/.test(lower)) locale = 'es-MX';
+            if (/\b(spain|castilian|es-es)\b/.test(lower)) locale = 'es-ES';
+            if (/\b(latam|latin america|latinamerican|es-419)\b/.test(lower)) locale = 'es-419';
+          }
+          if (iso2 === 'zh') {
+            if (/\b(zh-tw|taiwan|traditional)\b/.test(lower)) locale = 'zh-TW';
+            else if (/\b(zh-hk|hong\s*kong|hk)\b/.test(lower)) locale = 'zh-HK';
+            else if (/\b(zh-cn|china|mainland|simplified|cn)\b/.test(lower)) locale = 'zh-CN';
+          }
+          return {
+            iso2,
+            locale,
+            explicit: true,
+            reason: 'fuzzy_language',
+            typo_from: best.token,
+            typo_to: name
+          };
+        }
+      }
+    }
+  } catch (_) {}
+
   return { iso2: null, locale: null, explicit: false, reason: 'none' };
+}
+
+// -------------------------------------------------------------
+// Typo-tolerant matching helpers (conservative, bounded)
+// -------------------------------------------------------------
+
+function dedupePreserveOrder(list) {
+  const out = [];
+  const seen = new Set();
+  for (const it of Array.isArray(list) ? list : []) {
+    const v = (it || '').toString();
+    if (!v) continue;
+    if (seen.has(v)) continue;
+    seen.add(v);
+    out.push(v);
+  }
+  return out;
+}
+
+function tokenizeForTypos(text, { minLen = 5 } = {}) {
+  try {
+    const s = (text || '')
+      .toString()
+      .toLowerCase()
+      .normalize('NFKD')
+      .replace(/[\u0300-\u036f]/g, ''); // strip diacritics
+    const raw = s.split(/[^a-z0-9]+/g).filter(Boolean);
+    const tokens = raw.filter((t) => t.length >= minLen);
+    return dedupePreserveOrder(tokens);
+  } catch (_) {
+    return [];
+  }
+}
+
+function isSingleAdjacentTransposition(a, b) {
+  if (!a || !b) return false;
+  if (a.length !== b.length) return false;
+  let i = 0;
+  while (i < a.length && a[i] === b[i]) i++;
+  if (i >= a.length - 1) return false;
+  if (a[i] !== b[i + 1] || a[i + 1] !== b[i]) return false;
+  for (let j = i + 2; j < a.length; j++) {
+    if (a[j] !== b[j]) return false;
+  }
+  return true;
+}
+
+function boundedLevenshtein(a, b, maxDist) {
+  const s = (a || '').toString();
+  const t = (b || '').toString();
+  const n = s.length;
+  const m = t.length;
+  if (maxDist == null) maxDist = 2;
+  if (s === t) return 0;
+  if (!n) return m;
+  if (!m) return n;
+  if (Math.abs(n - m) > maxDist) return maxDist + 1;
+  if (isSingleAdjacentTransposition(s, t)) return 1;
+
+  // Classic DP with early-exit on row minimum (bounded)
+  let prev = new Array(m + 1);
+  let curr = new Array(m + 1);
+  for (let j = 0; j <= m; j++) prev[j] = j;
+
+  for (let i = 1; i <= n; i++) {
+    curr[0] = i;
+    let rowMin = curr[0];
+    const si = s.charCodeAt(i - 1);
+    for (let j = 1; j <= m; j++) {
+      const cost = si === t.charCodeAt(j - 1) ? 0 : 1;
+      const del = prev[j] + 1;
+      const ins = curr[j - 1] + 1;
+      const sub = prev[j - 1] + cost;
+      const v = del < ins ? (del < sub ? del : sub) : ins < sub ? ins : sub;
+      curr[j] = v;
+      if (v < rowMin) rowMin = v;
+    }
+    if (rowMin > maxDist) return maxDist + 1;
+    const tmp = prev;
+    prev = curr;
+    curr = tmp;
+  }
+  return prev[m];
+}
+
+function maxTypoDistanceForToken(token) {
+  const n = (token || '').toString().length;
+  if (n >= 9) return 3;
+  return 2;
+}
+
+function suggestClosest(term, candidates, { maxDist = 2, maxSuggestions = 2 } = {}) {
+  const w = (term || '').toString().toLowerCase().trim();
+  if (!w || !Array.isArray(candidates) || candidates.length === 0) return [];
+  const best = [];
+  let bestDist = maxDist + 1;
+
+  for (const c of candidates) {
+    const cand = (c || '').toString().toLowerCase().trim();
+    if (!cand) continue;
+    if (cand === w) return [cand];
+    if (Math.abs(cand.length - w.length) > maxDist) continue;
+    const d = boundedLevenshtein(w, cand, maxDist);
+    if (d > maxDist) continue;
+    if (d < bestDist) {
+      bestDist = d;
+      best.length = 0;
+      best.push({ cand, d });
+    } else if (d === bestDist) {
+      best.push({ cand, d });
+    }
+  }
+
+  best.sort((a, b) => a.cand.length - b.cand.length || a.cand.localeCompare(b.cand));
+  return best.slice(0, Math.max(1, maxSuggestions)).map((x) => x.cand);
 }
 
 // -------------------------------------------------------------
@@ -763,6 +940,12 @@ function getRequestedLocale(userText, keywordPlan) {
     if (/\b(mexico|mexican|es-mx|mx)\b/.test(lower)) return 'es-MX';
     if (/\b(spain|castilian|es-es)\b/.test(lower)) return 'es-ES';
     if (/\b(latam|latin america|latinamerican|es-419)\b/.test(lower)) return 'es-419';
+    // Broader LATAM signals (user phrasing)
+    if (/\b(latino|latin(?:o)? american|south american|central american|caribbean)\b/.test(lower) && /\b(spanish|es)\b/.test(lower)) {
+      return 'es-419';
+    }
+    // European Spanish phrasing
+    if (/\b(european)\b/.test(lower) && /\b(spanish|es)\b/.test(lower)) return 'es-ES';
   }
   if (iso2 === 'fr') {
     if (/\b(fr-ca|french canadian|canadian french|quebec|québec|qc)\b/.test(lower)) return 'fr-CA';
@@ -780,6 +963,11 @@ function hasExplicitAccentMention(userText) {
     'british',
     'mexican',
     'castilian',
+    'latin american',
+    'latam',
+    'latino',
+    'european spanish',
+    'spanish (spain)',
     'brazilian',
     'european portuguese',
     'portuguese (portugal)',
@@ -1878,9 +2066,7 @@ IMPORTANT:
     plan.quality_preference = qp || 'any';
 
     // Accent as soft preference unless explicitly mentioned by user
-    const accentRegex =
-      /\b(american|british|uk|us|australian|irish|scottish|canadian|polish)\b/i;
-    const explicitAccent = accentRegex.test(userText || '');
+    const explicitAccent = hasExplicitAccentMention(userText);
     if (!explicitAccent) {
       plan.target_accent = null;
     }
@@ -2127,6 +2313,68 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     selectedKeywords = filtered.slice(0, MAX_KEYWORD_QUERIES);
   }
 
+  // Hybrid keyword search: run "as typed" + "corrected" (bounded budget)
+  const CORRECTION_BUDGET = 4;
+  let searchQueue = [];
+  try {
+    const correctionCandidates = dedupePreserveOrder([
+      ...((languageIndex.namesSorted || []).filter(Boolean) || []),
+      ...Array.from(STATIC_LANGUAGE_ALIASES.keys())
+        .map((x) => normalizeLangName(x))
+        .filter(Boolean)
+    ]).filter((c) => c.length >= 4);
+
+    const corrected = [];
+    const usedKw = new Set();
+    for (const kw of selectedKeywords) {
+      const k = normalizeKw(kw);
+      if (!k) continue;
+      if (k.includes(' ')) continue; // don't try to correct phrases
+      if (!/^[a-z0-9]{5,}$/i.test(k)) continue;
+      const maxDist = maxTypoDistanceForToken(k);
+      const sugg = suggestClosest(k, correctionCandidates, { maxDist, maxSuggestions: 2 });
+      const best = (sugg || []).find((s) => s && s !== k);
+      if (!best) continue;
+      const kwUsed = normalizeKw(best);
+      if (!kwUsed || kwUsed === k) continue;
+      if (usedKw.has(kwUsed)) continue;
+      usedKw.add(kwUsed);
+      corrected.push({
+        kw_original: k,
+        kw_used: kwUsed,
+        variant: 'corrected',
+        typo_from: k,
+        typo_to: kwUsed
+      });
+      if (corrected.length >= CORRECTION_BUDGET) break;
+    }
+
+    const origBudget = Math.max(0, MAX_KEYWORD_QUERIES - corrected.length);
+    const originals = selectedKeywords.slice(0, origBudget);
+    const usedFinal = new Set(originals.map((k) => normalizeKw(k)));
+    const correctedFinal = corrected.filter((c) => !usedFinal.has(normalizeKw(c.kw_used)));
+    correctedFinal.forEach((c) => usedFinal.add(normalizeKw(c.kw_used)));
+
+    searchQueue = [
+      ...originals.map((k) => ({
+        kw_original: k,
+        kw_used: k,
+        variant: 'as_typed',
+        typo_from: null,
+        typo_to: null
+      })),
+      ...correctedFinal
+    ];
+  } catch (_) {
+    searchQueue = selectedKeywords.map((k) => ({
+      kw_original: k,
+      kw_used: k,
+      variant: 'as_typed',
+      typo_from: null,
+      typo_to: null
+    }));
+  }
+
   // 1) separate search for EACH keyword, with limited concurrency
   async function runWithLimit(items, limit, worker) {
     const results = new Array(items.length);
@@ -2149,10 +2397,33 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     return results;
   }
 
+  function generateKeywordVariants(kw) {
+    const k = normalizeKw(kw);
+    if (!k) return [];
+    const out = [];
+    // Special-case: drive-thru variants
+    if (k.includes('drive-thru') || k.includes('drive thru') || k.includes('drivethru')) {
+      out.push('drive thru', 'drivethru', 'drive through', 'drive-thru');
+    }
+    // Generic hyphenated variant(s)
+    if (k.includes('-')) {
+      out.push(k.replace(/-/g, ' ').replace(/\s+/g, ' ').trim());
+      out.push(k.replace(/-/g, ''));
+    }
+    // De-dupe and remove self
+    return dedupePreserveOrder(out.map(normalizeKw).filter((v) => v && v !== k)).slice(0, 3);
+  }
+
   const perKeywordResults = await runWithLimit(
-    selectedKeywords,
+    searchQueue,
     KEYWORD_SEARCH_CONCURRENCY,
-    async (kw) => {
+    async (kwEntry) => {
+      const kwOriginal = normalizeKw(kwEntry?.kw_original ?? kwEntry);
+      const kwUsed = normalizeKw(kwEntry?.kw_used ?? kwEntry);
+      const variant = kwEntry?.variant || 'as_typed';
+      const typoFrom = kwEntry?.typo_from || null;
+      const typoTo = kwEntry?.typo_to || null;
+
       const params = new URLSearchParams();
       params.set('page_size', '40');
       const appended = appendQueryFiltersToParams(params, plan, userText, {
@@ -2164,7 +2435,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
         sort: typeof plan.__sort === 'string' ? plan.__sort : null,
         forceUseCases: plan.__forceUseCases === true
       });
-      params.set('search', kw);
+      params.set('search', kwUsed);
       try {
         // Emit gates trace only when gate signature changes (or inline into per_keyword)
         const inlineGates = readEnvBoolean('TRACE_GATES_INLINE', false);
@@ -2176,7 +2447,8 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             try {
               trace({
                 stage: 'gates',
-                keyword: kw,
+                keyword: kwUsed,
+                variant,
                 params: {
                   use_cases: String(ucLen),
                   descriptives: String(descLen),
@@ -2199,6 +2471,39 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             return voices;
           });
         }
+
+        // Keyword variants retry (only when base query returns 0)
+        if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0) {
+          try {
+            const variants = generateKeywordVariants(kwUsed);
+            for (const vKw of variants) {
+              const pVar = new URLSearchParams(params.toString());
+              pVar.set('search', vKw);
+              let vVoices = [];
+              try {
+                vVoices = await callSharedVoices(pVar);
+              } catch (_) {}
+              try {
+                trace({
+                  stage: 'per_keyword_variant',
+                  keyword: vKw,
+                  variant: 'retry_variant',
+                  kw_original: kwOriginal,
+                  typo_from: kwUsed,
+                  typo_to: vKw,
+                  params: paramsToObject(pVar),
+                  count: Array.isArray(vVoices) ? vVoices.length : 0
+                });
+              } catch (_) {}
+              if (Array.isArray(vVoices) && vVoices.length > 0) {
+                voicesForKeyword = vVoices;
+                // Keep kwUsed as the canonical keyword for this result set; we record the successful variant via trace.
+                break;
+              }
+            }
+          } catch (_) {}
+        }
+
         try {
           const baseParams = paramsToObject(params);
           if (inlineGates) {
@@ -2207,7 +2512,11 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
           }
           trace({
             stage: 'per_keyword',
-            keyword: kw,
+            keyword: kwUsed,
+            variant,
+            kw_original: kwOriginal,
+            typo_from: typoFrom,
+            typo_to: typoTo,
             params: baseParams,
             count: Array.isArray(voicesForKeyword) ? voicesForKeyword.length : 0
           });
@@ -2234,7 +2543,11 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
                 try {
                   trace({
                     stage: 'per_keyword_alt_use_cases',
-                    keyword: kw,
+                    keyword: kwUsed,
+                    variant,
+                    kw_original: kwOriginal,
+                    typo_from: typoFrom,
+                    typo_to: typoTo,
                     params: paramsToObject(pAlt),
                     count: Array.isArray(altVoices) ? altVoices.length : 0
                   });
@@ -2261,7 +2574,11 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
               try {
                 trace({
                   stage: 'per_keyword_relax_descriptives',
-                  keyword: kw,
+                  keyword: kwUsed,
+                  variant,
+                  kw_original: kwOriginal,
+                  typo_from: typoFrom,
+                  typo_to: typoTo,
                   params: paramsToObject(p2),
                   count: Array.isArray(v2) ? v2.length : 0
                 });
@@ -2285,7 +2602,11 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             try {
               trace({
                 stage: 'per_keyword_relax_descriptives',
-                keyword: kw,
+                keyword: kwUsed,
+                variant,
+                kw_original: kwOriginal,
+                typo_from: typoFrom,
+                typo_to: typoTo,
                 params: paramsToObject(p2),
                 count: Array.isArray(v2) ? v2.length : 0
               });
@@ -2308,7 +2629,11 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
               try {
                 trace({
                   stage: 'per_keyword_relax_use_cases',
-                  keyword: kw,
+                  keyword: kwUsed,
+                  variant,
+                  kw_original: kwOriginal,
+                  typo_from: typoFrom,
+                  typo_to: typoTo,
                   params: paramsToObject(p3),
                   count: Array.isArray(v3) ? v3.length : 0
                 });
@@ -2329,7 +2654,11 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             try {
               trace({
                 stage: 'per_keyword_quick_relax',
-                keyword: kw,
+                keyword: kwUsed,
+                variant,
+                kw_original: kwOriginal,
+                typo_from: typoFrom,
+                typo_to: typoTo,
                 params: paramsToObject(pQuick),
                 count: Array.isArray(vQuick) ? vQuick.length : 0
               });
@@ -2339,10 +2668,24 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
         }
         // Note: we do NOT retry with non-ISO language aliases (e.g., "french").
         // Requests must use ISO 639-1 language codes only.
-        return { kw, voices: voicesForKeyword || [] };
+        return {
+          kw: kwUsed,
+          kw_original: kwOriginal,
+          variant,
+          typo_from: typoFrom,
+          typo_to: typoTo,
+          voices: voicesForKeyword || []
+        };
       } catch (err) {
-        console.error('Error fetching voices for keyword:', kw, err.message || err);
-        return { kw, voices: [] };
+        console.error('Error fetching voices for keyword:', kwUsed, err.message || err);
+        return {
+          kw: kwUsed,
+          kw_original: kwOriginal,
+          variant,
+          typo_from: typoFrom,
+          typo_to: typoTo,
+          voices: []
+        };
       }
     }
   );
@@ -2350,7 +2693,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   // merge results
   perKeywordResults.forEach((res) => {
     if (!res || !Array.isArray(res.voices)) return;
-    const kw = res.kw;
+    const kw = res.kw_original || res.kw;
     res.voices.forEach((voice) => {
       if (!voice || !voice.voice_id) return;
       let entry = seen.get(voice.voice_id);
@@ -3568,6 +3911,12 @@ function inferLocale(language, accent, userText) {
   if (lang === 'es') {
     if (acc.includes('mexican') || acc.includes('mx')) return 'es-MX';
     if (acc.includes('castilian') || acc.includes('spain')) return 'es-ES';
+    // LATAM / Latino signals (prefer locale over accent)
+    if (/\b(es-419|latam|latin america|latinamerican|latino|latin(?:o)? american|south american|central american|caribbean)\b/.test(lower)) {
+      return 'es-419';
+    }
+    // European Spanish phrasing
+    if (/\b(european)\b/.test(lower) && /\b(spanish|es)\b/.test(lower)) return 'es-ES';
   }
   if (lang === 'pt') {
     if (/\b(pt-br|brazil|brasil|brazilian|brasile)\b/.test(lower) || acc.includes('brazil')) return 'pt-BR';
@@ -3606,6 +3955,10 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
     (/\b(canadian|quebec|québec|fr-ca|qc|french canadian|canadian french)\b/.test(lowerText));
   const isSpanishMexico = (language === 'es' || /spanish|es\b/.test(lowerText)) &&
     (/\bmexico\b|\bmexican\b|\bes-mx\b|\bmx\b/.test(lowerText));
+  const isSpanishLatam = (language === 'es' || /spanish|es\b/.test(lowerText)) &&
+    (/\b(es-419|latam|latin america|latinamerican|latino|latin(?:o)? american|south american|central american|caribbean)\b/.test(lowerText));
+  const isSpanishSpain = (language === 'es' || /spanish|es\b/.test(lowerText)) &&
+    (/\b(spain|castilian|es-es)\b/.test(lowerText) || (/\b(european)\b/.test(lowerText) && /\bspanish\b/.test(lowerText)));
   const age =
     typeof options.age === 'string' && options.age
       ? options.age
@@ -3620,6 +3973,8 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   } else if (isFrenchCanadian) {
     // Prefer locale=fr-CA over hard accent filtering (accent metadata can be inconsistent)
     // Keep accent as a soft preference via keywords/ranking, not as a strict query param.
+  } else if (isSpanishLatam || isSpanishSpain) {
+    // Prefer locale-based regionalization for Spanish (accent metadata can be inconsistent)
   } else if (accent && shouldApplyParam('accent', plan, userText)) {
     params.set('accent', accent);
   }
@@ -3666,6 +4021,16 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
     params.set('locale', 'es-MX');
     loc = 'es-MX';
   }
+  // Force es-419 locale for LATAM Spanish briefs
+  if (isSpanishLatam && !isSpanishMexico) {
+    params.set('locale', 'es-419');
+    loc = 'es-419';
+  }
+  // Force es-ES locale for European/Spain Spanish briefs
+  if (isSpanishSpain && !isSpanishMexico) {
+    params.set('locale', 'es-ES');
+    loc = 'es-ES';
+  }
   // Force fr-CA locale for French Canadian briefs
   if (isFrenchCanadian) {
     params.set('locale', 'fr-CA');
@@ -3683,7 +4048,7 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
     featured,
     age,
     sort,
-    localeInferred: Boolean(isSpanishMexico),
+    localeInferred: Boolean(isSpanishMexico || isSpanishLatam || isSpanishSpain),
     bilingual: Boolean(isBilingualEnEs),
     negatives: banned || []
   };
@@ -3955,14 +4320,70 @@ function buildSearchReport(trace, plan, mode, summary) {
       lines.push('_No trace entries collected._');
       return lines.join('\n');
     }
+
+    // Typo/hybrid summary (derived from trace)
+    try {
+      const typoEvents = trace.filter(
+        (t) =>
+          t &&
+          typeof t === 'object' &&
+          (t.stage === 'per_keyword' ||
+            t.stage === 'per_keyword_alt_use_cases' ||
+            t.stage === 'per_keyword_relax_descriptives' ||
+            t.stage === 'per_keyword_relax_use_cases' ||
+            t.stage === 'per_keyword_quick_relax') &&
+          t.variant === 'corrected' &&
+          t.typo_from &&
+          t.typo_to
+      );
+      if (typoEvents.length) {
+        lines.push(`Typos: corrected_queries=${typoEvents.length}`);
+        const byPair = new Map();
+        typoEvents.forEach((e) => {
+          const k = `${e.typo_from}→${e.typo_to}`;
+          byPair.set(k, (byPair.get(k) || 0) + 1);
+        });
+        const topPairs = Array.from(byPair.entries())
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 5);
+        if (topPairs.length) {
+          lines.push('Top corrections:');
+          topPairs.forEach(([pair, count]) => lines.push(`• ${pair}: ${count}`));
+        }
+        lines.push('');
+      }
+    } catch (_) {}
+
+    // Locale usage summary (derived from trace params)
+    try {
+      const locales = new Set();
+      for (const t of trace) {
+        const loc = t?.params?.locale;
+        if (loc) locales.add(String(loc));
+      }
+      if (locales.size) {
+        const hasEsEs = locales.has('es-ES');
+        const hasEs419 = locales.has('es-419');
+        const hasEsMx = locales.has('es-MX');
+        if (hasEsEs || hasEs419 || hasEsMx) {
+          lines.push(`Locales: es-ES=${hasEsEs ? 'yes' : 'no'}, es-419=${hasEs419 ? 'yes' : 'no'}, es-MX=${hasEsMx ? 'yes' : 'no'}`);
+          lines.push('');
+        }
+      }
+    } catch (_) {}
+
     const max = Math.min(trace.length, 30);
     for (let i = 0; i < max; i++) {
       const t = trace[i];
       const params = t.params ? Object.entries(t.params).map(([k, v]) => `${k}=${v}`).join('&') : '';
+      const vTag = t.variant ? ` [${t.variant}]` : '';
+      const cTag = t.typo_from && t.typo_to ? ` (${t.typo_from}→${t.typo_to})` : '';
       if (t.stage === 'per_keyword') {
-        lines.push(`• per_keyword: "${t.keyword}" (${params}) → ${t.count}`);
+        lines.push(`• per_keyword: "${t.keyword}"${vTag}${cTag} (${params}) → ${t.count}`);
       } else if (t.stage === 'per_keyword_alt_use_cases') {
-        lines.push(`• per_keyword_alt_use_cases: "${t.keyword}" (${params}) → ${t.count}`);
+        lines.push(`• per_keyword_alt_use_cases: "${t.keyword}"${vTag}${cTag} (${params}) → ${t.count}`);
+      } else if (t.stage === 'per_keyword_variant') {
+        lines.push(`• per_keyword_variant: "${t.keyword}"${vTag}${cTag} (${params}) → ${t.count}`);
       } else if (t.stage === 'combined') {
         lines.push(`• combined (${params}) → ${t.count}`);
       } else if (t.stage === 'broad') {
@@ -4035,6 +4456,12 @@ function runDevAsserts() {
   devAssert(h5.iso2 === 'ja', 'static alias: japanese -> ja');
   const h6 = parseUserLanguageHints('korean');
   devAssert(h6.iso2 === 'ko', 'static alias: korean -> ko');
+
+  // Chinese aliases + typo correction
+  const h7 = parseUserLanguageHints('mandarin');
+  devAssert(h7.iso2 === 'zh', 'static alias: mandarin -> zh');
+  const h8 = parseUserLanguageHints('mandarian');
+  devAssert(h8.iso2 === 'zh', 'fuzzy language: mandarian -> zh');
 
   // Locale normalization (UI aliases -> canonical)
   devAssert(normalizeRequestedLocale('PT-EU') === 'pt-PT', 'normalize PT-EU -> pt-PT');
