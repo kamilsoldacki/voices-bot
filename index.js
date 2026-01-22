@@ -981,6 +981,45 @@ function hasExplicitAccentMention(userText) {
   return implicit.some((t) => lower.includes(t));
 }
 
+// -------------------------------------------------------------
+// Dialect helpers (Chinese: Mandarin vs Cantonese)
+// -------------------------------------------------------------
+
+function detectChineseDialectFromText(userText) {
+  const lower = (userText || '').toString().toLowerCase();
+  const hasCantonese =
+    /\b(cantonese|canton)\b/.test(lower) ||
+    /\b(zh-hk)\b/.test(lower) ||
+    /\b(hong\s*kong|hongkong)\b/.test(lower) ||
+    lower.includes('粤语');
+  const hasMandarin =
+    /\b(mandarin|putonghua)\b/.test(lower) ||
+    /\b(zh-cn)\b/.test(lower) ||
+    /\b(mainland|simplified)\b/.test(lower) ||
+    /\b(china)\b/.test(lower) ||
+    lower.includes('普通话');
+
+  if (hasCantonese && !hasMandarin) return 'cantonese';
+  if (hasMandarin && !hasCantonese) return 'mandarin';
+  return null;
+}
+
+function preferredLocalesForChineseDialect(dialect) {
+  if (dialect === 'cantonese') return ['zh-HK', 'zh-TW'];
+  if (dialect === 'mandarin') return ['zh-CN'];
+  return [];
+}
+
+function dialectKeywordHints(dialect) {
+  if (dialect === 'cantonese') {
+    return ['cantonese', 'hong kong', 'hk', 'zh-hk', 'traditional', 'canton'];
+  }
+  if (dialect === 'mandarin') {
+    return ['mandarin', 'putonghua', 'china', 'mainland', 'zh-cn', 'simplified'];
+  }
+  return [];
+}
+
 function getRequestedAccent(userText, keywordPlan, requestedLocale) {
   try {
     const text = (userText || '').toString();
@@ -2313,6 +2352,27 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     selectedKeywords = filtered.slice(0, MAX_KEYWORD_QUERIES);
   }
 
+  // Dialect-aware keyword shaping (soft): when user asks for Cantonese/Mandarin,
+  // spend less budget on very generic tokens and add dialect/region hints.
+  try {
+    const dialect = language === 'zh' ? detectChineseDialectFromText(userText) : null;
+    if (dialect) {
+      const hints = dialectKeywordHints(dialect);
+      const generic = new Set(['voice', 'accent', 'audiobook', 'narration']);
+      // Drop generic tokens unless explicitly present in user text
+      const trimmed = (selectedKeywords || []).filter((k) => {
+        const nk = normalizeKw(k);
+        if (!generic.has(nk)) return true;
+        return explicitlyMentionedInText(nk, userText);
+      });
+      const merged = dedupePreserveOrder([
+        ...hints,
+        ...trimmed
+      ]).filter(Boolean);
+      selectedKeywords = merged.slice(0, MAX_KEYWORD_QUERIES);
+    }
+  } catch (_) {}
+
   // Hybrid keyword search: run "as typed" + "corrected" (bounded budget)
   const CORRECTION_BUDGET = 4;
   let searchQueue = [];
@@ -2967,6 +3027,10 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   }
 
   // Candidate ranking prep: coverage score + diversity seeding before cap
+  const chineseDialect = language === 'zh' ? detectChineseDialectFromText(userText) : null;
+  const preferredZhLocales = preferredLocalesForChineseDialect(chineseDialect).map((x) => String(x).toLowerCase());
+  const dialectHints = new Set(dialectKeywordHints(chineseDialect).map(normalizeKw));
+
   function calcCoverageScore(v) {
     const mk = Array.isArray(v._matched_keywords) ? v._matched_keywords : [];
     const set = new Set(mk);
@@ -3012,6 +3076,34 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
         coverage += 0.5;
       }
     } catch (_) {}
+
+    // Dialect boost for Chinese (soft): reward matching dialect keywords and matching locale
+    try {
+      if (chineseDialect) {
+        const mkNorm = mk.map(normalizeKw);
+        const hasDialectKw = mkNorm.some((k) => k === chineseDialect || dialectHints.has(k));
+        if (hasDialectKw) coverage += 1.2;
+
+        const vLoc = (v.locale || '').toString().toLowerCase();
+        if (preferredZhLocales.length && vLoc) {
+          if (preferredZhLocales.includes(vLoc)) coverage += 0.8;
+        }
+
+        // Conservative fallback from visible metadata (when locale missing)
+        const blob = (
+          (v.name || '') + ' ' +
+          (v.description || '') + ' ' +
+          (v.descriptive || '') + ' ' +
+          (v.accent || '')
+        ).toString().toLowerCase();
+        if (chineseDialect === 'cantonese') {
+          if (/\b(hong\s*kong|hongkong|zh-hk|cantonese)\b/.test(blob) || blob.includes('粤语')) coverage += 0.4;
+        } else if (chineseDialect === 'mandarin') {
+          if (/\b(zh-cn|china|mainland|simplified|mandarin|putonghua)\b/.test(blob) || blob.includes('普通话')) coverage += 0.4;
+        }
+      }
+    } catch (_) {}
+
     // bilingual boost: verified EN+ES
     try {
       const vlangs = Array.isArray(v.verified_languages) ? v.verified_languages : [];
@@ -3246,6 +3338,9 @@ Think like a human curator:
    - Language & accent:
      - If target_voice_language is set, strongly prefer that language.
      - If target_accent is set (e.g. "american"), prefer voices with matching accent or naming.
+     - If the user explicitly asks for a Chinese dialect (e.g. "cantonese" or "mandarin"), treat it as a strong constraint:
+       - Strongly reward candidates whose matched_keywords include that dialect or its obvious region hints (e.g. hong kong, zh-hk for cantonese; china, zh-cn for mandarin).
+       - Prefer locale matches when present (zh-HK for cantonese; zh-CN for mandarin).
 
    - Gender:
      - If target_gender is clear, reward matching voices and slightly penalize opposite gender.
@@ -3927,6 +4022,12 @@ function inferLocale(language, accent, userText) {
       return 'fr-CA';
     }
   }
+  if (lang === 'zh') {
+    // Dialect-ish locale preferences (soft; metadata may be sparse)
+    if (/\b(zh-hk|hong\s*kong|hongkong|cantonese|hk)\b/.test(lower) || lower.includes('粤语')) return 'zh-HK';
+    if (/\b(zh-tw|taiwan|traditional)\b/.test(lower)) return 'zh-TW';
+    if (/\b(zh-cn|china|mainland|simplified|mandarin|putonghua|cn)\b/.test(lower) || lower.includes('普通话')) return 'zh-CN';
+  }
   return null;
 }
 
@@ -3950,6 +4051,8 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   const forceDescriptives = options.forceDescriptives === true;
   const lowerText = (userText || '').toLowerCase();
   const isBilingualEnEs = detectBilingualEnEs(userText);
+  const chineseDialect = detectChineseDialectFromText(userText);
+  const chinesePreferredLocales = preferredLocalesForChineseDialect(chineseDialect);
   const isFrenchCanadian =
     (language === 'fr' || /\bfrench\b|\bfr\b/.test(lowerText)) &&
     (/\b(canadian|quebec|québec|fr-ca|qc|french canadian|canadian french)\b/.test(lowerText));
@@ -3975,6 +4078,8 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
     // Keep accent as a soft preference via keywords/ranking, not as a strict query param.
   } else if (isSpanishLatam || isSpanishSpain) {
     // Prefer locale-based regionalization for Spanish (accent metadata can be inconsistent)
+  } else if (language === 'zh' && chineseDialect) {
+    // Prefer locale-based hinting for Mandarin vs Cantonese (soft)
   } else if (accent && shouldApplyParam('accent', plan, userText)) {
     params.set('accent', accent);
   }
@@ -4036,6 +4141,14 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
     params.set('locale', 'fr-CA');
     loc = 'fr-CA';
   }
+  // Prefer dialect locale for Chinese (soft; only if allowed to apply locale)
+  if (language === 'zh' && chineseDialect && chinesePreferredLocales.length && shouldApplyParam('locale', plan, userText)) {
+    // Only set if not already set by other logic
+    if (!loc) {
+      params.set('locale', chinesePreferredLocales[0]);
+      loc = chinesePreferredLocales[0];
+    }
+  }
 
   if (featured && shouldApplyParam('featured', plan, userText, { featured })) params.set('featured', 'true');
   if (age && shouldApplyParam('age', plan, userText)) params.set('age', age);
@@ -4048,7 +4161,7 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
     featured,
     age,
     sort,
-    localeInferred: Boolean(isSpanishMexico || isSpanishLatam || isSpanishSpain),
+    localeInferred: Boolean(isSpanishMexico || isSpanishLatam || isSpanishSpain || (language === 'zh' && chineseDialect)),
     bilingual: Boolean(isBilingualEnEs),
     negatives: banned || []
   };
@@ -4369,6 +4482,26 @@ function buildSearchReport(trace, plan, mode, summary) {
           lines.push(`Locales: es-ES=${hasEsEs ? 'yes' : 'no'}, es-419=${hasEs419 ? 'yes' : 'no'}, es-MX=${hasEsMx ? 'yes' : 'no'}`);
           lines.push('');
         }
+        // Chinese dialect locales
+        const hasZhHk = locales.has('zh-HK');
+        const hasZhCn = locales.has('zh-CN');
+        const hasZhTw = locales.has('zh-TW');
+        if (hasZhHk || hasZhCn || hasZhTw) {
+          lines.push(`Locales: zh-HK=${hasZhHk ? 'yes' : 'no'}, zh-CN=${hasZhCn ? 'yes' : 'no'}, zh-TW=${hasZhTw ? 'yes' : 'no'}`);
+          lines.push('');
+        }
+      }
+    } catch (_) {}
+
+    // Dialect usage summary (derived from per_keyword entries)
+    try {
+      const kwEntries = trace.filter((t) => t && (t.stage === 'per_keyword' || t.stage === 'per_keyword_variant'));
+      const keys = kwEntries.map((t) => String(t.keyword || '').toLowerCase());
+      const cantoneseCount = keys.filter((k) => k.includes('cantonese') || k.includes('zh-hk') || k.includes('hong kong') || k.includes('hk')).length;
+      const mandarinCount = keys.filter((k) => k.includes('mandarin') || k.includes('putonghua') || k.includes('zh-cn') || k.includes('mainland') || k.includes('simplified')).length;
+      if (cantoneseCount || mandarinCount) {
+        lines.push(`Dialect queries: cantonese_like=${cantoneseCount}, mandarin_like=${mandarinCount}`);
+        lines.push('');
       }
     } catch (_) {}
 
