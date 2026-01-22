@@ -697,6 +697,89 @@ class FacetKB {
     return m ? m.get(a) || null : null;
   }
 
+  _canonicalizeLocaleForApi(normLocale) {
+    // Input is normalized like: "pt-br", "es-419", "cmn-cn"
+    const s = (normLocale || '').toString().trim().toLowerCase();
+    if (!s) return null;
+    const m = s.match(/^([a-z]{2,3})-([a-z]{2}|\d{3})$/i);
+    if (!m) return null;
+    const lang = m[1].toLowerCase();
+    const reg = /^\d{3}$/.test(m[2]) ? m[2] : m[2].toUpperCase();
+    return `${lang}-${reg}`;
+  }
+
+  _canonicalizeLocaleLabel(normLocale) {
+    // Prefer UI-friendly casing; for now keep tag-like output
+    const api = this._canonicalizeLocaleForApi(normLocale);
+    return api || String(normLocale || '');
+  }
+
+  getAxisForIso2(iso2) {
+    const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    if (!k) return null;
+    const localeCount = (this.allowedLocalesByIso2.get(k) || new Set()).size;
+    const accentCount = (this.allowedAccentsByIso2.get(k) || new Set()).size;
+
+    // Prefer locale when it meaningfully partitions and stays small (2–6).
+    if (localeCount >= 2 && localeCount <= 6) return 'locale';
+    // Otherwise prefer accents when available.
+    if (accentCount >= 2) return 'accent';
+    // Fallback: if locale exists but is large, still show a few locales rather than hundreds of accents (rare).
+    if (localeCount >= 2) return 'locale';
+    if (accentCount >= 1) return 'accent';
+    return null;
+  }
+
+  getFacetVariants(iso2, axis, { maxVariants = 6 } = {}) {
+    const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    const ax = (axis || '').toString();
+    const maxN = Math.max(1, Math.min(15, Number(maxVariants) || 6));
+    if (!k) return [];
+
+    if (ax === 'locale') {
+      const list = this.suggestLocales(k, '', { limit: Math.max(2, Math.min(8, maxN)) }) || [];
+      return list.slice(0, Math.min(8, maxN)).map((x) => {
+        const norm = (x?.norm || x?.locale || '').toString();
+        const apiLocale = this._canonicalizeLocaleForApi(norm) || norm;
+        return {
+          facetType: 'locale',
+          facetKey: norm,
+          facetValue: apiLocale,
+          facetLabel: this._canonicalizeLocaleLabel(norm)
+        };
+      });
+    }
+
+    if (ax === 'accent') {
+      const top = this._getTopAccents(k) || [];
+      // Keep top by popularity, but cap. Always try to include "standard" if present.
+      const out = [];
+      const seen = new Set();
+      const push = (it) => {
+        if (!it) return;
+        const key = it.norm || it.accent;
+        if (!key || seen.has(key)) return;
+        seen.add(key);
+        out.push({
+          facetType: 'accent',
+          facetKey: it.norm,
+          facetValue: it.accent, // name form (spaces) – usually safest for API
+          facetLabel: it.accent,
+          slug: it.slug || null,
+          count: it.count || 0
+        });
+      };
+      // include standard early if popular
+      const standard = top.find((x) => x && x.norm === 'standard');
+      // Sort already by count; start with top N then ensure standard included
+      for (const it of top.slice(0, maxN)) push(it);
+      if (standard) push(standard);
+      return out.slice(0, maxN);
+    }
+
+    return [];
+  }
+
   // Suggest locales for a language (no popularity data; deterministic ordering)
   suggestLocales(iso2, userText, { limit = 3 } = {}) {
     const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
@@ -740,7 +823,8 @@ class FacetKB {
         return out.length ? [...out, ...list.filter((x) => !out.some((y) => y.norm === x.norm))] : list;
       }
       if (k === 'zh') {
-        const pri = ['zh-cn', 'zh-tw', 'zh-hk', 'cmn-cn', 'cmn-tw'];
+        // Prefer cmn-* because that's what facets.json currently exposes for zh.
+        const pri = ['cmn-cn', 'cmn-tw', 'zh-cn', 'zh-tw', 'zh-hk'];
         const out = [];
         for (const p of pri) {
           const hit = list.find((x) => x.norm === p);
@@ -3356,6 +3440,154 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     }
   } catch (_) {}
 
+  // -------------------------------------------------------------
+  // Facet browse mode (UI-like): split results per accent/locale
+  // -------------------------------------------------------------
+  // Goal: for ANY language with multiple variants in FacetKB, avoid mixing variants by
+  // fetching per-variant candidate pools (bounded number of requests) and returning
+  // facetGroups alongside the combined candidate list.
+  try {
+    const canFacetBrowse =
+      language &&
+      !detectBilingualEnEs(userText) &&
+      facetKB &&
+      facetKB.isLoaded &&
+      facetKB.isLoaded() &&
+      facetKB.hasIso2 &&
+      facetKB.hasIso2(language) &&
+      !(
+        (plan.target_accent && typeof plan.target_accent === 'string' && plan.target_accent.trim()) ||
+        (plan.target_locale && typeof plan.target_locale === 'string' && plan.target_locale.trim())
+      );
+
+    if (canFacetBrowse) {
+      const axis = facetKB.getAxisForIso2 ? facetKB.getAxisForIso2(language) : null;
+      const maxVariants = axis === 'locale' ? 4 : 6;
+      const variants = facetKB.getFacetVariants ? facetKB.getFacetVariants(language, axis, { maxVariants }) : [];
+
+      if (axis && Array.isArray(variants) && variants.length >= 2) {
+        const wantMore = detectListAll(userText) === true || plan.__listAll === true;
+        const pageSize = wantMore ? 80 : 50;
+        const featured = plan.__featured === true;
+        const sort = typeof plan.__sort === 'string' ? plan.__sort : null;
+        const age = detectAgeFromText(userText);
+
+        // Use a compact combined search string to keep relevance (single query per variant)
+        const combinedSearch = (selectedKeywords || []).slice(0, 6).join(' ').trim();
+
+        let requestBudget = 15;
+        const facetGroups = [];
+        const allVoices = [];
+        const allSeen = new Set();
+
+        try {
+          trace({
+            stage: 'facet_browse',
+            params: {
+              iso2: language,
+              axis,
+              variants: String(variants.length),
+              page_size: String(pageSize),
+              search: combinedSearch ? 'yes' : 'no'
+            }
+          });
+        } catch (_) {}
+
+        const fetchOnce = async (params, meta) => {
+          if (requestBudget <= 0) return [];
+          requestBudget -= 1;
+          let voices = [];
+          try {
+            voices = wantMore
+              ? await callSharedVoicesAllPages(params, { maxPages: 1, cap: pageSize })
+              : await callSharedVoicesCached(params, async (p) => {
+                  const { voices } = await callSharedVoicesRaw(p);
+                  return voices;
+                });
+          } catch (_) {
+            voices = [];
+          }
+          try {
+            trace({
+              stage: 'facet_variant',
+              params: { ...meta, ...paramsToObject(params) },
+              count: Array.isArray(voices) ? voices.length : 0
+            });
+          } catch (_) {}
+          return Array.isArray(voices) ? voices : [];
+        };
+
+        for (const v of variants) {
+          if (!v || requestBudget <= 0) break;
+          const group = {
+            facetType: v.facetType,
+            facetKey: v.facetKey,
+            facetLabel: v.facetLabel,
+            voices: []
+          };
+
+          const seenInGroup = new Set();
+          const base = new URLSearchParams();
+          base.set('page_size', String(pageSize));
+          base.set('language', String(language));
+          if (gender) base.set('gender', gender);
+          if (qualityPref === 'high_only') base.set('category', 'high_quality');
+          if (featured) base.set('featured', 'true');
+          if (age) base.set('age', age);
+          if (sort) base.set('sort', sort);
+          if (combinedSearch) base.set('search', combinedSearch);
+
+          let fetched = [];
+          if (axis === 'locale' && v.facetType === 'locale') {
+            const p = new URLSearchParams(base.toString());
+            p.set('locale', String(v.facetValue || v.facetLabel || ''));
+            fetched = await fetchOnce(p, { iso2: language, axis: 'locale', facet: String(v.facetLabel || v.facetValue || '') });
+          } else if (axis === 'accent' && v.facetType === 'accent') {
+            // Try accent NAME first, then slug (some APIs are picky)
+            const nameVal = String(v.facetValue || v.facetLabel || '').trim();
+            if (nameVal) {
+              const p1 = new URLSearchParams(base.toString());
+              p1.set('accent', nameVal);
+              fetched = await fetchOnce(p1, { iso2: language, axis: 'accent', accent_mode: 'name', facet: nameVal });
+            }
+            if ((!fetched || fetched.length === 0) && v.slug) {
+              const slugVal = String(v.slug || '').trim();
+              if (slugVal && slugVal !== nameVal) {
+                const p2 = new URLSearchParams(base.toString());
+                p2.set('accent', slugVal);
+                const v2 = await fetchOnce(p2, { iso2: language, axis: 'accent', accent_mode: 'slug', facet: slugVal });
+                if (Array.isArray(v2) && v2.length) fetched = v2;
+              }
+            }
+          }
+
+          for (const voice of fetched || []) {
+            if (!voice || !voice.voice_id) continue;
+            if (!seenInGroup.has(voice.voice_id)) {
+              seenInGroup.add(voice.voice_id);
+              group.voices.push(voice);
+            }
+            if (!allSeen.has(voice.voice_id)) {
+              allSeen.add(voice.voice_id);
+              allVoices.push(voice);
+            }
+          }
+
+          facetGroups.push(group);
+        }
+
+        // If we got anything at all, return early with groups.
+        if (allVoices.length) {
+          // Attach groups as metadata on the returned array (keeps callers compatible)
+          allVoices.facetGroups = facetGroups;
+          allVoices.facetAxis = axis;
+          allVoices.facetIso2 = language;
+          return allVoices;
+        }
+      }
+    }
+  } catch (_) {}
+
   // Hybrid keyword search: run "as typed" + "corrected" (bounded budget)
   const CORRECTION_BUDGET = 4;
   let searchQueue = [];
@@ -4258,6 +4490,128 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     voices = voices.slice(0, 120);
   }
 
+  // Facet fallback grouping: if language has multiple variants, attach facetGroups
+  // even when we used keyword search (keeps output from mixing variants).
+  try {
+    const canGroup =
+      language &&
+      facetKB &&
+      facetKB.isLoaded &&
+      facetKB.isLoaded() &&
+      facetKB.hasIso2 &&
+      facetKB.hasIso2(language) &&
+      !(
+        (plan.target_accent && typeof plan.target_accent === 'string' && plan.target_accent.trim()) ||
+        (plan.target_locale && typeof plan.target_locale === 'string' && plan.target_locale.trim())
+      );
+
+    if (canGroup && Array.isArray(voices) && voices.length) {
+      const axis = facetKB.getAxisForIso2 ? facetKB.getAxisForIso2(language) : null;
+      const maxVariants = axis === 'locale' ? 4 : 6;
+      const variants = facetKB.getFacetVariants ? facetKB.getFacetVariants(language, axis, { maxVariants }) : [];
+
+      if (axis && Array.isArray(variants) && variants.length >= 2) {
+        const normLocaleLoose = (val) => {
+          const s = (val || '').toString().trim().toLowerCase().replace(/_/g, '-').replace(/\s+/g, '');
+          const m = s.match(/^([a-z]{2,3})-([a-z]{2}|\d{3})$/i);
+          if (!m) return null;
+          const lang = m[1].toLowerCase();
+          const reg = /^\d{3}$/.test(m[2]) ? m[2] : m[2].toLowerCase();
+          return `${lang}-${reg}`;
+        };
+
+        const topKeys = new Set(variants.map((v) => v && v.facetKey).filter(Boolean));
+        const groups = new Map(); // facetKey -> { facetType, facetKey, facetLabel, voices: [] }
+        const otherKey = '__other__';
+
+        const initGroup = (k, label) => {
+          if (!groups.has(k)) {
+            groups.set(k, { facetType: axis, facetKey: k, facetLabel: label, voices: [] });
+          }
+          return groups.get(k);
+        };
+
+        // Pre-create groups in variant order
+        for (const v of variants) {
+          if (!v || !v.facetKey) continue;
+          initGroup(v.facetKey, v.facetLabel || v.facetKey);
+        }
+        initGroup(otherKey, 'OTHER / UNSURE');
+
+        const allowedAccents = facetKB.allowedAccentsByIso2?.get?.(language) || new Set();
+        const allowedLocales = facetKB.allowedLocalesByIso2?.get?.(language) || new Set();
+
+        const pickFacetKeyForVoice = (voice) => {
+          if (!voice) return otherKey;
+          if (axis === 'accent') {
+            const accs = [];
+            // verified accents for this iso2
+            const verified = Array.isArray(voice.verified_languages) ? voice.verified_languages : [];
+            for (const e of verified) {
+              const el = extractIso2FromLanguageField(e?.language);
+              if (el !== language) continue;
+              const a = normalizeCatalogToken(e?.accent);
+              if (a) accs.push(a);
+            }
+            const topA = normalizeCatalogToken(voice?.accent);
+            if (topA) accs.push(topA);
+            for (const a of accs) {
+              if (allowedAccents.has(a) && topKeys.has(a)) return a;
+            }
+            return otherKey;
+          }
+          if (axis === 'locale') {
+            const locs = [];
+            const verified = Array.isArray(voice.verified_languages) ? voice.verified_languages : [];
+            for (const e of verified) {
+              const el = extractIso2FromLanguageField(e?.language);
+              if (el !== language) continue;
+              const l1 = normLocaleLoose(e?.locale);
+              if (l1) locs.push(l1);
+              const l2 = normLocaleLoose(e?.language);
+              if (l2) locs.push(l2);
+            }
+            const topL = normLocaleLoose(voice?.locale);
+            if (topL) locs.push(topL);
+            for (const l of locs) {
+              if (allowedLocales.has(l) && topKeys.has(l)) return l;
+            }
+            return otherKey;
+          }
+          return otherKey;
+        };
+
+        for (const v of voices) {
+          const k = pickFacetKeyForVoice(v);
+          const g = groups.get(k) || groups.get(otherKey);
+          g.voices.push(v);
+        }
+
+        const facetGroups = [];
+        for (const v of variants) {
+          const k = v?.facetKey;
+          const g = k ? groups.get(k) : null;
+          if (g && Array.isArray(g.voices) && g.voices.length) facetGroups.push(g);
+        }
+        const other = groups.get(otherKey);
+        if (other && other.voices && other.voices.length) facetGroups.push(other);
+
+        if (facetGroups.length) {
+          voices.facetGroups = facetGroups;
+          voices.facetAxis = axis;
+          voices.facetIso2 = language;
+          try {
+            trace({
+              stage: 'facet_fallback_grouping',
+              params: { iso2: language, axis, groups: String(facetGroups.length) },
+              count: voices.length
+            });
+          } catch (_) {}
+        }
+      }
+    }
+  } catch (_) {}
+
   return voices;
 }
 
@@ -4527,6 +4881,68 @@ Every candidate_voices.voice_id MUST appear exactly once in "ranking".
 function buildMessageFromSession(session) {
   const { voices, ranking, filters, originalQuery } = session;
   const labels = getLabels();
+
+  // Facet sections (locale/accent) – UI-like grouping
+  try {
+    const facetGroups = voices && Array.isArray(voices.facetGroups) ? voices.facetGroups : null;
+    const facetAxis = voices && typeof voices.facetAxis === 'string' ? voices.facetAxis : null;
+    if (facetGroups && facetGroups.length) {
+      const maxPerGender =
+        Number.isFinite(filters.limitPerGender) && filters.limitPerGender > 0
+          ? filters.limitPerGender
+          : (filters.listAll ? 25 : 6);
+
+      const qualityFilter = filters.quality || 'any';
+      const genderFilter = filters.gender || 'any';
+
+      const out = [];
+
+      const renderGroup = (group) => {
+        const gVoices = Array.isArray(group?.voices) ? group.voices : [];
+        if (!gVoices.length) return;
+
+        const title = `${String(facetAxis || group.facetType || 'facet').toUpperCase()}: ${String(group.facetLabel || group.facetKey || '').toUpperCase()}`;
+        out.push('```' + title + '```');
+
+        const sorted = [...gVoices].sort((a, b) => (ranking?.[b.voice_id] || 0) - (ranking?.[a.voice_id] || 0));
+        const uniq = [];
+        const seen = new Set();
+        for (const v of sorted) {
+          if (v && v.voice_id && !seen.has(v.voice_id)) {
+            seen.add(v.voice_id);
+            uniq.push(v);
+          }
+        }
+
+        const buckets = { female: [], male: [], other: [] };
+        for (const v of uniq) {
+          const isHq = isHighQuality(v);
+          if (qualityFilter === 'high_only' && !isHq) continue;
+          if (qualityFilter === 'no_high' && isHq) continue;
+          const g = getGenderGroup(v);
+          if (genderFilter !== 'any' && g !== genderFilter) continue;
+          if (buckets[g].length < maxPerGender) buckets[g].push(v);
+        }
+
+        const order = genderFilter !== 'any' ? [genderFilter] : ['female', 'male', 'other'];
+        const genderLabels = { female: labels.female, male: labels.male, other: labels.other };
+        for (const k of order) {
+          const arr = buckets[k] || [];
+          if (!arr.length) continue;
+          out.push(`*${genderLabels[k]}:*`);
+          for (const v of arr) {
+            const isHq = isHighQuality(v);
+            const prefix = qualityFilter === 'any' && isHq ? '[HQ] ' : '';
+            out.push(`- ${prefix}${formatVoiceLine(v)}`);
+          }
+          out.push('');
+        }
+      };
+
+      for (const g of facetGroups) renderGroup(g);
+      return out.join('\n');
+    }
+  } catch (_) {}
 
   const maxPerGender =
     Number.isFinite(filters.limitPerGender) && filters.limitPerGender > 0
