@@ -3461,7 +3461,11 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
       );
 
     if (canFacetBrowse) {
-      const axis = facetKB.getAxisForIso2 ? facetKB.getAxisForIso2(language) : null;
+      const zhDialect = language === 'zh' ? detectChineseDialectFromText(userText) : null;
+      const axis =
+        language === 'zh' && zhDialect
+          ? 'accent'
+          : (facetKB.getAxisForIso2 ? facetKB.getAxisForIso2(language) : null);
       const maxVariants = axis === 'locale' ? 4 : 6;
       const variants = facetKB.getFacetVariants ? facetKB.getFacetVariants(language, axis, { maxVariants }) : [];
 
@@ -3472,7 +3476,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
         const sort = typeof plan.__sort === 'string' ? plan.__sort : null;
         const age = detectAgeFromText(userText);
 
-        // Use a compact combined search string to keep relevance (single query per variant)
+        // Hybrid facet browse: pass 1 without `search` (UI-like facets), pass 2 with `search` only if needed.
         const combinedSearch = (selectedKeywords || []).slice(0, 6).join(' ').trim();
 
         let requestBudget = 15;
@@ -3535,27 +3539,45 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
           if (featured) base.set('featured', 'true');
           if (age) base.set('age', age);
           if (sort) base.set('sort', sort);
-          if (combinedSearch) base.set('search', combinedSearch);
+          // pass 1: no search
 
           let fetched = [];
           if (axis === 'locale' && v.facetType === 'locale') {
             const p = new URLSearchParams(base.toString());
             p.set('locale', String(v.facetValue || v.facetLabel || ''));
-            fetched = await fetchOnce(p, { iso2: language, axis: 'locale', facet: String(v.facetLabel || v.facetValue || '') });
+            fetched = await fetchOnce(p, { iso2: language, axis: 'locale', pass: 'no_search', facet: String(v.facetLabel || v.facetValue || '') });
+            if ((!fetched || fetched.length < 3) && combinedSearch && requestBudget > 0) {
+              const p2 = new URLSearchParams(p.toString());
+              p2.set('search', combinedSearch);
+              const v2 = await fetchOnce(p2, { iso2: language, axis: 'locale', pass: 'with_search', facet: String(v.facetLabel || v.facetValue || '') });
+              if (Array.isArray(v2) && v2.length > fetched.length) fetched = v2;
+            }
           } else if (axis === 'accent' && v.facetType === 'accent') {
             // Try accent NAME first, then slug (some APIs are picky)
             const nameVal = String(v.facetValue || v.facetLabel || '').trim();
             if (nameVal) {
               const p1 = new URLSearchParams(base.toString());
               p1.set('accent', nameVal);
-              fetched = await fetchOnce(p1, { iso2: language, axis: 'accent', accent_mode: 'name', facet: nameVal });
+              fetched = await fetchOnce(p1, { iso2: language, axis: 'accent', accent_mode: 'name', pass: 'no_search', facet: nameVal });
+              if ((!fetched || fetched.length < 3) && combinedSearch && requestBudget > 0) {
+                const p1s = new URLSearchParams(p1.toString());
+                p1s.set('search', combinedSearch);
+                const v1s = await fetchOnce(p1s, { iso2: language, axis: 'accent', accent_mode: 'name', pass: 'with_search', facet: nameVal });
+                if (Array.isArray(v1s) && v1s.length > fetched.length) fetched = v1s;
+              }
             }
             if ((!fetched || fetched.length === 0) && v.slug) {
               const slugVal = String(v.slug || '').trim();
               if (slugVal && slugVal !== nameVal) {
                 const p2 = new URLSearchParams(base.toString());
                 p2.set('accent', slugVal);
-                const v2 = await fetchOnce(p2, { iso2: language, axis: 'accent', accent_mode: 'slug', facet: slugVal });
+                let v2 = await fetchOnce(p2, { iso2: language, axis: 'accent', accent_mode: 'slug', pass: 'no_search', facet: slugVal });
+                if ((!v2 || v2.length < 3) && combinedSearch && requestBudget > 0) {
+                  const p2s = new URLSearchParams(p2.toString());
+                  p2s.set('search', combinedSearch);
+                  const v2s = await fetchOnce(p2s, { iso2: language, axis: 'accent', accent_mode: 'slug', pass: 'with_search', facet: slugVal });
+                  if (Array.isArray(v2s) && v2s.length > v2.length) v2 = v2s;
+                }
                 if (Array.isArray(v2) && v2.length) fetched = v2;
               }
             }
@@ -4506,7 +4528,11 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
       );
 
     if (canGroup && Array.isArray(voices) && voices.length) {
-      const axis = facetKB.getAxisForIso2 ? facetKB.getAxisForIso2(language) : null;
+      const zhDialect = language === 'zh' ? detectChineseDialectFromText(userText) : null;
+      const axis =
+        language === 'zh' && zhDialect
+          ? 'accent'
+          : (facetKB.getAxisForIso2 ? facetKB.getAxisForIso2(language) : null);
       const maxVariants = axis === 'locale' ? 4 : 6;
       const variants = facetKB.getFacetVariants ? facetKB.getFacetVariants(language, axis, { maxVariants }) : [];
 
@@ -4774,6 +4800,8 @@ Think like a human curator:
 
 Return ONLY:
 
+Return valid JSON.
+
 {
   "user_language": string,    // 2-letter code like "en","pl" for the language of the user's query
   "ranking": [
@@ -4795,7 +4823,9 @@ Every candidate_voices.voice_id MUST appear exactly once in "ranking".
       { role: 'system', content: systemPrompt },
       {
         role: 'user',
-        content: JSON.stringify({
+        content:
+          'json\n' +
+          JSON.stringify({
           user_query: userText,
           keyword_plan: keywordPlan,
           candidate_voices: candidates
@@ -5491,9 +5521,11 @@ function inferLocale(language, accent, userText) {
   }
   if (lang === 'zh') {
     // Dialect-ish locale preferences (soft; metadata may be sparse)
-    if (/\b(zh-hk|hong\s*kong|hongkong|cantonese|hk)\b/.test(lower) || lower.includes('粤语')) return 'zh-HK';
-    if (/\b(zh-tw|taiwan|traditional)\b/.test(lower)) return 'zh-TW';
-    if (/\b(zh-cn|china|mainland|simplified|mandarin|putonghua|cn)\b/.test(lower) || lower.includes('普通话')) return 'zh-CN';
+    // FacetKB for zh exposes cmn-CN/cmn-TW (and usually no HK locale). Prefer those.
+    if (/\b(zh-tw|taiwan|traditional)\b/.test(lower)) return 'cmn-TW';
+    if (/\b(zh-cn|china|mainland|simplified|mandarin|putonghua|cn)\b/.test(lower) || lower.includes('普通话')) return 'cmn-CN';
+    // Cantonese has no reliable locale in FacetKB; keep locale unset and rely on accent facets.
+    if (/\b(zh-hk|hong\s*kong|hongkong|cantonese|hk)\b/.test(lower) || lower.includes('粤语')) return null;
   }
   return null;
 }
@@ -5522,6 +5554,22 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   const chineseDialect = detectChineseDialectFromText(userText);
   const chinesePreferredLocales = (() => {
     try {
+      // Prefer FacetKB locales for zh (cmn-*) when available; AccentCatalog uses zh-*.
+      if (language === 'zh' && facetKB && facetKB.isLoaded && facetKB.isLoaded() && facetKB.allowedLocalesByIso2) {
+        const set = facetKB.allowedLocalesByIso2.get('zh');
+        const has = (x) => !!(set && set.has(normalizeLocaleToken(x)));
+        if (chineseDialect === 'mandarin') {
+          if (has('cmn-CN')) return ['cmn-CN'];
+          if (has('zh-CN')) return ['zh-CN'];
+        }
+        if (chineseDialect === 'cantonese') {
+          // if there's no Cantonese locale in facets, return empty to avoid catalog reject loops
+          return [];
+        }
+        // default preference
+        if (has('cmn-CN')) return ['cmn-CN'];
+        if (has('cmn-TW')) return ['cmn-TW'];
+      }
       if (language === 'zh' && accentCatalog && typeof accentCatalog.getPreferredChineseLocales === 'function') {
         const list = accentCatalog.getPreferredChineseLocales(chineseDialect);
         if (Array.isArray(list) && list.length) return list;
