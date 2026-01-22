@@ -1,0 +1,1920 @@
+{
+  "meta": {
+    "generated_at": "2026-01-22T11:33:55.587088+00:00",
+    "base_url": "https://api.us.elevenlabs.io/v1",
+    "sort": "created_date",
+    "page_size": 100,
+    "max_pages": 80,
+    "include_custom_rates": false,
+    "ui_slugs": true
+  },
+  "verify": {
+    "af": {
+      "language_code": "af",
+      "accents": {}
+    },
+    "ar": {
+      "language_code": "ar",
+      "accents": {
+        "modern standard": {
+          "count": 191,
+          "matched_query": "modern standard",
+          "slug": "modern-standard"
+        },
+        "egyptian": {
+          "count": 18,
+          "matched_query": "egyptian",
+          "slug": "egyptian"
+        },
+        "tunisian": {
+          "count": 2,
+          "matched_query": "tunisian",
+          "slug": "tunisian"
+        },
+        "levantine": {
+          "count": 6,
+          "matched_query": "levantine",
+          "slug": "levantine"
+        },
+        "saudi": {
+          "count": 9,
+          "matched_query": "saudi",
+          "slug": "saudi"
+        },
+        "syrian": {
+          "count": 2,
+          "matched_query": "syrian",
+          "slug": "syrian"
+        },
+        "gulf": {
+          "count": 3,
+          "matched_query": "gulf",
+          "slug": "gulf"
+        },
+        "algerian": {
+          "count": 1,
+          "matched_query": "algerian",
+          "slug": "algerian"
+        },
+        "palestinian": {
+          "count": 2,
+          "matched_query": "palestinian",
+          "slug": "palestinian"
+        },
+        "moroccan": {
+          "count": 4,
+          "matched_query": "moroccan",
+          "slug": "moroccan"
+        },
+        "jordanian": {
+          "count": 2,
+          "matched_query": "jordanian",
+          "slug": "jordanian"
+        },
+        "kuwaiti": {
+          "count": 2,
+          "matched_query": "kuwaiti",
+          "slug": "kuwaiti"
+        },
+        "modern": {
+          "count": 44,
+          "matched_query": "modern",
+          "slug": "modern"
+        }
+      }
+    },
+    "hy": {
+      "language_code": "hy",
+      "accents": {}
+    },
+    "as": {
+      "language_code": "as",
+      "accents": {}
+    },
+    "az": {
+      "language_code": "az",
+      "accents": {}
+    },
+    "be": {
+      "language_code": "be",
+      "accents": {}
+    },
+    "bn": {
+      "language_code": "bn",
+      "accents": {}
+    },
+    "bs": {
+      "language_code": "bs",
+      "accents": {}
+    },
+    "bg": {
+      "language_code": "bg",
+      "accents": {
+        "standard": {
+          "count": 87,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "sofia": {
+          "count": 3,
+          "matched_query": "sofia",
+          "slug": "sofia"
+        },
+        "central": {
+          "count": 45,
+          "matched_query": "central",
+          "slug": "central"
+        },
+        "southern": {
+          "count": 28,
+          "matched_query": "southern",
+          "slug": "southern"
+        }
+      }
+    },
+    "ca": {
+      "language_code": "ca",
+      "accents": {}
+    },
+    "ceb": {
+      "language_code": "ceb",
+      "accents": {}
+    },
+    "ny": {
+      "language_code": "ny",
+      "accents": {}
+    },
+    "zh": {
+      "language_code": "zh",
+      "accents": {
+        "beijing mandarin": {
+          "count": 18,
+          "matched_query": "beijing mandarin",
+          "slug": "beijing-mandarin"
+        },
+        "standard": {
+          "count": 103,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "taiwan mandarin": {
+          "count": 17,
+          "matched_query": "taiwan mandarin",
+          "slug": "taiwan-mandarin"
+        },
+        "singapore mandarin": {
+          "count": 1,
+          "matched_query": "singapore mandarin",
+          "slug": "singapore-mandarin"
+        },
+        "hong kong cantonese": {
+          "count": 2,
+          "matched_query": "hong kong cantonese",
+          "slug": "hong-kong-cantonese"
+        },
+        "southern": {
+          "count": 52,
+          "matched_query": "southern",
+          "slug": "southern"
+        },
+        "central": {
+          "count": 43,
+          "matched_query": "central",
+          "slug": "central"
+        },
+        "beijing": {
+          "count": 2,
+          "matched_query": "beijing",
+          "slug": "beijing"
+        },
+        "northern": {
+          "count": 23,
+          "matched_query": "northern",
+          "slug": "northern"
+        }
+      }
+    },
+    "hr": {
+      "language_code": "hr",
+      "accents": {
+        "standard": {
+          "count": 473,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "zagreb": {
+          "count": 16,
+          "matched_query": "zagreb",
+          "slug": "zagreb"
+        },
+        "central": {
+          "count": 259,
+          "matched_query": "central",
+          "slug": "central"
+        },
+        "southern": {
+          "count": 188,
+          "matched_query": "southern",
+          "slug": "southern"
+        },
+        "northern": {
+          "count": 156,
+          "matched_query": "northern",
+          "slug": "northern"
+        },
+        "dubrovnik": {
+          "count": 11,
+          "matched_query": "dubrovnik",
+          "slug": "dubrovnik"
+        },
+        "istrian": {
+          "count": 3,
+          "matched_query": "istrian",
+          "slug": "istrian"
+        }
+      }
+    },
+    "cs": {
+      "language_code": "cs",
+      "accents": {
+        "standard": {
+          "count": 321,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "prague": {
+          "count": 17,
+          "matched_query": "prague",
+          "slug": "prague"
+        },
+        "moravian": {
+          "count": 15,
+          "matched_query": "moravian",
+          "slug": "moravian"
+        },
+        "northern": {
+          "count": 95,
+          "matched_query": "northern",
+          "slug": "northern"
+        },
+        "silesian": {
+          "count": 3,
+          "matched_query": "silesian",
+          "slug": "silesian"
+        },
+        "southern": {
+          "count": 102,
+          "matched_query": "southern",
+          "slug": "southern"
+        },
+        "central": {
+          "count": 147,
+          "matched_query": "central",
+          "slug": "central"
+        }
+      }
+    },
+    "da": {
+      "language_code": "da",
+      "accents": {
+        "standard": {
+          "count": 267,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "copenhagen": {
+          "count": 28,
+          "matched_query": "copenhagen",
+          "slug": "copenhagen"
+        },
+        "zealandic": {
+          "count": 8,
+          "matched_query": "zealandic",
+          "slug": "zealandic"
+        },
+        "jutlandic": {
+          "count": 8,
+          "matched_query": "jutlandic",
+          "slug": "jutlandic"
+        },
+        "southern": {
+          "count": 114,
+          "matched_query": "southern",
+          "slug": "southern"
+        },
+        "central": {
+          "count": 146,
+          "matched_query": "central",
+          "slug": "central"
+        },
+        "northern": {
+          "count": 87,
+          "matched_query": "northern",
+          "slug": "northern"
+        }
+      }
+    },
+    "nl": {
+      "language_code": "nl",
+      "accents": {
+        "brabantian": {
+          "count": 9,
+          "matched_query": "brabantian",
+          "slug": "brabantian"
+        },
+        "standard": {
+          "count": 340,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "limburgish": {
+          "count": 12,
+          "matched_query": "limburgish",
+          "slug": "limburgish"
+        },
+        "flemish": {
+          "count": 79,
+          "matched_query": "flemish",
+          "slug": "flemish"
+        },
+        "southern": {
+          "count": 119,
+          "matched_query": "southern",
+          "slug": "southern"
+        },
+        "central": {
+          "count": 149,
+          "matched_query": "central",
+          "slug": "central"
+        },
+        "northern": {
+          "count": 89,
+          "matched_query": "northern",
+          "slug": "northern"
+        },
+        "gronings": {
+          "count": 1,
+          "matched_query": "gronings",
+          "slug": "gronings"
+        }
+      }
+    },
+    "en": {
+      "language_code": "en",
+      "accents": {
+        "canadian": {
+          "count": 142,
+          "matched_query": "canadian",
+          "slug": "canadian"
+        },
+        "american": {
+          "count": 1000,
+          "matched_query": "american",
+          "slug": "american"
+        },
+        "british": {
+          "count": 662,
+          "matched_query": "british",
+          "slug": "british"
+        },
+        "german": {
+          "count": 34,
+          "matched_query": "german",
+          "slug": "german"
+        },
+        "indian": {
+          "count": 462,
+          "matched_query": "indian",
+          "slug": "indian"
+        },
+        "australian": {
+          "count": 170,
+          "matched_query": "australian",
+          "slug": "australian"
+        },
+        "us midwest": {
+          "count": 26,
+          "matched_query": "us midwest",
+          "slug": "us-midwest"
+        },
+        "scottish": {
+          "count": 24,
+          "matched_query": "scottish",
+          "slug": "scottish"
+        },
+        "french": {
+          "count": 18,
+          "matched_query": "french",
+          "slug": "french"
+        },
+        "received pronunciation": {
+          "count": 19,
+          "matched_query": "received pronunciation",
+          "slug": "received-pronunciation"
+        },
+        "portuguese": {
+          "count": 10,
+          "matched_query": "portuguese",
+          "slug": "portuguese"
+        },
+        "african american": {
+          "count": 39,
+          "matched_query": "african american",
+          "slug": "african-american"
+        },
+        "singaporean": {
+          "count": 20,
+          "matched_query": "singaporean",
+          "slug": "singaporean"
+        },
+        "russian": {
+          "count": 16,
+          "matched_query": "russian",
+          "slug": "russian"
+        },
+        "filipino": {
+          "count": 35,
+          "matched_query": "filipino",
+          "slug": "filipino"
+        },
+        "greek": {
+          "count": 1,
+          "matched_query": "greek",
+          "slug": "greek"
+        },
+        "nigerian": {
+          "count": 80,
+          "matched_query": "nigerian",
+          "slug": "nigerian"
+        },
+        "chicago": {
+          "count": 3,
+          "matched_query": "chicago",
+          "slug": "chicago"
+        },
+        "south african": {
+          "count": 38,
+          "matched_query": "south african",
+          "slug": "south-african"
+        },
+        "spanish": {
+          "count": 24,
+          "matched_query": "spanish",
+          "slug": "spanish"
+        },
+        "danish": {
+          "count": 3,
+          "matched_query": "danish",
+          "slug": "danish"
+        },
+        "us southern": {
+          "count": 42,
+          "matched_query": "us southern",
+          "slug": "us-southern"
+        },
+        "new zealand": {
+          "count": 21,
+          "matched_query": "new zealand",
+          "slug": "new-zealand"
+        },
+        "chinese": {
+          "count": 15,
+          "matched_query": "chinese",
+          "slug": "chinese"
+        },
+        "dutch": {
+          "count": 14,
+          "matched_query": "dutch",
+          "slug": "dutch"
+        },
+        "polish": {
+          "count": 11,
+          "matched_query": "polish",
+          "slug": "polish"
+        },
+        "new york": {
+          "count": 16,
+          "matched_query": "new york",
+          "slug": "new-york"
+        },
+        "swedish": {
+          "count": 8,
+          "matched_query": "swedish",
+          "slug": "swedish"
+        },
+        "welsh": {
+          "count": 2,
+          "matched_query": "welsh",
+          "slug": "welsh"
+        },
+        "croatian": {
+          "count": 6,
+          "matched_query": "croatian",
+          "slug": "croatian"
+        },
+        "yorkshire": {
+          "count": 4,
+          "matched_query": "yorkshire",
+          "slug": "yorkshire"
+        },
+        "irish": {
+          "count": 45,
+          "matched_query": "irish",
+          "slug": "irish"
+        },
+        "arabic": {
+          "count": 14,
+          "matched_query": "arabic",
+          "slug": "arabic"
+        },
+        "romanian": {
+          "count": 5,
+          "matched_query": "romanian",
+          "slug": "romanian"
+        },
+        "jamaican": {
+          "count": 4,
+          "matched_query": "jamaican",
+          "slug": "jamaican"
+        },
+        "czech": {
+          "count": 2,
+          "matched_query": "czech",
+          "slug": "czech"
+        },
+        "us northeast": {
+          "count": 9,
+          "matched_query": "us northeast",
+          "slug": "us-northeast"
+        },
+        "malay": {
+          "count": 5,
+          "matched_query": "malay",
+          "slug": "malay"
+        },
+        "boston": {
+          "count": 7,
+          "matched_query": "boston",
+          "slug": "boston"
+        },
+        "hindi": {
+          "count": 7,
+          "matched_query": "hindi",
+          "slug": "hindi"
+        },
+        "italian": {
+          "count": 4,
+          "matched_query": "italian",
+          "slug": "italian"
+        },
+        "geordie": {
+          "count": 2,
+          "matched_query": "geordie",
+          "slug": "geordie"
+        },
+        "central": {
+          "count": 267,
+          "matched_query": "central",
+          "slug": "central"
+        },
+        "standard": {
+          "count": 514,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "finnish": {
+          "count": 3,
+          "matched_query": "finnish",
+          "slug": "finnish"
+        },
+        "tamil": {
+          "count": 5,
+          "matched_query": "tamil",
+          "slug": "tamil"
+        },
+        "southern": {
+          "count": 189,
+          "matched_query": "southern",
+          "slug": "southern"
+        },
+        "turkish": {
+          "count": 5,
+          "matched_query": "turkish",
+          "slug": "turkish"
+        },
+        "en-filipino": {
+          "count": 1,
+          "matched_query": "en-filipino",
+          "slug": "en-filipino"
+        },
+        "en-indian": {
+          "count": 1,
+          "matched_query": "en-indian",
+          "slug": "en-indian"
+        },
+        "en-american": {
+          "count": 2,
+          "matched_query": "en-american",
+          "slug": "en-american"
+        },
+        "en-canadian": {
+          "count": 1,
+          "matched_query": "en-canadian",
+          "slug": "en-canadian"
+        },
+        "en-british": {
+          "count": 1,
+          "matched_query": "en-british",
+          "slug": "en-british"
+        },
+        "en-scottish": {
+          "count": 1,
+          "matched_query": "en-scottish",
+          "slug": "en-scottish"
+        },
+        "northern": {
+          "count": 145,
+          "matched_query": "northern",
+          "slug": "northern"
+        },
+        "cockney": {
+          "count": 1,
+          "matched_query": "cockney",
+          "slug": "cockney"
+        },
+        "ukrainian": {
+          "count": 3,
+          "matched_query": "ukrainian",
+          "slug": "ukrainian"
+        },
+        "slovak": {
+          "count": 1,
+          "matched_query": "slovak",
+          "slug": "slovak"
+        },
+        "indonesian": {
+          "count": 1,
+          "matched_query": "indonesian",
+          "slug": "indonesian"
+        },
+        "korean": {
+          "count": 1,
+          "matched_query": "korean",
+          "slug": "korean"
+        },
+        "japanese": {
+          "count": 2,
+          "matched_query": "japanese",
+          "slug": "japanese"
+        },
+        "african": {
+          "count": 8,
+          "matched_query": "african",
+          "slug": "african"
+        }
+      }
+    },
+    "et": {
+      "language_code": "et",
+      "accents": {}
+    },
+    "tl": {
+      "language_code": "tl",
+      "accents": {}
+    },
+    "fi": {
+      "language_code": "fi",
+      "accents": {
+        "standard": {
+          "count": 95,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "helsinki": {
+          "count": 4,
+          "matched_query": "helsinki",
+          "slug": "helsinki"
+        },
+        "turku": {
+          "count": 1,
+          "matched_query": "turku",
+          "slug": "turku"
+        },
+        "southern": {
+          "count": 28,
+          "matched_query": "southern",
+          "slug": "southern"
+        },
+        "central": {
+          "count": 42,
+          "matched_query": "central",
+          "slug": "central"
+        }
+      }
+    },
+    "fr": {
+      "language_code": "fr",
+      "accents": {
+        "standard": {
+          "count": 575,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "parisian": {
+          "count": 51,
+          "matched_query": "parisian",
+          "slug": "parisian"
+        },
+        "african": {
+          "count": 8,
+          "matched_query": "african",
+          "slug": "african"
+        },
+        "quebec": {
+          "count": 40,
+          "matched_query": "quebec",
+          "slug": "quebec"
+        },
+        "belgian": {
+          "count": 5,
+          "matched_query": "belgian",
+          "slug": "belgian"
+        },
+        "swiss": {
+          "count": 7,
+          "matched_query": "swiss",
+          "slug": "swiss"
+        },
+        "acadian": {
+          "count": 3,
+          "matched_query": "acadian",
+          "slug": "acadian"
+        },
+        "northern": {
+          "count": 128,
+          "matched_query": "northern",
+          "slug": "northern"
+        },
+        "southern": {
+          "count": 146,
+          "matched_query": "southern",
+          "slug": "southern"
+        },
+        "central": {
+          "count": 213,
+          "matched_query": "central",
+          "slug": "central"
+        },
+        "cajun": {
+          "count": 1,
+          "matched_query": "cajun",
+          "slug": "cajun"
+        },
+        "creole": {
+          "count": 1,
+          "matched_query": "creole",
+          "slug": "creole"
+        }
+      }
+    },
+    "gl": {
+      "language_code": "gl",
+      "accents": {}
+    },
+    "ka": {
+      "language_code": "ka",
+      "accents": {}
+    },
+    "de": {
+      "language_code": "de",
+      "accents": {
+        "standard": {
+          "count": 562,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "bavarian": {
+          "count": 15,
+          "matched_query": "bavarian",
+          "slug": "bavarian"
+        },
+        "swabian": {
+          "count": 2,
+          "matched_query": "swabian",
+          "slug": "swabian"
+        },
+        "rhine franconian": {
+          "count": 2,
+          "matched_query": "rhine franconian",
+          "slug": "rhine-franconian"
+        },
+        "berlinerisch": {
+          "count": 3,
+          "matched_query": "berlinerisch",
+          "slug": "berlinerisch"
+        },
+        "saxon": {
+          "count": 3,
+          "matched_query": "saxon",
+          "slug": "saxon"
+        },
+        "de-standard": {
+          "count": 1,
+          "matched_query": "de-standard",
+          "slug": "de-standard"
+        },
+        "german": {
+          "count": 1,
+          "matched_query": "german",
+          "slug": "german"
+        },
+        "american german": {
+          "count": 1,
+          "matched_query": "american german",
+          "slug": "american-german"
+        },
+        "southern": {
+          "count": 72,
+          "matched_query": "southern",
+          "slug": "southern"
+        },
+        "central": {
+          "count": 85,
+          "matched_query": "central",
+          "slug": "central"
+        }
+      }
+    },
+    "el": {
+      "language_code": "el",
+      "accents": {
+        "standard": {
+          "count": 360,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "athenian": {
+          "count": 5,
+          "matched_query": "athenian",
+          "slug": "athenian"
+        },
+        "aegean": {
+          "count": 3,
+          "matched_query": "aegean",
+          "slug": "aegean"
+        },
+        "cypriot": {
+          "count": 9,
+          "matched_query": "cypriot",
+          "slug": "cypriot"
+        },
+        "macedonian": {
+          "count": 2,
+          "matched_query": "macedonian",
+          "slug": "macedonian"
+        },
+        "southern": {
+          "count": 121,
+          "matched_query": "southern",
+          "slug": "southern"
+        },
+        "northern": {
+          "count": 104,
+          "matched_query": "northern",
+          "slug": "northern"
+        },
+        "central": {
+          "count": 177,
+          "matched_query": "central",
+          "slug": "central"
+        },
+        "vi-standard": {
+          "count": 1,
+          "matched_query": "vi-standard",
+          "slug": "vi-standard"
+        }
+      }
+    },
+    "gu": {
+      "language_code": "gu",
+      "accents": {}
+    },
+    "ha": {
+      "language_code": "ha",
+      "accents": {}
+    },
+    "he": {
+      "language_code": "he",
+      "accents": {}
+    },
+    "hi": {
+      "language_code": "hi",
+      "accents": {
+        "standard": {
+          "count": 933,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "gujarati": {
+          "count": 9,
+          "matched_query": "gujarati",
+          "slug": "gujarati"
+        },
+        "punjabi": {
+          "count": 4,
+          "matched_query": "punjabi",
+          "slug": "punjabi"
+        },
+        "bengali": {
+          "count": 4,
+          "matched_query": "bengali",
+          "slug": "bengali"
+        },
+        "marathi": {
+          "count": 2,
+          "matched_query": "marathi",
+          "slug": "marathi"
+        },
+        "bhojpuri": {
+          "count": 3,
+          "matched_query": "bhojpuri",
+          "slug": "bhojpuri"
+        },
+        "northern": {
+          "count": 182,
+          "matched_query": "northern",
+          "slug": "northern"
+        },
+        "central": {
+          "count": 292,
+          "matched_query": "central",
+          "slug": "central"
+        },
+        "tamil": {
+          "count": 4,
+          "matched_query": "tamil",
+          "slug": "tamil"
+        },
+        "southern": {
+          "count": 208,
+          "matched_query": "southern",
+          "slug": "southern"
+        },
+        "bihari": {
+          "count": 2,
+          "matched_query": "bihari",
+          "slug": "bihari"
+        },
+        "telegu": {
+          "count": 2,
+          "matched_query": "telegu",
+          "slug": "telegu"
+        },
+        "haryanvi": {
+          "count": 1,
+          "matched_query": "haryanvi",
+          "slug": "haryanvi"
+        },
+        "indian": {
+          "count": 37,
+          "matched_query": "indian",
+          "slug": "indian"
+        },
+        "rajasthani": {
+          "count": 1,
+          "matched_query": "rajasthani",
+          "slug": "rajasthani"
+        },
+        "malvi": {
+          "count": 1,
+          "matched_query": "malvi",
+          "slug": "malvi"
+        },
+        "marwadi": {
+          "count": 1,
+          "matched_query": "marwadi",
+          "slug": "marwadi"
+        },
+        "chhattisgarhi": {
+          "count": 1,
+          "matched_query": "chhattisgarhi",
+          "slug": "chhattisgarhi"
+        },
+        "awadhi": {
+          "count": 2,
+          "matched_query": "awadhi",
+          "slug": "awadhi"
+        }
+      }
+    },
+    "hu": {
+      "language_code": "hu",
+      "accents": {
+        "budapest": {
+          "count": 15,
+          "matched_query": "budapest",
+          "slug": "budapest"
+        },
+        "standard": {
+          "count": 379,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "western": {
+          "count": 8,
+          "matched_query": "western",
+          "slug": "western"
+        },
+        "northern": {
+          "count": 124,
+          "matched_query": "northern",
+          "slug": "northern"
+        },
+        "southern": {
+          "count": 142,
+          "matched_query": "southern",
+          "slug": "southern"
+        },
+        "central": {
+          "count": 201,
+          "matched_query": "central",
+          "slug": "central"
+        }
+      }
+    },
+    "is": {
+      "language_code": "is",
+      "accents": {}
+    },
+    "id": {
+      "language_code": "id",
+      "accents": {
+        "standard": {
+          "count": 312,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "javanese": {
+          "count": 29,
+          "matched_query": "javanese",
+          "slug": "javanese"
+        },
+        "sundanese": {
+          "count": 14,
+          "matched_query": "sundanese",
+          "slug": "sundanese"
+        },
+        "id-standard": {
+          "count": 1,
+          "matched_query": "id-standard",
+          "slug": "id-standard"
+        },
+        "balinese": {
+          "count": 6,
+          "matched_query": "balinese",
+          "slug": "balinese"
+        }
+      }
+    },
+    "ga": {
+      "language_code": "ga",
+      "accents": {}
+    },
+    "it": {
+      "language_code": "it",
+      "accents": {
+        "standard": {
+          "count": 493,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "florentine": {
+          "count": 3,
+          "matched_query": "florentine",
+          "slug": "florentine"
+        },
+        "sicilian": {
+          "count": 6,
+          "matched_query": "sicilian",
+          "slug": "sicilian"
+        },
+        "romanesco": {
+          "count": 3,
+          "matched_query": "romanesco",
+          "slug": "romanesco"
+        },
+        "tuscan": {
+          "count": 4,
+          "matched_query": "tuscan",
+          "slug": "tuscan"
+        },
+        "milanese": {
+          "count": 9,
+          "matched_query": "milanese",
+          "slug": "milanese"
+        },
+        "venetian": {
+          "count": 3,
+          "matched_query": "venetian",
+          "slug": "venetian"
+        },
+        "northern": {
+          "count": 133,
+          "matched_query": "northern",
+          "slug": "northern"
+        },
+        "southern": {
+          "count": 155,
+          "matched_query": "southern",
+          "slug": "southern"
+        },
+        "central": {
+          "count": 230,
+          "matched_query": "central",
+          "slug": "central"
+        },
+        "ticinese": {
+          "count": 1,
+          "matched_query": "ticinese",
+          "slug": "ticinese"
+        },
+        "neapolitan": {
+          "count": 2,
+          "matched_query": "neapolitan",
+          "slug": "neapolitan"
+        },
+        "calabrese": {
+          "count": 1,
+          "matched_query": "calabrese",
+          "slug": "calabrese"
+        },
+        "genoese": {
+          "count": 1,
+          "matched_query": "genoese",
+          "slug": "genoese"
+        }
+      }
+    },
+    "ja": {
+      "language_code": "ja",
+      "accents": {
+        "standard": {
+          "count": 131,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "kanto": {
+          "count": 39,
+          "matched_query": "kanto",
+          "slug": "kanto"
+        },
+        "kyushu": {
+          "count": 3,
+          "matched_query": "kyushu",
+          "slug": "kyushu"
+        },
+        "kansai": {
+          "count": 4,
+          "matched_query": "kansai",
+          "slug": "kansai"
+        },
+        "tohoku": {
+          "count": 3,
+          "matched_query": "tohoku",
+          "slug": "tohoku"
+        }
+      }
+    },
+    "jv": {
+      "language_code": "jv",
+      "accents": {}
+    },
+    "kn": {
+      "language_code": "kn",
+      "accents": {}
+    },
+    "kk": {
+      "language_code": "kk",
+      "accents": {}
+    },
+    "ky": {
+      "language_code": "ky",
+      "accents": {}
+    },
+    "ko": {
+      "language_code": "ko",
+      "accents": {
+        "seoul": {
+          "count": 46,
+          "matched_query": "seoul",
+          "slug": "seoul"
+        },
+        "standard": {
+          "count": 279,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "jeolla": {
+          "count": 2,
+          "matched_query": "jeolla",
+          "slug": "jeolla"
+        },
+        "gyeongsang": {
+          "count": 2,
+          "matched_query": "gyeongsang",
+          "slug": "gyeongsang"
+        },
+        "hamgyong": {
+          "count": 1,
+          "matched_query": "hamgyong",
+          "slug": "hamgyong"
+        },
+        "chungcheong": {
+          "count": 1,
+          "matched_query": "chungcheong",
+          "slug": "chungcheong"
+        },
+        "southern": {
+          "count": 97,
+          "matched_query": "southern",
+          "slug": "southern"
+        }
+      }
+    },
+    "lv": {
+      "language_code": "lv",
+      "accents": {}
+    },
+    "ln": {
+      "language_code": "ln",
+      "accents": {}
+    },
+    "lt": {
+      "language_code": "lt",
+      "accents": {}
+    },
+    "lb": {
+      "language_code": "lb",
+      "accents": {}
+    },
+    "mk": {
+      "language_code": "mk",
+      "accents": {}
+    },
+    "ms": {
+      "language_code": "ms",
+      "accents": {
+        "standard": {
+          "count": 130,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "malaysian": {
+          "count": 25,
+          "matched_query": "malaysian",
+          "slug": "malaysian"
+        },
+        "northern": {
+          "count": 50,
+          "matched_query": "northern",
+          "slug": "northern"
+        },
+        "brunei": {
+          "count": 1,
+          "matched_query": "brunei",
+          "slug": "brunei"
+        },
+        "singaporean": {
+          "count": 1,
+          "matched_query": "singaporean",
+          "slug": "singaporean"
+        },
+        "southern": {
+          "count": 55,
+          "matched_query": "southern",
+          "slug": "southern"
+        },
+        "central": {
+          "count": 72,
+          "matched_query": "central",
+          "slug": "central"
+        }
+      }
+    },
+    "ml": {
+      "language_code": "ml",
+      "accents": {}
+    },
+    "mr": {
+      "language_code": "mr",
+      "accents": {}
+    },
+    "ne": {
+      "language_code": "ne",
+      "accents": {}
+    },
+    "no": {
+      "language_code": "no",
+      "accents": {
+        "oslo": {
+          "count": 11,
+          "matched_query": "oslo",
+          "slug": "oslo"
+        },
+        "bergen": {
+          "count": 2,
+          "matched_query": "bergen",
+          "slug": "bergen"
+        },
+        "standard": {
+          "count": 148,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "northern": {
+          "count": 51,
+          "matched_query": "northern",
+          "slug": "northern"
+        },
+        "central": {
+          "count": 78,
+          "matched_query": "central",
+          "slug": "central"
+        },
+        "southern": {
+          "count": 52,
+          "matched_query": "southern",
+          "slug": "southern"
+        }
+      }
+    },
+    "ps": {
+      "language_code": "ps",
+      "accents": {}
+    },
+    "fa": {
+      "language_code": "fa",
+      "accents": {}
+    },
+    "pl": {
+      "language_code": "pl",
+      "accents": {
+        "standard": {
+          "count": 374,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "mazovian": {
+          "count": 19,
+          "matched_query": "mazovian",
+          "slug": "mazovian"
+        },
+        "silesian": {
+          "count": 4,
+          "matched_query": "silesian",
+          "slug": "silesian"
+        },
+        "kashubian": {
+          "count": 4,
+          "matched_query": "kashubian",
+          "slug": "kashubian"
+        },
+        "podhale": {
+          "count": 3,
+          "matched_query": "podhale",
+          "slug": "podhale"
+        }
+      }
+    },
+    "pt": {
+      "language_code": "pt",
+      "accents": {
+        "brazilian": {
+          "count": 450,
+          "matched_query": "brazilian",
+          "slug": "brazilian"
+        },
+        "european": {
+          "count": 13,
+          "matched_query": "european",
+          "slug": "european"
+        },
+        "standard": {
+          "count": 549,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "african": {
+          "count": 1,
+          "matched_query": "african",
+          "slug": "african"
+        },
+        "central": {
+          "count": 286,
+          "matched_query": "central",
+          "slug": "central"
+        },
+        "northern": {
+          "count": 166,
+          "matched_query": "northern",
+          "slug": "northern"
+        },
+        "southern": {
+          "count": 196,
+          "matched_query": "southern",
+          "slug": "southern"
+        }
+      }
+    },
+    "pa": {
+      "language_code": "pa",
+      "accents": {}
+    },
+    "ro": {
+      "language_code": "ro",
+      "accents": {
+        "standard": {
+          "count": 458,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "moldovan": {
+          "count": 1,
+          "matched_query": "moldovan",
+          "slug": "moldovan"
+        },
+        "transylvanian": {
+          "count": 2,
+          "matched_query": "transylvanian",
+          "slug": "transylvanian"
+        },
+        "moscow": {
+          "count": 5,
+          "matched_query": "moscow",
+          "slug": "moscow"
+        },
+        "central": {
+          "count": 235,
+          "matched_query": "central",
+          "slug": "central"
+        },
+        "northern": {
+          "count": 135,
+          "matched_query": "northern",
+          "slug": "northern"
+        },
+        "southern": {
+          "count": 171,
+          "matched_query": "southern",
+          "slug": "southern"
+        }
+      }
+    },
+    "ru": {
+      "language_code": "ru",
+      "accents": {
+        "standard": {
+          "count": 514,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "moscow": {
+          "count": 40,
+          "matched_query": "moscow",
+          "slug": "moscow"
+        },
+        "saint petersburg": {
+          "count": 7,
+          "matched_query": "saint petersburg",
+          "slug": "saint-petersburg"
+        },
+        "central": {
+          "count": 219,
+          "matched_query": "central",
+          "slug": "central"
+        },
+        "southern": {
+          "count": 161,
+          "matched_query": "southern",
+          "slug": "southern"
+        },
+        "northern": {
+          "count": 131,
+          "matched_query": "northern",
+          "slug": "northern"
+        }
+      }
+    },
+    "sr": {
+      "language_code": "sr",
+      "accents": {}
+    },
+    "sd": {
+      "language_code": "sd",
+      "accents": {}
+    },
+    "sk": {
+      "language_code": "sk",
+      "accents": {
+        "western": {
+          "count": 14,
+          "matched_query": "western",
+          "slug": "western"
+        },
+        "standard": {
+          "count": 463,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "central": {
+          "count": 259,
+          "matched_query": "central",
+          "slug": "central"
+        },
+        "eastern": {
+          "count": 1,
+          "matched_query": "eastern",
+          "slug": "eastern"
+        },
+        "northern": {
+          "count": 130,
+          "matched_query": "northern",
+          "slug": "northern"
+        },
+        "southern": {
+          "count": 181,
+          "matched_query": "southern",
+          "slug": "southern"
+        }
+      }
+    },
+    "sl": {
+      "language_code": "sl",
+      "accents": {}
+    },
+    "so": {
+      "language_code": "so",
+      "accents": {}
+    },
+    "es": {
+      "language_code": "es",
+      "accents": {
+        "peninsular": {
+          "count": 330,
+          "matched_query": "peninsular",
+          "slug": "peninsular"
+        },
+        "latin american": {
+          "count": 344,
+          "matched_query": "latin american",
+          "slug": "latin-american"
+        },
+        "colombian": {
+          "count": 56,
+          "matched_query": "colombian",
+          "slug": "colombian"
+        },
+        "chilean": {
+          "count": 10,
+          "matched_query": "chilean",
+          "slug": "chilean"
+        },
+        "mexican": {
+          "count": 181,
+          "matched_query": "mexican",
+          "slug": "mexican"
+        },
+        "argentine": {
+          "count": 46,
+          "matched_query": "argentine",
+          "slug": "argentine"
+        },
+        "galician": {
+          "count": 4,
+          "matched_query": "galician",
+          "slug": "galician"
+        },
+        "venezuelan": {
+          "count": 8,
+          "matched_query": "venezuelan",
+          "slug": "venezuelan"
+        },
+        "peruvian": {
+          "count": 17,
+          "matched_query": "peruvian",
+          "slug": "peruvian"
+        },
+        "cuban": {
+          "count": 4,
+          "matched_query": "cuban",
+          "slug": "cuban"
+        },
+        "puerto rican": {
+          "count": 3,
+          "matched_query": "puerto rican",
+          "slug": "puerto-rican"
+        },
+        "canary islands": {
+          "count": 3,
+          "matched_query": "canary islands",
+          "slug": "canary-islands"
+        },
+        "ecuadorian": {
+          "count": 3,
+          "matched_query": "ecuadorian",
+          "slug": "ecuadorian"
+        },
+        "andalusian": {
+          "count": 8,
+          "matched_query": "andalusian",
+          "slug": "andalusian"
+        },
+        "dominican": {
+          "count": 3,
+          "matched_query": "dominican",
+          "slug": "dominican"
+        },
+        "caribbean": {
+          "count": 1,
+          "matched_query": "caribbean",
+          "slug": "caribbean"
+        },
+        "central": {
+          "count": 249,
+          "matched_query": "central",
+          "slug": "central"
+        },
+        "standard": {
+          "count": 485,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "es-venezuelan": {
+          "count": 1,
+          "matched_query": "es-venezuelan",
+          "slug": "es-venezuelan"
+        },
+        "es-colombian": {
+          "count": 1,
+          "matched_query": "es-colombian",
+          "slug": "es-colombian"
+        },
+        "es-argentine": {
+          "count": 1,
+          "matched_query": "es-argentine",
+          "slug": "es-argentine"
+        },
+        "southern": {
+          "count": 171,
+          "matched_query": "southern",
+          "slug": "southern"
+        },
+        "northern": {
+          "count": 154,
+          "matched_query": "northern",
+          "slug": "northern"
+        },
+        "latin": {
+          "count": 68,
+          "matched_query": "latin",
+          "slug": "latin"
+        },
+        "american": {
+          "count": 96,
+          "matched_query": "american",
+          "slug": "american"
+        },
+        "castillian": {
+          "count": 1,
+          "matched_query": "castillian",
+          "slug": "castillian"
+        },
+        "puerto": {
+          "count": 1,
+          "matched_query": "puerto",
+          "slug": "puerto"
+        }
+      }
+    },
+    "sw": {
+      "language_code": "sw",
+      "accents": {}
+    },
+    "sv": {
+      "language_code": "sv",
+      "accents": {
+        "standard": {
+          "count": 463,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "scanian": {
+          "count": 2,
+          "matched_query": "scanian",
+          "slug": "scanian"
+        },
+        "stockholm": {
+          "count": 9,
+          "matched_query": "stockholm",
+          "slug": "stockholm"
+        },
+        "gothenburg": {
+          "count": 5,
+          "matched_query": "gothenburg",
+          "slug": "gothenburg"
+        },
+        "norrland": {
+          "count": 2,
+          "matched_query": "norrland",
+          "slug": "norrland"
+        },
+        "central": {
+          "count": 274,
+          "matched_query": "central",
+          "slug": "central"
+        },
+        "southern": {
+          "count": 180,
+          "matched_query": "southern",
+          "slug": "southern"
+        },
+        "northern": {
+          "count": 142,
+          "matched_query": "northern",
+          "slug": "northern"
+        }
+      }
+    },
+    "ta": {
+      "language_code": "ta",
+      "accents": {
+        "standard": {
+          "count": 441,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "chennai": {
+          "count": 12,
+          "matched_query": "chennai",
+          "slug": "chennai"
+        },
+        "coimbatore": {
+          "count": 7,
+          "matched_query": "coimbatore",
+          "slug": "coimbatore"
+        },
+        "madurai": {
+          "count": 13,
+          "matched_query": "madurai",
+          "slug": "madurai"
+        },
+        "southern": {
+          "count": 194,
+          "matched_query": "southern",
+          "slug": "southern"
+        },
+        "central": {
+          "count": 231,
+          "matched_query": "central",
+          "slug": "central"
+        },
+        "northern": {
+          "count": 129,
+          "matched_query": "northern",
+          "slug": "northern"
+        },
+        "salem": {
+          "count": 5,
+          "matched_query": "salem",
+          "slug": "salem"
+        },
+        "thanjavur": {
+          "count": 11,
+          "matched_query": "thanjavur",
+          "slug": "thanjavur"
+        },
+        "tirunelveli": {
+          "count": 3,
+          "matched_query": "tirunelveli",
+          "slug": "tirunelveli"
+        }
+      }
+    },
+    "te": {
+      "language_code": "te",
+      "accents": {}
+    },
+    "th": {
+      "language_code": "th",
+      "accents": {}
+    },
+    "tr": {
+      "language_code": "tr",
+      "accents": {
+        "istanbul": {
+          "count": 356,
+          "matched_query": "istanbul",
+          "slug": "istanbul"
+        },
+        "standard": {
+          "count": 546,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "anatolian": {
+          "count": 12,
+          "matched_query": "anatolian",
+          "slug": "anatolian"
+        },
+        "central": {
+          "count": 248,
+          "matched_query": "central",
+          "slug": "central"
+        },
+        "aegean": {
+          "count": 7,
+          "matched_query": "aegean",
+          "slug": "aegean"
+        },
+        "eastern": {
+          "count": 4,
+          "matched_query": "eastern",
+          "slug": "eastern"
+        },
+        "american": {
+          "count": 117,
+          "matched_query": "american",
+          "slug": "american"
+        },
+        "british": {
+          "count": 46,
+          "matched_query": "british",
+          "slug": "british"
+        },
+        "northern": {
+          "count": 132,
+          "matched_query": "northern",
+          "slug": "northern"
+        },
+        "southern": {
+          "count": 166,
+          "matched_query": "southern",
+          "slug": "southern"
+        }
+      }
+    },
+    "uk": {
+      "language_code": "uk",
+      "accents": {
+        "standard": {
+          "count": 233,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "kiev": {
+          "count": 4,
+          "matched_query": "kiev",
+          "slug": "kiev"
+        },
+        "central": {
+          "count": 112,
+          "matched_query": "central",
+          "slug": "central"
+        }
+      }
+    },
+    "ur": {
+      "language_code": "ur",
+      "accents": {}
+    },
+    "vi": {
+      "language_code": "vi",
+      "accents": {
+        "standard": {
+          "count": 39,
+          "matched_query": "standard",
+          "slug": "standard"
+        },
+        "northern": {
+          "count": 30,
+          "matched_query": "northern",
+          "slug": "northern"
+        },
+        "southern": {
+          "count": 27,
+          "matched_query": "southern",
+          "slug": "southern"
+        },
+        "central": {
+          "count": 29,
+          "matched_query": "central",
+          "slug": "central"
+        }
+      }
+    },
+    "cy": {
+      "language_code": "cy",
+      "accents": {}
+    }
+  }
+}

@@ -1,0 +1,1546 @@
+{
+  "meta": {
+    "generated_at": "2026-01-22T11:33:55.587088+00:00",
+    "base_url": "https://api.us.elevenlabs.io/v1",
+    "sort": "created_date",
+    "page_size": 100,
+    "max_pages": 80,
+    "include_custom_rates": false,
+    "ui_slugs": true
+  },
+  "result": {
+    "Afrikaans": {
+      "language_code": "af",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Arabic": {
+      "language_code": "ar",
+      "voices_count": 285,
+      "accent": [
+        "modern standard",
+        "egyptian",
+        "tunisian",
+        "levantine",
+        "saudi",
+        "syrian",
+        "gulf",
+        "algerian",
+        "palestinian",
+        "moroccan",
+        "jordanian",
+        "kuwaiti",
+        "modern"
+      ],
+      "locale": [
+        "ar-SA",
+        "ar-EG",
+        "ar-LB",
+        "ar-MA",
+        "ar-KW"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "modern-standard",
+        "egyptian",
+        "tunisian",
+        "levantine",
+        "saudi",
+        "syrian",
+        "gulf",
+        "algerian",
+        "palestinian",
+        "moroccan",
+        "jordanian",
+        "kuwaiti",
+        "modern"
+      ]
+    },
+    "Armenian": {
+      "language_code": "hy",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Assamese": {
+      "language_code": "as",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Azerbaijani": {
+      "language_code": "az",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Belarusian": {
+      "language_code": "be",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Bengali": {
+      "language_code": "bn",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Bosnian": {
+      "language_code": "bs",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Bulgarian": {
+      "language_code": "bg",
+      "voices_count": 88,
+      "accent": [
+        "standard",
+        "sofia",
+        "central",
+        "southern"
+      ],
+      "locale": [
+        "bg-BG"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "standard",
+        "sofia",
+        "central",
+        "southern"
+      ]
+    },
+    "Catalan": {
+      "language_code": "ca",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Cebuano": {
+      "language_code": "ceb",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Chichewa": {
+      "language_code": "ny",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Chinese": {
+      "language_code": "zh",
+      "voices_count": 136,
+      "accent": [
+        "beijing mandarin",
+        "standard",
+        "taiwan mandarin",
+        "singapore mandarin",
+        "hong kong cantonese",
+        "southern",
+        "central",
+        "beijing",
+        "northern"
+      ],
+      "locale": [
+        "cmn-CN",
+        "cmn-TW"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "beijing-mandarin",
+        "standard",
+        "taiwan-mandarin",
+        "singapore-mandarin",
+        "hong-kong-cantonese",
+        "southern",
+        "central",
+        "beijing",
+        "northern"
+      ]
+    },
+    "Croatian": {
+      "language_code": "hr",
+      "voices_count": 477,
+      "accent": [
+        "standard",
+        "zagreb",
+        "central",
+        "southern",
+        "northern",
+        "dubrovnik",
+        "istrian"
+      ],
+      "locale": [
+        "hr-HR"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "standard",
+        "zagreb",
+        "central",
+        "southern",
+        "northern",
+        "dubrovnik",
+        "istrian"
+      ]
+    },
+    "Czech": {
+      "language_code": "cs",
+      "voices_count": 330,
+      "accent": [
+        "standard",
+        "prague",
+        "moravian",
+        "northern",
+        "silesian",
+        "southern",
+        "central"
+      ],
+      "locale": [
+        "cs-CZ"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "standard",
+        "prague",
+        "moravian",
+        "northern",
+        "silesian",
+        "southern",
+        "central"
+      ]
+    },
+    "Danish": {
+      "language_code": "da",
+      "voices_count": 272,
+      "accent": [
+        "standard",
+        "copenhagen",
+        "zealandic",
+        "jutlandic",
+        "southern",
+        "central",
+        "northern"
+      ],
+      "locale": [
+        "da-DK"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "standard",
+        "copenhagen",
+        "zealandic",
+        "jutlandic",
+        "southern",
+        "central",
+        "northern"
+      ]
+    },
+    "Dutch": {
+      "language_code": "nl",
+      "voices_count": 358,
+      "accent": [
+        "brabantian",
+        "standard",
+        "limburgish",
+        "flemish",
+        "southern",
+        "central",
+        "northern",
+        "gronings"
+      ],
+      "locale": [
+        "nl-NL",
+        "li-NL",
+        "nl-BE"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "brabantian",
+        "standard",
+        "limburgish",
+        "flemish",
+        "southern",
+        "central",
+        "northern",
+        "gronings"
+      ]
+    },
+    "English": {
+      "language_code": "en",
+      "voices_count": 4496,
+      "accent": [
+        "canadian",
+        "american",
+        "british",
+        "german",
+        "indian",
+        "australian",
+        "us midwest",
+        "scottish",
+        "french",
+        "received pronunciation",
+        "portuguese",
+        "african american",
+        "singaporean",
+        "russian",
+        "filipino",
+        "greek",
+        "nigerian",
+        "chicago",
+        "south african",
+        "spanish",
+        "danish",
+        "us southern",
+        "new zealand",
+        "chinese",
+        "dutch",
+        "polish",
+        "new york",
+        "swedish",
+        "welsh",
+        "croatian",
+        "yorkshire",
+        "irish",
+        "arabic",
+        "romanian",
+        "jamaican",
+        "czech",
+        "us northeast",
+        "malay",
+        "boston",
+        "hindi",
+        "italian",
+        "geordie",
+        "central",
+        "standard",
+        "finnish",
+        "tamil",
+        "southern",
+        "turkish",
+        "en-filipino",
+        "en-indian",
+        "en-american",
+        "en-canadian",
+        "en-british",
+        "en-scottish",
+        "northern",
+        "cockney",
+        "ukrainian",
+        "slovak",
+        "indonesian",
+        "korean",
+        "japanese",
+        "african"
+      ],
+      "locale": [
+        "en-CA",
+        "en-US",
+        "en-GB",
+        "en-IN",
+        "en-AU",
+        "en-SG",
+        "en-RU",
+        "en-PH",
+        "en-NG",
+        "en-ZA",
+        "en-NZ",
+        "en-IE",
+        "en-JM",
+        "en-MY",
+        "en-FI",
+        "en-KR"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "canadian",
+        "american",
+        "british",
+        "german",
+        "indian",
+        "australian",
+        "us-midwest",
+        "scottish",
+        "french",
+        "received-pronunciation",
+        "portuguese",
+        "african-american",
+        "singaporean",
+        "russian",
+        "filipino",
+        "greek",
+        "nigerian",
+        "chicago",
+        "south-african",
+        "spanish",
+        "danish",
+        "us-southern",
+        "new-zealand",
+        "chinese",
+        "dutch",
+        "polish",
+        "new-york",
+        "swedish",
+        "welsh",
+        "croatian",
+        "yorkshire",
+        "irish",
+        "arabic",
+        "romanian",
+        "jamaican",
+        "czech",
+        "us-northeast",
+        "malay",
+        "boston",
+        "hindi",
+        "italian",
+        "geordie",
+        "central",
+        "standard",
+        "finnish",
+        "tamil",
+        "southern",
+        "turkish",
+        "en-filipino",
+        "en-indian",
+        "en-american",
+        "en-canadian",
+        "en-british",
+        "en-scottish",
+        "northern",
+        "cockney",
+        "ukrainian",
+        "slovak",
+        "indonesian",
+        "korean",
+        "japanese",
+        "african"
+      ]
+    },
+    "Estonian": {
+      "language_code": "et",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Filipino": {
+      "language_code": "tl",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Finnish": {
+      "language_code": "fi",
+      "voices_count": 100,
+      "accent": [
+        "standard",
+        "helsinki",
+        "turku",
+        "southern",
+        "central"
+      ],
+      "locale": [
+        "fi-FI"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "standard",
+        "helsinki",
+        "turku",
+        "southern",
+        "central"
+      ]
+    },
+    "French": {
+      "language_code": "fr",
+      "voices_count": 650,
+      "accent": [
+        "standard",
+        "parisian",
+        "african",
+        "quebec",
+        "belgian",
+        "swiss",
+        "acadian",
+        "northern",
+        "southern",
+        "central",
+        "cajun",
+        "creole"
+      ],
+      "locale": [
+        "fr-FR",
+        "fr-TN",
+        "fr-CA",
+        "fr-BE",
+        "fr-CH"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "standard",
+        "parisian",
+        "african",
+        "quebec",
+        "belgian",
+        "swiss",
+        "acadian",
+        "northern",
+        "southern",
+        "central",
+        "cajun",
+        "creole"
+      ]
+    },
+    "Galician": {
+      "language_code": "gl",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Georgian": {
+      "language_code": "ka",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "German": {
+      "language_code": "de",
+      "voices_count": 595,
+      "accent": [
+        "standard",
+        "bavarian",
+        "swabian",
+        "rhine franconian",
+        "berlinerisch",
+        "saxon",
+        "de-standard",
+        "german",
+        "american german",
+        "southern",
+        "central"
+      ],
+      "locale": [
+        "de-DE",
+        "de-AT"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "standard",
+        "bavarian",
+        "swabian",
+        "rhine-franconian",
+        "berlinerisch",
+        "saxon",
+        "de-standard",
+        "german",
+        "american-german",
+        "southern",
+        "central"
+      ]
+    },
+    "Greek": {
+      "language_code": "el",
+      "voices_count": 363,
+      "accent": [
+        "standard",
+        "athenian",
+        "aegean",
+        "cypriot",
+        "macedonian",
+        "southern",
+        "northern",
+        "central",
+        "vi-standard"
+      ],
+      "locale": [
+        "el-GR"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "standard",
+        "athenian",
+        "aegean",
+        "cypriot",
+        "macedonian",
+        "southern",
+        "northern",
+        "central",
+        "vi-standard"
+      ]
+    },
+    "Gujarati": {
+      "language_code": "gu",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Hausa": {
+      "language_code": "ha",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Hebrew": {
+      "language_code": "he",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Hindi": {
+      "language_code": "hi",
+      "voices_count": 955,
+      "accent": [
+        "standard",
+        "gujarati",
+        "punjabi",
+        "bengali",
+        "marathi",
+        "bhojpuri",
+        "northern",
+        "central",
+        "tamil",
+        "southern",
+        "bihari",
+        "telegu",
+        "haryanvi",
+        "indian",
+        "rajasthani",
+        "malvi",
+        "marwadi",
+        "chhattisgarhi",
+        "awadhi"
+      ],
+      "locale": [
+        "hi-IN"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "standard",
+        "gujarati",
+        "punjabi",
+        "bengali",
+        "marathi",
+        "bhojpuri",
+        "northern",
+        "central",
+        "tamil",
+        "southern",
+        "bihari",
+        "telegu",
+        "haryanvi",
+        "indian",
+        "rajasthani",
+        "malvi",
+        "marwadi",
+        "chhattisgarhi",
+        "awadhi"
+      ]
+    },
+    "Hungarian": {
+      "language_code": "hu",
+      "voices_count": 384,
+      "accent": [
+        "budapest",
+        "standard",
+        "western",
+        "northern",
+        "southern",
+        "central"
+      ],
+      "locale": [
+        "hu-HU"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "budapest",
+        "standard",
+        "western",
+        "northern",
+        "southern",
+        "central"
+      ]
+    },
+    "Icelandic": {
+      "language_code": "is",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Indonesian": {
+      "language_code": "id",
+      "voices_count": 330,
+      "accent": [
+        "standard",
+        "javanese",
+        "sundanese",
+        "id-standard",
+        "balinese"
+      ],
+      "locale": [
+        "id-ID",
+        "jv-ID"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "standard",
+        "javanese",
+        "sundanese",
+        "id-standard",
+        "balinese"
+      ]
+    },
+    "Irish": {
+      "language_code": "ga",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Italian": {
+      "language_code": "it",
+      "voices_count": 509,
+      "accent": [
+        "standard",
+        "florentine",
+        "sicilian",
+        "romanesco",
+        "tuscan",
+        "milanese",
+        "venetian",
+        "northern",
+        "southern",
+        "central",
+        "ticinese",
+        "neapolitan",
+        "calabrese",
+        "genoese"
+      ],
+      "locale": [
+        "it-IT"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "standard",
+        "florentine",
+        "sicilian",
+        "romanesco",
+        "tuscan",
+        "milanese",
+        "venetian",
+        "northern",
+        "southern",
+        "central",
+        "ticinese",
+        "neapolitan",
+        "calabrese",
+        "genoese"
+      ]
+    },
+    "Japanese": {
+      "language_code": "ja",
+      "voices_count": 165,
+      "accent": [
+        "standard",
+        "kanto",
+        "kyushu",
+        "kansai",
+        "tohoku"
+      ],
+      "locale": [
+        "ja-JP"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "standard",
+        "kanto",
+        "kyushu",
+        "kansai",
+        "tohoku"
+      ]
+    },
+    "Javanese": {
+      "language_code": "jv",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Kannada": {
+      "language_code": "kn",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Kazakh": {
+      "language_code": "kk",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Kirghiz": {
+      "language_code": "ky",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Korean": {
+      "language_code": "ko",
+      "voices_count": 327,
+      "accent": [
+        "seoul",
+        "standard",
+        "jeolla",
+        "gyeongsang",
+        "hamgyong",
+        "chungcheong",
+        "southern"
+      ],
+      "locale": [
+        "ko-KR"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "seoul",
+        "standard",
+        "jeolla",
+        "gyeongsang",
+        "hamgyong",
+        "chungcheong",
+        "southern"
+      ]
+    },
+    "Latvian": {
+      "language_code": "lv",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Lingala": {
+      "language_code": "ln",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Lithuanian": {
+      "language_code": "lt",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Luxembourgish": {
+      "language_code": "lb",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Macedonian": {
+      "language_code": "mk",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Malay": {
+      "language_code": "ms",
+      "voices_count": 144,
+      "accent": [
+        "standard",
+        "malaysian",
+        "northern",
+        "brunei",
+        "singaporean",
+        "southern",
+        "central"
+      ],
+      "locale": [
+        "ms-MY"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "standard",
+        "malaysian",
+        "northern",
+        "brunei",
+        "singaporean",
+        "southern",
+        "central"
+      ]
+    },
+    "Malayalam": {
+      "language_code": "ml",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Marathi": {
+      "language_code": "mr",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Nepali": {
+      "language_code": "ne",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Norwegian": {
+      "language_code": "no",
+      "voices_count": 158,
+      "accent": [
+        "oslo",
+        "bergen",
+        "standard",
+        "northern",
+        "central",
+        "southern"
+      ],
+      "locale": [
+        "no-NO"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "oslo",
+        "bergen",
+        "standard",
+        "northern",
+        "central",
+        "southern"
+      ]
+    },
+    "Pashto": {
+      "language_code": "ps",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Persian": {
+      "language_code": "fa",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Polish": {
+      "language_code": "pl",
+      "voices_count": 387,
+      "accent": [
+        "standard",
+        "mazovian",
+        "silesian",
+        "kashubian",
+        "podhale"
+      ],
+      "locale": [
+        "pl-PL"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "standard",
+        "mazovian",
+        "silesian",
+        "kashubian",
+        "podhale"
+      ]
+    },
+    "Portuguese": {
+      "language_code": "pt",
+      "voices_count": 740,
+      "accent": [
+        "brazilian",
+        "european",
+        "standard",
+        "african",
+        "central",
+        "northern",
+        "southern"
+      ],
+      "locale": [
+        "pt-BR",
+        "pt-PT"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "brazilian",
+        "european",
+        "standard",
+        "african",
+        "central",
+        "northern",
+        "southern"
+      ]
+    },
+    "Punjabi": {
+      "language_code": "pa",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Romanian": {
+      "language_code": "ro",
+      "voices_count": 461,
+      "accent": [
+        "standard",
+        "moldovan",
+        "transylvanian",
+        "moscow",
+        "central",
+        "northern",
+        "southern"
+      ],
+      "locale": [
+        "ro-RO"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "standard",
+        "moldovan",
+        "transylvanian",
+        "moscow",
+        "central",
+        "northern",
+        "southern"
+      ]
+    },
+    "Russian": {
+      "language_code": "ru",
+      "voices_count": 547,
+      "accent": [
+        "standard",
+        "moscow",
+        "saint petersburg",
+        "central",
+        "southern",
+        "northern"
+      ],
+      "locale": [
+        "ru-RU",
+        "ro-RO"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "standard",
+        "moscow",
+        "saint-petersburg",
+        "central",
+        "southern",
+        "northern"
+      ]
+    },
+    "Serbian": {
+      "language_code": "sr",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Sindhi": {
+      "language_code": "sd",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Slovak": {
+      "language_code": "sk",
+      "voices_count": 467,
+      "accent": [
+        "western",
+        "standard",
+        "central",
+        "eastern",
+        "northern",
+        "southern"
+      ],
+      "locale": [
+        "sk-SK"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "western",
+        "standard",
+        "central",
+        "eastern",
+        "northern",
+        "southern"
+      ]
+    },
+    "Slovenian": {
+      "language_code": "sl",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Somali": {
+      "language_code": "so",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Spanish": {
+      "language_code": "es",
+      "voices_count": 1156,
+      "accent": [
+        "peninsular",
+        "latin american",
+        "colombian",
+        "chilean",
+        "mexican",
+        "argentine",
+        "galician",
+        "venezuelan",
+        "peruvian",
+        "cuban",
+        "puerto rican",
+        "canary islands",
+        "ecuadorian",
+        "andalusian",
+        "dominican",
+        "caribbean",
+        "central",
+        "standard",
+        "es-venezuelan",
+        "es-colombian",
+        "es-argentine",
+        "southern",
+        "northern",
+        "latin",
+        "american",
+        "castillian",
+        "puerto"
+      ],
+      "locale": [
+        "es-ES",
+        "es-AR",
+        "es-CO",
+        "es-CL",
+        "es-MX",
+        "es-VE",
+        "es-PE",
+        "es-US"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "peninsular",
+        "latin-american",
+        "colombian",
+        "chilean",
+        "mexican",
+        "argentine",
+        "galician",
+        "venezuelan",
+        "peruvian",
+        "cuban",
+        "puerto-rican",
+        "canary-islands",
+        "ecuadorian",
+        "andalusian",
+        "dominican",
+        "caribbean",
+        "central",
+        "standard",
+        "es-venezuelan",
+        "es-colombian",
+        "es-argentine",
+        "southern",
+        "northern",
+        "latin",
+        "american",
+        "castillian",
+        "puerto"
+      ]
+    },
+    "Swahili": {
+      "language_code": "sw",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Swedish": {
+      "language_code": "sv",
+      "voices_count": 471,
+      "accent": [
+        "standard",
+        "scanian",
+        "stockholm",
+        "gothenburg",
+        "norrland",
+        "central",
+        "southern",
+        "northern"
+      ],
+      "locale": [
+        "sv-SE"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "standard",
+        "scanian",
+        "stockholm",
+        "gothenburg",
+        "norrland",
+        "central",
+        "southern",
+        "northern"
+      ]
+    },
+    "Tamil": {
+      "language_code": "ta",
+      "voices_count": 443,
+      "accent": [
+        "standard",
+        "chennai",
+        "coimbatore",
+        "madurai",
+        "southern",
+        "central",
+        "northern",
+        "salem",
+        "thanjavur",
+        "tirunelveli"
+      ],
+      "locale": [
+        "ta-IN"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "standard",
+        "chennai",
+        "coimbatore",
+        "madurai",
+        "southern",
+        "central",
+        "northern",
+        "salem",
+        "thanjavur",
+        "tirunelveli"
+      ]
+    },
+    "Telugu": {
+      "language_code": "te",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Thai": {
+      "language_code": "th",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Turkish": {
+      "language_code": "tr",
+      "voices_count": 923,
+      "accent": [
+        "istanbul",
+        "standard",
+        "anatolian",
+        "central",
+        "aegean",
+        "eastern",
+        "american",
+        "british",
+        "northern",
+        "southern"
+      ],
+      "locale": [
+        "tr-TR"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "istanbul",
+        "standard",
+        "anatolian",
+        "central",
+        "aegean",
+        "eastern",
+        "american",
+        "british",
+        "northern",
+        "southern"
+      ]
+    },
+    "Ukrainian": {
+      "language_code": "uk",
+      "voices_count": 237,
+      "accent": [
+        "standard",
+        "kiev",
+        "central"
+      ],
+      "locale": [
+        "uk-UA"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "standard",
+        "kiev",
+        "central"
+      ]
+    },
+    "Urdu": {
+      "language_code": "ur",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    },
+    "Vietnamese": {
+      "language_code": "vi",
+      "voices_count": 119,
+      "accent": [
+        "standard",
+        "northern",
+        "southern",
+        "central"
+      ],
+      "locale": [
+        "vi-VN"
+      ],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": [
+        "standard",
+        "northern",
+        "southern",
+        "central"
+      ]
+    },
+    "Welsh": {
+      "language_code": "cy",
+      "voices_count": 0,
+      "accent": [],
+      "locale": [],
+      "dialect": [],
+      "region": [],
+      "other": [],
+      "accent_slugs": []
+    }
+  }
+}
