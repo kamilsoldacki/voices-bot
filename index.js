@@ -1991,6 +1991,10 @@ function detectVariantIntent(userText, iso2, kb) {
       isSpecific: false,
       axis: null, // 'locale' | 'accent'
       requestedFacetKeys: [], // normalized facetKey strings
+      fallbackFacetKeys: [], // fallback-only keys (used only when primary results are 0)
+      requestedFacetQueryKeys: null, // optional: query-only variants (e.g. zh dialect sub-variants)
+      combineGroupKey: null, // optional: combined facetKey for rendering
+      combineGroupLabel: null, // optional: combined label for rendering
       minResults: 10
     };
     if (!lang) return out;
@@ -2004,6 +2008,7 @@ function detectVariantIntent(userText, iso2, kb) {
         out.isSpecific = true;
         out.axis = 'locale';
         out.requestedFacetKeys = [key];
+        out.fallbackFacetKeys = [];
         return out;
       }
     }
@@ -2022,9 +2027,17 @@ function detectVariantIntent(userText, iso2, kb) {
           if (d === 'mandarin') return a.includes('mandarin');
           return false;
         });
-        // Always include standard as fallback option (not shown unless needed)
-        const keys = dedupePreserveOrder([...matches, 'standard']).filter(Boolean);
-        out.requestedFacetKeys = keys.length ? keys : [d === 'cantonese' ? 'hong kong cantonese' : 'beijing mandarin', 'standard'];
+        // Requested (primary) should be ONLY the dialect variants.
+        // STANDARD is fallback-only and should be used only when primary returns 0.
+        const queryKeys = dedupePreserveOrder(matches).filter(Boolean);
+        out.requestedFacetQueryKeys = queryKeys.length
+          ? queryKeys
+          : [d === 'cantonese' ? 'hong kong cantonese' : 'beijing mandarin'];
+        out.fallbackFacetKeys = ['standard'];
+        // Combined rendering section (you chose: one combined section for dialect requests)
+        out.combineGroupKey = d; // 'mandarin' | 'cantonese'
+        out.combineGroupLabel = d === 'cantonese' ? 'CANTONESE' : 'MANDARIN';
+        out.requestedFacetKeys = [out.combineGroupKey];
         return out;
       }
     }
@@ -2035,12 +2048,14 @@ function detectVariantIntent(userText, iso2, kb) {
         out.isSpecific = true;
         out.axis = 'locale';
         out.requestedFacetKeys = ['pt-br'];
+        out.fallbackFacetKeys = [];
         return out;
       }
       if (/\b(portugal|pt-pt|pt-eu|european)\b/.test(lower)) {
         out.isSpecific = true;
         out.axis = 'locale';
         out.requestedFacetKeys = ['pt-pt'];
+        out.fallbackFacetKeys = [];
         return out;
       }
     }
@@ -2049,18 +2064,21 @@ function detectVariantIntent(userText, iso2, kb) {
         out.isSpecific = true;
         out.axis = 'locale';
         out.requestedFacetKeys = ['es-419'];
+        out.fallbackFacetKeys = [];
         return out;
       }
       if (/\b(mexico|mexican|es-mx|mx)\b/.test(lower)) {
         out.isSpecific = true;
         out.axis = 'locale';
         out.requestedFacetKeys = ['es-mx'];
+        out.fallbackFacetKeys = [];
         return out;
       }
       if (/\b(spain|castilian|es-es)\b/.test(lower) || (/\b(european)\b/.test(lower) && /\bspanish\b/.test(lower))) {
         out.isSpecific = true;
         out.axis = 'locale';
         out.requestedFacetKeys = ['es-es'];
+        out.fallbackFacetKeys = [];
         return out;
       }
     }
@@ -2069,12 +2087,14 @@ function detectVariantIntent(userText, iso2, kb) {
         out.isSpecific = true;
         out.axis = 'locale';
         out.requestedFacetKeys = ['en-us'];
+        out.fallbackFacetKeys = [];
         return out;
       }
       if (/\b(en-gb|en-uk|british english|uk english|england)\b/.test(lower)) {
         out.isSpecific = true;
         out.axis = 'locale';
         out.requestedFacetKeys = ['en-gb'];
+        out.fallbackFacetKeys = [];
         return out;
       }
     }
@@ -2083,6 +2103,7 @@ function detectVariantIntent(userText, iso2, kb) {
         out.isSpecific = true;
         out.axis = 'locale';
         out.requestedFacetKeys = ['fr-ca'];
+        out.fallbackFacetKeys = [];
         return out;
       }
     }
@@ -2096,6 +2117,7 @@ function detectVariantIntent(userText, iso2, kb) {
         out.isSpecific = true;
         out.axis = 'accent';
         out.requestedFacetKeys = [key];
+        out.fallbackFacetKeys = [];
         return out;
       }
     }
@@ -3756,9 +3778,12 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
         : (language === 'zh' && zhDialect ? 'accent' : (facetKB.getAxisForIso2 ? facetKB.getAxisForIso2(language) : null));
       const maxVariants = 4;
       let variants = [];
-      if (variantIntent && variantIntent.isSpecific && Array.isArray(variantIntent.requestedFacetKeys) && variantIntent.requestedFacetKeys.length) {
+      if (variantIntent && variantIntent.isSpecific) {
+        const queryKeys = Array.isArray(variantIntent.requestedFacetQueryKeys) && variantIntent.requestedFacetQueryKeys.length
+          ? variantIntent.requestedFacetQueryKeys
+          : (Array.isArray(variantIntent.requestedFacetKeys) ? variantIntent.requestedFacetKeys : []);
         const built = [];
-        for (const k of variantIntent.requestedFacetKeys) {
+        for (const k of queryKeys) {
           const v = facetKB.getVariantForFacetKey ? facetKB.getVariantForFacetKey(language, axis, k) : null;
           if (v) built.push(v);
         }
@@ -3774,7 +3799,9 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             iso2: language,
             specific: variantIntent && variantIntent.isSpecific ? 'true' : 'false',
             axis: variantIntent && variantIntent.axis ? String(variantIntent.axis) : '-',
-            requested: variantIntent && variantIntent.isSpecific ? (variantIntent.requestedFacetKeys || []).slice(0, 8).join(',') : '-'
+            requested: variantIntent && variantIntent.isSpecific ? (variantIntent.requestedFacetKeys || []).slice(0, 8).join(',') : '-',
+            fallback: variantIntent && variantIntent.isSpecific ? (variantIntent.fallbackFacetKeys || []).slice(0, 6).join(',') : '-',
+            combine: variantIntent && variantIntent.isSpecific && variantIntent.combineGroupKey ? String(variantIntent.combineGroupKey) : '-'
           }
         });
       } catch (_) {}
@@ -3794,21 +3821,15 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
         const facetGroups = [];
         const allVoices = [];
         const allSeen = new Set();
+        const isCombinedZhDialect =
+          !!(variantIntent && variantIntent.isSpecific && language === 'zh' && axis === 'accent' && variantIntent.combineGroupKey && variantIntent.combineGroupLabel);
+        const combinedGroup = isCombinedZhDialect
+          ? { facetType: 'accent', facetKey: String(variantIntent.combineGroupKey), facetLabel: String(variantIntent.combineGroupLabel), voices: [] }
+          : null;
+        const combinedSeen = combinedGroup ? new Set() : null;
+        let fallbackUsed = false;
 
-        try {
-          trace({
-            stage: 'facet_browse',
-            params: {
-              iso2: language,
-              axis,
-              specific: variantIntent && variantIntent.isSpecific ? 'true' : 'false',
-              requested: variantIntent && variantIntent.isSpecific ? (variantIntent.requestedFacetKeys || []).slice(0, 6).join(',') : '-',
-              variants: String(variants.length),
-              page_size: String(pageSize),
-              search: combinedSearch ? 'yes' : 'no'
-            }
-          });
-        } catch (_) {}
+        // (trace after we know whether fallback was used)
 
         const fetchOnce = async (params, meta) => {
           if (requestBudget <= 0) return [];
@@ -3834,88 +3855,165 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
           return Array.isArray(voices) ? voices : [];
         };
 
-        for (const v of variants) {
-          if (!v || requestBudget <= 0) break;
-          const group = {
-            facetType: v.facetType,
-            facetKey: v.facetKey,
-            facetLabel: v.facetLabel,
-            voices: []
-          };
+        const runVariantList = async (variantList, { allowCombine = false } = {}) => {
+          for (const v of variantList || []) {
+            if (!v || requestBudget <= 0) break;
+            const group =
+              allowCombine && combinedGroup && v.facetType === 'accent'
+                ? combinedGroup
+                : {
+                    facetType: v.facetType,
+                    facetKey: v.facetKey,
+                    facetLabel: v.facetLabel,
+                    voices: []
+                  };
 
-          const seenInGroup = new Set();
-          const base = new URLSearchParams();
-          base.set('page_size', String(pageSize));
-          base.set('language', String(language));
-          if (gender) base.set('gender', gender);
-          if (qualityPref === 'high_only') base.set('category', 'high_quality');
-          if (featured) base.set('featured', 'true');
-          if (age) base.set('age', age);
-          if (sort) base.set('sort', sort);
-          // pass 1: no search
+            const seenInGroup = group === combinedGroup && combinedSeen ? combinedSeen : new Set();
+            const base = new URLSearchParams();
+            base.set('page_size', String(pageSize));
+            base.set('language', String(language));
+            if (gender) base.set('gender', gender);
+            if (qualityPref === 'high_only') base.set('category', 'high_quality');
+            if (featured) base.set('featured', 'true');
+            if (age) base.set('age', age);
+            if (sort) base.set('sort', sort);
+            // pass 1: no search
 
-          let fetched = [];
-          if (axis === 'locale' && v.facetType === 'locale') {
-            const p = new URLSearchParams(base.toString());
-            p.set('locale', String(v.facetValue || v.facetLabel || ''));
-            fetched = await fetchOnce(p, { iso2: language, axis: 'locale', pass: 'no_search', facet: String(v.facetLabel || v.facetValue || '') });
-            if ((!fetched || fetched.length < 3) && combinedSearch && requestBudget > 0) {
-              const p2 = new URLSearchParams(p.toString());
-              p2.set('search', combinedSearch);
-              const v2 = await fetchOnce(p2, { iso2: language, axis: 'locale', pass: 'with_search', facet: String(v.facetLabel || v.facetValue || '') });
-              if (Array.isArray(v2) && v2.length > fetched.length) fetched = v2;
-            }
-          } else if (axis === 'accent' && v.facetType === 'accent') {
-            // Try accent NAME first, then slug (some APIs are picky)
-            const nameVal = String(v.facetValue || v.facetLabel || '').trim();
-            if (nameVal) {
-              const p1 = new URLSearchParams(base.toString());
-              p1.set('accent', nameVal);
-              fetched = await fetchOnce(p1, { iso2: language, axis: 'accent', accent_mode: 'name', pass: 'no_search', facet: nameVal });
+            let fetched = [];
+            if (axis === 'locale' && v.facetType === 'locale') {
+              const p = new URLSearchParams(base.toString());
+              p.set('locale', String(v.facetValue || v.facetLabel || ''));
+              fetched = await fetchOnce(p, { iso2: language, axis: 'locale', pass: 'no_search', facet: String(v.facetLabel || v.facetValue || '') });
               if ((!fetched || fetched.length < 3) && combinedSearch && requestBudget > 0) {
-                const p1s = new URLSearchParams(p1.toString());
-                p1s.set('search', combinedSearch);
-                const v1s = await fetchOnce(p1s, { iso2: language, axis: 'accent', accent_mode: 'name', pass: 'with_search', facet: nameVal });
-                if (Array.isArray(v1s) && v1s.length > fetched.length) fetched = v1s;
+                const p2 = new URLSearchParams(p.toString());
+                p2.set('search', combinedSearch);
+                const v2 = await fetchOnce(p2, { iso2: language, axis: 'locale', pass: 'with_search', facet: String(v.facetLabel || v.facetValue || '') });
+                if (Array.isArray(v2) && v2.length > fetched.length) fetched = v2;
               }
-            }
-            if ((!fetched || fetched.length === 0) && v.slug) {
-              const slugVal = String(v.slug || '').trim();
-              if (slugVal && slugVal !== nameVal) {
-                const p2 = new URLSearchParams(base.toString());
-                p2.set('accent', slugVal);
-                let v2 = await fetchOnce(p2, { iso2: language, axis: 'accent', accent_mode: 'slug', pass: 'no_search', facet: slugVal });
-                if ((!v2 || v2.length < 3) && combinedSearch && requestBudget > 0) {
-                  const p2s = new URLSearchParams(p2.toString());
-                  p2s.set('search', combinedSearch);
-                  const v2s = await fetchOnce(p2s, { iso2: language, axis: 'accent', accent_mode: 'slug', pass: 'with_search', facet: slugVal });
-                  if (Array.isArray(v2s) && v2s.length > v2.length) v2 = v2s;
+            } else if (axis === 'accent' && v.facetType === 'accent') {
+              // Try accent NAME first, then slug (some APIs are picky)
+              const nameVal = String(v.facetValue || v.facetLabel || '').trim();
+              if (nameVal) {
+                const p1 = new URLSearchParams(base.toString());
+                p1.set('accent', nameVal);
+                fetched = await fetchOnce(p1, { iso2: language, axis: 'accent', accent_mode: 'name', pass: 'no_search', facet: nameVal });
+                if ((!fetched || fetched.length < 3) && combinedSearch && requestBudget > 0) {
+                  const p1s = new URLSearchParams(p1.toString());
+                  p1s.set('search', combinedSearch);
+                  const v1s = await fetchOnce(p1s, { iso2: language, axis: 'accent', accent_mode: 'name', pass: 'with_search', facet: nameVal });
+                  if (Array.isArray(v1s) && v1s.length > fetched.length) fetched = v1s;
                 }
-                if (Array.isArray(v2) && v2.length) fetched = v2;
+              }
+              if ((!fetched || fetched.length === 0) && v.slug) {
+                const slugVal = String(v.slug || '').trim();
+                if (slugVal && slugVal !== nameVal) {
+                  const p2 = new URLSearchParams(base.toString());
+                  p2.set('accent', slugVal);
+                  let v2 = await fetchOnce(p2, { iso2: language, axis: 'accent', accent_mode: 'slug', pass: 'no_search', facet: slugVal });
+                  if ((!v2 || v2.length < 3) && combinedSearch && requestBudget > 0) {
+                    const p2s = new URLSearchParams(p2.toString());
+                    p2s.set('search', combinedSearch);
+                    const v2s = await fetchOnce(p2s, { iso2: language, axis: 'accent', accent_mode: 'slug', pass: 'with_search', facet: slugVal });
+                    if (Array.isArray(v2s) && v2s.length > v2.length) v2 = v2s;
+                  }
+                  if (Array.isArray(v2) && v2.length) fetched = v2;
+                }
               }
             }
-          }
 
-          for (const voice of fetched || []) {
-            if (!voice || !voice.voice_id) continue;
-            // Tag for diagnostics/coverage
-            try {
-              const tag = `${axis}:${String(group.facetKey || '')}`;
-              if (!Array.isArray(voice._matched_keywords)) voice._matched_keywords = [];
-              if (!voice._matched_keywords.includes(tag)) voice._matched_keywords.push(tag);
-            } catch (_) {}
-            if (!seenInGroup.has(voice.voice_id)) {
-              seenInGroup.add(voice.voice_id);
-              group.voices.push(voice);
+            for (const voice of fetched || []) {
+              if (!voice || !voice.voice_id) continue;
+              // Tag for diagnostics/coverage using the actual facet variant key (even if we later combine groups)
+              try {
+                const tag = `${axis}:${String(v.facetKey || '')}`;
+                if (!Array.isArray(voice._matched_keywords)) voice._matched_keywords = [];
+                if (!voice._matched_keywords.includes(tag)) voice._matched_keywords.push(tag);
+              } catch (_) {}
+              if (!seenInGroup.has(voice.voice_id)) {
+                seenInGroup.add(voice.voice_id);
+                group.voices.push(voice);
+              }
+              if (!allSeen.has(voice.voice_id)) {
+                allSeen.add(voice.voice_id);
+                allVoices.push(voice);
+              }
             }
-            if (!allSeen.has(voice.voice_id)) {
-              allSeen.add(voice.voice_id);
-              allVoices.push(voice);
+
+            // In combined mode, only push the combined group once (at the end).
+            if (!(allowCombine && combinedGroup && group === combinedGroup)) {
+              facetGroups.push(group);
             }
           }
+        };
 
-          facetGroups.push(group);
+        // Primary (requested) variants
+        await runVariantList(variants, { allowCombine: isCombinedZhDialect });
+        if (isCombinedZhDialect && combinedGroup) {
+          // Ensure the combined group appears once and only if it has voices
+          if (Array.isArray(combinedGroup.voices) && combinedGroup.voices.length) {
+            facetGroups.push(combinedGroup);
+          }
         }
+
+        // Fallback variants only when primary is 0 (per spec)
+        if ((variantIntent && variantIntent.isSpecific) && allVoices.length === 0) {
+          fallbackUsed = true;
+          const fallbackKeys = Array.isArray(variantIntent.fallbackFacetKeys) ? variantIntent.fallbackFacetKeys : [];
+          const fallbackVariants = [];
+          for (const k of fallbackKeys) {
+            const fv = facetKB.getVariantForFacetKey ? facetKB.getVariantForFacetKey(language, axis, k) : null;
+            if (fv) fallbackVariants.push(fv);
+          }
+          if (fallbackVariants.length) {
+            await runVariantList(fallbackVariants, { allowCombine: false });
+          }
+
+          // If still nothing, add OTHER/UNSURE (broad query) if budget allows
+          if (allVoices.length === 0 && requestBudget > 0) {
+            const base = new URLSearchParams();
+            base.set('page_size', String(pageSize));
+            base.set('language', String(language));
+            if (gender) base.set('gender', gender);
+            if (qualityPref === 'high_only') base.set('category', 'high_quality');
+            if (featured) base.set('featured', 'true');
+            if (age) base.set('age', age);
+            if (sort) base.set('sort', sort);
+            const p = new URLSearchParams(base.toString());
+            const fetched = await fetchOnce(p, { iso2: language, axis: 'other', pass: 'no_search', facet: '__other__' });
+            const group = { facetType: axis, facetKey: '__other__', facetLabel: 'OTHER/UNSURE', voices: [] };
+            const seenInGroup = new Set();
+            for (const voice of fetched || []) {
+              if (!voice || !voice.voice_id) continue;
+              if (!seenInGroup.has(voice.voice_id)) {
+                seenInGroup.add(voice.voice_id);
+                group.voices.push(voice);
+              }
+              if (!allSeen.has(voice.voice_id)) {
+                allSeen.add(voice.voice_id);
+                allVoices.push(voice);
+              }
+            }
+            if (group.voices.length) facetGroups.push(group);
+          }
+        }
+
+        try {
+          trace({
+            stage: 'facet_browse',
+            params: {
+              iso2: language,
+              axis,
+              specific: variantIntent && variantIntent.isSpecific ? 'true' : 'false',
+              requested: variantIntent && variantIntent.isSpecific ? (variantIntent.requestedFacetKeys || []).slice(0, 6).join(',') : '-',
+              fallback: variantIntent && variantIntent.isSpecific ? (variantIntent.fallbackFacetKeys || []).slice(0, 6).join(',') : '-',
+              combine: variantIntent && variantIntent.isSpecific && variantIntent.combineGroupKey ? String(variantIntent.combineGroupKey) : '-',
+              fallback_used: fallbackUsed ? 'true' : 'false',
+              variants: String(variants.length),
+              page_size: String(pageSize),
+              search: combinedSearch ? 'yes' : 'no'
+            }
+          });
+        } catch (_) {}
 
         // If we got anything at all, return early with groups.
         if (allVoices.length) {
@@ -5290,23 +5388,24 @@ function buildMessageFromSession(session) {
         }
       };
 
-      // Strict mode: if user asked for a specific variant, show only that variant,
-      // plus STANDARD/OTHER only when results are insufficient.
+      // Strict mode: if user asked for a specific variant, show only that variant.
+      // Fallback (STANDARD/OTHER) is allowed ONLY when primaryCount === 0.
       if (variantIntent && variantIntent.isSpecific && Array.isArray(variantIntent.requestedFacetKeys)) {
         const want = new Set(variantIntent.requestedFacetKeys.map((k) => (k || '').toString()));
         const primary = facetGroups.filter((g) => g && want.has((g.facetKey || '').toString()));
-        const standard = facetGroups.find((g) => (g?.facetKey || '') === 'standard') || null;
         const other = facetGroups.find((g) => (g?.facetKey || '') === '__other__' || String(g?.facetLabel || '').toUpperCase().includes('OTHER')) || null;
 
         const primaryCount = primary.reduce((acc, g) => acc + (Array.isArray(g.voices) ? g.voices.length : 0), 0);
         for (const g of primary) renderGroup(g);
 
-        if (primaryCount < (variantIntent.minResults || 10) && standard && Array.isArray(standard.voices) && standard.voices.length) {
-          renderGroup(standard);
-        }
-        const afterStd = primaryCount + (standard && standard.voices ? standard.voices.length : 0);
-        if (afterStd < (variantIntent.minResults || 10) && other && Array.isArray(other.voices) && other.voices.length) {
-          renderGroup(other);
+        if (primaryCount === 0) {
+          const fbKeys = Array.isArray(variantIntent.fallbackFacetKeys) ? variantIntent.fallbackFacetKeys : [];
+          const fallbackGroups = facetGroups.filter((g) => g && fbKeys.includes(String(g.facetKey || '')));
+          for (const g of fallbackGroups) renderGroup(g);
+          const fallbackCount = fallbackGroups.reduce((acc, g) => acc + (Array.isArray(g.voices) ? g.voices.length : 0), 0);
+          if (fallbackCount === 0 && other && Array.isArray(other.voices) && other.voices.length) {
+            renderGroup(other);
+          }
         }
       } else {
         for (const g of facetGroups) renderGroup(g);
