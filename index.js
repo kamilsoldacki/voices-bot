@@ -1,6 +1,8 @@
 const { App } = require('@slack/bolt');
 const axios = require('axios');
 const FormData = require('form-data');
+const fs = require('fs');
+const path = require('path');
 
 // -------------------------------------------------------------
 // In-memory conversation sessions (per Slack thread)
@@ -14,6 +16,447 @@ const KEYWORD_SEARCH_CONCURRENCY = 6; // limit concurrent keyword searches
 // Simple in-memory cache for shared-voices queries
 const sharedVoicesCache = new Map(); // key -> { at:number, voices:any[] }
 const SHARED_VOICES_CACHE_TTL_MS = 7 * 60 * 1000; // 7 minutes
+
+// -------------------------------------------------------------
+// Accent/locale catalog (loaded from disk + optional refresh)
+// -------------------------------------------------------------
+// Goal:
+// - keep bot fast by using an in-memory index
+// - only apply accent/locale as HARD query params when they are known-valid for the language
+//
+// Default path points to ../accents_all.json so this works when index.js lives in ~/Downloads
+// and accents_all.json lives in ~/
+const DEFAULT_ACCENTS_JSON_PATH = path.resolve(__dirname, '../accents_all.json');
+
+function normalizeCatalogToken(s) {
+  return (s || '')
+    .toString()
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .replace(/_/g, '-');
+}
+
+function normalizeLocaleToken(s) {
+  // Keep case-insensitive compare, preserve original for output.
+  return normalizeCatalogToken(s);
+}
+
+function slugifyAccentName(s) {
+  // Best-effort: "hong kong cantonese" -> "hong-kong-cantonese"
+  const t = normalizeCatalogToken(s);
+  return t
+    .replace(/[^a-z0-9 -]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+class AccentCatalog {
+  constructor(opts = {}) {
+    this.filePath = (opts.filePath || process.env.ACCENTS_JSON_PATH || DEFAULT_ACCENTS_JSON_PATH).toString();
+    this.loadedAt = 0;
+    this.byIso2 = new Map(); // iso2 -> { accents:Set<string>, locales:Set<string> }
+    this.zhAccentSlugs = []; // cached list (strings) built from accents when available
+    this.recentLanguageUse = new Map(); // iso2 -> lastSeenMs
+    this._lastLoadError = null;
+
+    // Background refresh knobs (safe defaults)
+    this.refreshTtlMs = Number(process.env.ACCENTS_REFRESH_TTL_MS || 0) || 24 * 60 * 60 * 1000; // 24h
+    this.refreshCheckMs = Number(process.env.ACCENTS_REFRESH_CHECK_MS || 0) || 15 * 60 * 1000; // 15m
+    this.refreshMaxPages = Math.max(1, Math.min(20, Number(process.env.ACCENTS_REFRESH_MAX_PAGES || 0) || 6));
+    this.refreshPageSize = Math.max(10, Math.min(100, Number(process.env.ACCENTS_REFRESH_PAGE_SIZE || 0) || 80));
+    this.refreshCap = Math.max(50, Math.min(2000, Number(process.env.ACCENTS_REFRESH_CAP || 0) || 800));
+    this.refreshLastAt = 0;
+    this._refreshInFlight = null;
+    this._refreshTimer = null;
+    this._refreshBackoffUntil = 0;
+  }
+
+  loadFromDiskSync() {
+    try {
+      const raw = fs.readFileSync(this.filePath, 'utf8');
+      const data = JSON.parse(raw);
+      this._ingestPayload(data);
+      this.loadedAt = Date.now();
+      this._lastLoadError = null;
+      return true;
+    } catch (e) {
+      this._lastLoadError = e;
+      return false;
+    }
+  }
+
+  noteLanguageUsed(iso2) {
+    try {
+      const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+      if (!k) return;
+      this.recentLanguageUse.set(k, Date.now());
+    } catch (_) {}
+  }
+
+  startBackgroundRefresh() {
+    try {
+      if (this._refreshTimer) return;
+      this._refreshTimer = setInterval(() => {
+        this.refreshIfDue().catch(() => {});
+      }, this.refreshCheckMs);
+      // Fire-and-forget quick check shortly after boot (non-blocking)
+      setTimeout(() => {
+        this.refreshIfDue().catch(() => {});
+      }, 2500);
+    } catch (_) {}
+  }
+
+  stopBackgroundRefresh() {
+    try {
+      if (this._refreshTimer) clearInterval(this._refreshTimer);
+      this._refreshTimer = null;
+    } catch (_) {}
+  }
+
+  async refreshIfDue() {
+    try {
+      const XI_KEY = process.env.ELEVENLABS_API_KEY;
+      if (!XI_KEY) return false;
+      const now = Date.now();
+      if (now < (this._refreshBackoffUntil || 0)) return false;
+      if (this.refreshLastAt && now - this.refreshLastAt < this.refreshTtlMs) return false;
+
+      if (this._refreshInFlight) return await this._refreshInFlight;
+
+      this._refreshInFlight = (async () => {
+        try {
+          const langs = this._computeRefreshLanguages();
+          if (!langs.length) {
+            this.refreshLastAt = Date.now();
+            return true;
+          }
+          await this._refreshLanguages(langs);
+          this.refreshLastAt = Date.now();
+          return true;
+        } catch (e) {
+          // Back off for 30 minutes after an unexpected failure
+          this._refreshBackoffUntil = Date.now() + 30 * 60 * 1000;
+          return false;
+        } finally {
+          this._refreshInFlight = null;
+        }
+      })();
+
+      return await this._refreshInFlight;
+    } catch (_) {
+      this._refreshInFlight = null;
+      return false;
+    }
+  }
+
+  _computeRefreshLanguages() {
+    try {
+      const defaults = ['en', 'es', 'pt', 'zh', 'pl'];
+      const recent = Array.from(this.recentLanguageUse.entries())
+        .sort((a, b) => (b[1] || 0) - (a[1] || 0))
+        .map(([k]) => (k || '').toString().toLowerCase().slice(0, 2))
+        .filter(Boolean)
+        .slice(0, 6);
+      const out = [];
+      const seen = new Set();
+      for (const k of [...recent, ...defaults]) {
+        const kk = (k || '').toString().toLowerCase().slice(0, 2);
+        if (!kk || seen.has(kk)) continue;
+        seen.add(kk);
+        out.push(kk);
+      }
+      return out;
+    } catch (_) {
+      return ['en', 'es', 'pt', 'zh', 'pl'];
+    }
+  }
+
+  async _refreshLanguages(iso2List) {
+    const langs = Array.isArray(iso2List) ? iso2List : [];
+    for (const iso2 of langs) {
+      try {
+        await this._refreshOneLanguage(iso2);
+        // small spacing between languages to reduce burstiness
+        await sleep(150);
+      } catch (_) {}
+    }
+  }
+
+  _extractBucketsFromVoices(voices) {
+    const out = { accent: new Set(), locale: new Set(), dialect: new Set(), region: new Set() };
+    const add = (set, val) => {
+      const t = normalizeCatalogToken(val);
+      if (t) set.add(t);
+    };
+    const addLocale = (val) => {
+      const t = normalizeLocaleToken(val);
+      if (!t) return;
+      out.locale.add(t);
+      // allow zh-* equivalents for cmn-* locales
+      const m = t.match(/^cmn-([a-z0-9]{2,3})$/i);
+      if (m) out.locale.add(`zh-${String(m[1]).toLowerCase()}`);
+    };
+    const addAny = (bucket, v) => {
+      if (typeof v === 'string') {
+        if (bucket === 'locale') addLocale(v);
+        else if (bucket === 'accent') add(out.accent, v);
+        else if (bucket === 'dialect') add(out.dialect, v);
+        else if (bucket === 'region') add(out.region, v);
+      } else if (Array.isArray(v)) {
+        v.forEach((x) => addAny(bucket, x));
+      }
+    };
+
+    for (const v of Array.isArray(voices) ? voices : []) {
+      if (!v || typeof v !== 'object') continue;
+      addAny('accent', v.accent);
+      addAny('locale', v.locale);
+      addAny('dialect', v.dialect);
+      addAny('region', v.region);
+      if (v.labels && typeof v.labels === 'object') {
+        addAny('accent', v.labels.accent || v.labels.language_accent);
+        addAny('locale', v.labels.locale);
+        addAny('dialect', v.labels.dialect);
+        addAny('region', v.labels.region);
+      }
+      if (v.sharing && typeof v.sharing === 'object' && v.sharing.labels && typeof v.sharing.labels === 'object') {
+        addAny('accent', v.sharing.labels.accent || v.sharing.labels.language_accent);
+        addAny('locale', v.sharing.labels.locale);
+        addAny('dialect', v.sharing.labels.dialect);
+        addAny('region', v.sharing.labels.region);
+      }
+    }
+    return out;
+  }
+
+  async _refreshOneLanguage(iso2) {
+    const code = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    if (!code) return false;
+    const XI_KEY = process.env.ELEVENLABS_API_KEY;
+    if (!XI_KEY) return false;
+
+    // Fetch a bounded sample of shared voices for the language and extract accent/locale-ish metadata.
+    const baseParams = new URLSearchParams();
+    baseParams.set('page_size', String(this.refreshPageSize));
+    baseParams.set('sort', 'created_date');
+    baseParams.set('include_custom_rates', 'false');
+
+    let voices = [];
+    try {
+      const p = new URLSearchParams(baseParams.toString());
+      p.set('required_languages', code);
+      voices = await callSharedVoicesAllPages(p, { maxPages: this.refreshMaxPages, cap: this.refreshCap });
+    } catch (e) {
+      const status = e?.response?.status;
+      // Fallback to `language=` if `required_languages=` isn't accepted by this endpoint/account
+      if (status === 400) {
+        try {
+          const p2 = new URLSearchParams(baseParams.toString());
+          p2.set('language', code);
+          voices = await callSharedVoicesAllPages(p2, { maxPages: this.refreshMaxPages, cap: this.refreshCap });
+        } catch (_) {
+          voices = [];
+        }
+      } else {
+        voices = [];
+      }
+    }
+
+    const buckets = this._extractBucketsFromVoices(voices || []);
+    const bucket = this._ensureBucket(code);
+    if (!bucket) return false;
+
+    // Swap in refreshed sets for this iso2 (keep others intact)
+    bucket.accents = new Set(Array.from(buckets.accent || []));
+    bucket.locales = new Set(Array.from(buckets.locale || []));
+
+    // Rebuild zh slug cache if needed
+    if (code === 'zh') {
+      const slugs = Array.from(bucket.accents || []).map((a) => slugifyAccentName(a)).filter(Boolean);
+      const seen = new Set();
+      this.zhAccentSlugs = slugs.filter((s) => {
+        const k = normalizeCatalogToken(s);
+        if (!k || seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+    }
+
+    // Persist back to JSON on disk (best-effort, keep file structure)
+    try {
+      const raw = fs.readFileSync(this.filePath, 'utf8');
+      const data = JSON.parse(raw);
+      const result = data && typeof data === 'object' ? (data.result || data) : null;
+      if (result && typeof result === 'object') {
+        let targetKey = null;
+        for (const [k, entry] of Object.entries(result)) {
+          const lc = (entry && typeof entry === 'object' && entry.language_code) ? String(entry.language_code).toLowerCase().slice(0, 2) : null;
+          if (lc === code) {
+            targetKey = k;
+            break;
+          }
+        }
+        if (!targetKey) targetKey = code;
+
+        const prev = (result[targetKey] && typeof result[targetKey] === 'object') ? result[targetKey] : {};
+        result[targetKey] = {
+          ...prev,
+          language_code: code,
+          voices_count: Array.isArray(voices) ? voices.length : (prev.voices_count || 0),
+          accent: Array.from(bucket.accents || []),
+          locale: Array.from(bucket.locales || []),
+          // keep previously-known dialect/region/other if present; refresh script can fill those more deeply
+          dialect: Array.isArray(prev.dialect) ? prev.dialect : [],
+          region: Array.isArray(prev.region) ? prev.region : [],
+          other: Array.isArray(prev.other) ? prev.other : []
+        };
+
+        const payload = data.result ? data : { result };
+        const tmp = `${this.filePath}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf8');
+        fs.renameSync(tmp, this.filePath);
+      }
+    } catch (_) {}
+
+    return true;
+  }
+
+  _ensureBucket(iso2) {
+    const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    if (!k) return null;
+    if (!this.byIso2.has(k)) {
+      this.byIso2.set(k, { accents: new Set(), locales: new Set() });
+    }
+    return this.byIso2.get(k);
+  }
+
+  _ingestPayload(data) {
+    this.byIso2 = new Map();
+    this.zhAccentSlugs = [];
+    const result = data && typeof data === 'object' ? (data.result || data) : null;
+    if (!result || typeof result !== 'object') return;
+
+    for (const [name, entry] of Object.entries(result)) {
+      const code = (entry && typeof entry === 'object' && entry.language_code) ? String(entry.language_code) : null;
+      const iso2 = (code || '').toLowerCase().slice(0, 2);
+      if (!iso2) continue;
+
+      const bucket = this._ensureBucket(iso2);
+      if (!bucket) continue;
+
+      const accents = Array.isArray(entry?.accent) ? entry.accent : [];
+      const locales = Array.isArray(entry?.locale) ? entry.locale : [];
+
+      accents.forEach((a) => {
+        const t = normalizeCatalogToken(a);
+        if (t) bucket.accents.add(t);
+      });
+
+      locales.forEach((loc) => {
+        const t = normalizeLocaleToken(loc);
+        if (!t) return;
+        bucket.locales.add(t);
+        // Chinese locales sometimes show up as cmn-CN/cmn-TW; allow zh-* equivalents
+        if (iso2 === 'zh') {
+          const m = t.match(/^cmn-([a-z0-9]{2,3})$/i);
+          if (m) {
+            bucket.locales.add(`zh-${String(m[1]).toLowerCase()}`);
+          }
+        }
+      });
+
+      // Build zh slugs list from accents (best-effort, filtered later per query)
+      if (iso2 === 'zh' && accents.length) {
+        accents.forEach((a) => {
+          const s = slugifyAccentName(a);
+          if (s) this.zhAccentSlugs.push(s);
+        });
+      }
+    }
+
+    // De-dupe zh slugs while preserving order
+    const zhSeen = new Set();
+    this.zhAccentSlugs = (this.zhAccentSlugs || []).filter((s) => {
+      const k = normalizeCatalogToken(s);
+      if (!k) return false;
+      if (zhSeen.has(k)) return false;
+      zhSeen.add(k);
+      return true;
+    });
+  }
+
+  isAccentAllowed(iso2, accent) {
+    try {
+      const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+      const a = normalizeCatalogToken(accent);
+      if (!k || !a) return false;
+      const bucket = this.byIso2.get(k);
+      if (!bucket) return false;
+      return bucket.accents.has(a);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  isLocaleAllowed(iso2, locale) {
+    try {
+      const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+      const l = normalizeLocaleToken(locale);
+      if (!k || !l) return false;
+      const bucket = this.byIso2.get(k);
+      if (!bucket) return false;
+      return bucket.locales.has(l);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // Used for zh fallback: get a small, safe list of accent slugs
+  getZhAccentSlugs({ dialect = null, limit = 10 } = {}) {
+    const all = Array.isArray(this.zhAccentSlugs) ? this.zhAccentSlugs : [];
+    if (!all.length) return [];
+    const d = (dialect || '').toString().toLowerCase();
+    let filtered = all;
+    if (d === 'cantonese') {
+      filtered = all.filter((s) => s.includes('cantonese'));
+      // include "standard" as last resort
+      if (filtered.length < limit) filtered = [...filtered, ...all.filter((s) => s === 'standard')];
+    } else if (d === 'mandarin') {
+      filtered = all.filter((s) => s.includes('mandarin'));
+      if (filtered.length < limit) filtered = [...filtered, ...all.filter((s) => s === 'standard')];
+    } else {
+      // general zh: prefer known zh-relevant slugs
+      filtered = all.filter((s) => s.includes('mandarin') || s.includes('cantonese') || s === 'standard');
+      if (!filtered.length) filtered = all;
+    }
+    return filtered.slice(0, Math.max(1, Math.min(50, Number(limit) || 10)));
+  }
+
+  // Choose locale candidate for Chinese dialect, based on what is actually present in catalog
+  getPreferredChineseLocales(dialect) {
+    const bucket = this.byIso2.get('zh');
+    const locales = bucket ? Array.from(bucket.locales || []) : [];
+    const set = new Set(locales.map((x) => normalizeLocaleToken(x)));
+    const want = (dialect || '').toString().toLowerCase();
+
+    // Prefer zh-* since the rest of the bot already uses zh-XX tags.
+    const pickFirst = (cands) => cands.find((c) => set.has(normalizeLocaleToken(c))) || null;
+
+    if (want === 'cantonese') {
+      return [pickFirst(['zh-hk', 'zh-tw', 'zh-cn'])].filter(Boolean);
+    }
+    if (want === 'mandarin') {
+      return [pickFirst(['zh-cn', 'zh-tw', 'zh-hk'])].filter(Boolean);
+    }
+    return [pickFirst(['zh-cn', 'zh-tw', 'zh-hk'])].filter(Boolean);
+  }
+}
+
+// Global catalog instance (wired into query logic later)
+const accentCatalog = new AccentCatalog();
+accentCatalog.loadFromDiskSync();
 
 // -------------------------------------------------------------
 // Language detection & normalization (ISO 639-1 + locale)
@@ -1018,6 +1461,30 @@ function dialectKeywordHints(dialect) {
     return ['mandarin', 'putonghua', 'china', 'mainland', 'zh-cn', 'simplified'];
   }
   return [];
+}
+
+// Accent slugs visible in ElevenLabs Voice Library UI (zh)
+const ZH_ACCENT_SLUGS = {
+  cantonese: ['hong-kong-cantonese', 'guangzhou-cantonese', 'singapore-cantonese'],
+  mandarin: ['beijing-mandarin', 'singapore-mandarin', 'taiwan-mandarin'],
+  standard: ['standard']
+};
+
+function getAccentSlugsForQuery(userText) {
+  // Per requirement: “sprawdzaj wtedy wszystko co dostępne” (soft; with fallback later).
+  const dialect = detectChineseDialectFromText(userText);
+  try {
+    const fromCatalog =
+      accentCatalog && typeof accentCatalog.getZhAccentSlugs === 'function'
+        ? accentCatalog.getZhAccentSlugs({ dialect, limit: 10 })
+        : [];
+    if (Array.isArray(fromCatalog) && fromCatalog.length) return dedupePreserveOrder(fromCatalog);
+  } catch (_) {}
+
+  const all = [...ZH_ACCENT_SLUGS.cantonese, ...ZH_ACCENT_SLUGS.mandarin, ...ZH_ACCENT_SLUGS.standard];
+  if (dialect === 'cantonese') return dedupePreserveOrder([...ZH_ACCENT_SLUGS.cantonese, ...ZH_ACCENT_SLUGS.standard]);
+  if (dialect === 'mandarin') return dedupePreserveOrder([...ZH_ACCENT_SLUGS.mandarin, ...ZH_ACCENT_SLUGS.standard]);
+  return dedupePreserveOrder(all);
 }
 
 function getRequestedAccent(userText, keywordPlan, requestedLocale) {
@@ -2206,6 +2673,9 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   if (plan.target_voice_language && typeof plan.target_voice_language === 'string') {
     language = plan.target_voice_language.slice(0, 2).toLowerCase();
   }
+  try {
+    if (language) accentCatalog?.noteLanguageUsed?.(language);
+  } catch (_) {}
 
   let accent = null;
   if (plan.target_accent && typeof plan.target_accent === 'string') {
@@ -2493,7 +2963,8 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
         qualityPref,
         featured: plan.__featured === true,
         sort: typeof plan.__sort === 'string' ? plan.__sort : null,
-        forceUseCases: plan.__forceUseCases === true
+        forceUseCases: plan.__forceUseCases === true,
+        traceCb: trace
       });
       params.set('search', kwUsed);
       try {
@@ -2768,6 +3239,51 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     });
   });
 
+  // Accent-slug fetch stage (zh): use UI slugs like hong-kong-cantonese / beijing-mandarin (soft)
+  if (seen.size === 0 && language === 'zh') {
+    try {
+      const slugs = getAccentSlugsForQuery(userText);
+      const wantMore = detectListAll(userText) === true || plan.__listAll === true;
+      for (const slug of slugs) {
+        const params = new URLSearchParams();
+        params.set('page_size', wantMore ? '80' : '40');
+        params.set('language', 'zh');
+        params.set('accent', slug);
+        if (gender) params.set('gender', gender);
+        if (qualityPref === 'high_only') params.set('category', 'high_quality');
+
+        let voicesSlug = [];
+        try {
+          voicesSlug = wantMore
+            ? await callSharedVoicesAllPages(params, { maxPages: 2, cap: 160 })
+            : await callSharedVoicesCached(params, async (p) => {
+                const { voices } = await callSharedVoicesRaw(p);
+                return voices;
+              });
+        } catch (_) {}
+
+        try {
+          trace({
+            stage: 'accent_slug',
+            params: paramsToObject(params),
+            count: Array.isArray(voicesSlug) ? voicesSlug.length : 0
+          });
+        } catch (_) {}
+
+        (voicesSlug || []).forEach((voice) => {
+          if (!voice || !voice.voice_id) return;
+          let entry = seen.get(voice.voice_id);
+          if (!entry) {
+            entry = { voice, matchedKeywords: new Set() };
+          }
+          // Tag the result with the accent slug for ranking/diagnostics
+          entry.matchedKeywords.add(slug);
+          seen.set(voice.voice_id, entry);
+        });
+      }
+    } catch (_) {}
+  }
+
   // 2) fallback: if nothing found at all, try a combined-search query
   if (seen.size === 0) {
     const params = new URLSearchParams();
@@ -2779,7 +3295,8 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
       qualityPref,
       featured: plan.__featured === true,
       sort: typeof plan.__sort === 'string' ? plan.__sort : null,
-      forceUseCases: plan.__forceUseCases === true
+      forceUseCases: plan.__forceUseCases === true,
+      traceCb: trace
     });
 
     const fallbackSearch =
@@ -3030,6 +3547,15 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   const chineseDialect = language === 'zh' ? detectChineseDialectFromText(userText) : null;
   const preferredZhLocales = preferredLocalesForChineseDialect(chineseDialect).map((x) => String(x).toLowerCase());
   const dialectHints = new Set(dialectKeywordHints(chineseDialect).map(normalizeKw));
+  const zhAccentSlugs = new Set(
+    language === 'zh'
+      ? [
+          ...(ZH_ACCENT_SLUGS.cantonese || []),
+          ...(ZH_ACCENT_SLUGS.mandarin || []),
+          ...(ZH_ACCENT_SLUGS.standard || [])
+        ].map(normalizeKw)
+      : []
+  );
 
   function calcCoverageScore(v) {
     const mk = Array.isArray(v._matched_keywords) ? v._matched_keywords : [];
@@ -3101,6 +3627,15 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
         } else if (chineseDialect === 'mandarin') {
           if (/\b(zh-cn|china|mainland|simplified|mandarin|putonghua)\b/.test(blob) || blob.includes('普通话')) coverage += 0.4;
         }
+      }
+    } catch (_) {}
+
+    // Accent-slug boost (zh): if we fetched this voice via accent=<slug>, reward it.
+    try {
+      if (language === 'zh' && zhAccentSlugs.size) {
+        const mkNorm = mk.map(normalizeKw);
+        const hasSlug = mkNorm.some((k) => zhAccentSlugs.has(k));
+        if (hasSlug) coverage += 1.0;
       }
     } catch (_) {}
 
@@ -3226,7 +3761,8 @@ async function fetchTopVoicesByLanguage(languageCode, qualityPreference, plan, u
       qualityPref: qualityPreference,
       featured: plan?.__featured === true,
       sort: typeof plan?.__sort === 'string' ? plan.__sort : null,
-      forceUseCases: plan?.__forceUseCases === true
+      forceUseCases: plan?.__forceUseCases === true,
+      traceCb: trace
     });
 
     const url = `https://api.elevenlabs.io/v1/shared-voices?${params.toString()}`;
@@ -3341,6 +3877,8 @@ Think like a human curator:
      - If the user explicitly asks for a Chinese dialect (e.g. "cantonese" or "mandarin"), treat it as a strong constraint:
        - Strongly reward candidates whose matched_keywords include that dialect or its obvious region hints (e.g. hong kong, zh-hk for cantonese; china, zh-cn for mandarin).
        - Prefer locale matches when present (zh-HK for cantonese; zh-CN for mandarin).
+       - Also strongly reward candidates that were retrieved via an ElevenLabs accent filter slug in matched_keywords
+         (e.g. hong-kong-cantonese, guangzhou-cantonese, beijing-mandarin, taiwan-mandarin, standard).
 
    - Gender:
      - If target_gender is clear, reward matching voices and slightly penalize opposite gender.
@@ -4049,10 +4587,56 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   const sort = typeof options.sort === 'string' ? options.sort : null;
   const forceUseCases = options.forceUseCases === true;
   const forceDescriptives = options.forceDescriptives === true;
+  const trace = typeof options.traceCb === 'function' ? options.traceCb : () => {};
   const lowerText = (userText || '').toLowerCase();
   const isBilingualEnEs = detectBilingualEnEs(userText);
   const chineseDialect = detectChineseDialectFromText(userText);
-  const chinesePreferredLocales = preferredLocalesForChineseDialect(chineseDialect);
+  const chinesePreferredLocales = (() => {
+    try {
+      if (language === 'zh' && accentCatalog && typeof accentCatalog.getPreferredChineseLocales === 'function') {
+        const list = accentCatalog.getPreferredChineseLocales(chineseDialect);
+        if (Array.isArray(list) && list.length) return list;
+      }
+    } catch (_) {}
+    return preferredLocalesForChineseDialect(chineseDialect);
+  })();
+
+  const hasCatalogForLang = (iso2) => {
+    try {
+      const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+      if (!k) return false;
+      return !!(accentCatalog && accentCatalog.byIso2 && accentCatalog.byIso2.has(k));
+    } catch (_) {
+      return false;
+    }
+  };
+  const isAccentAllowedByCatalog = (iso2, acc) => {
+    try {
+      if (!hasCatalogForLang(iso2)) return true; // graceful fallback if no catalog data
+      return !!(accentCatalog && accentCatalog.isAccentAllowed && accentCatalog.isAccentAllowed(iso2, acc));
+    } catch (_) {
+      return true;
+    }
+  };
+  const isLocaleAllowedByCatalog = (iso2, loc) => {
+    try {
+      if (!hasCatalogForLang(iso2)) return true; // graceful fallback if no catalog data
+      return !!(accentCatalog && accentCatalog.isLocaleAllowed && accentCatalog.isLocaleAllowed(iso2, loc));
+    } catch (_) {
+      return true;
+    }
+  };
+
+  const diag = {
+    language: (language || '-').toString(),
+    accent_candidate: accent ? String(accent) : '-',
+    accent_set: '-',
+    accent_allowed: '-',
+    accent_reason: '-',
+    locale_set: '-',
+    locale_allowed: '-',
+    locale_reason: '-'
+  };
   const isFrenchCanadian =
     (language === 'fr' || /\bfrench\b|\bfr\b/.test(lowerText)) &&
     (/\b(canadian|quebec|québec|fr-ca|qc|french canadian|canadian french)\b/.test(lowerText));
@@ -4072,7 +4656,16 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   if (!isBilingualEnEs && language && shouldApplyParam('language', plan, userText)) params.set('language', language);
   // Accent: allow Spanish Mexico heuristic even without explicit "accent"
   if (isSpanishMexico) {
-    params.set('accent', 'mexican');
+    if (isAccentAllowedByCatalog('es', 'mexican')) {
+      params.set('accent', 'mexican');
+      diag.accent_set = 'mexican';
+      diag.accent_allowed = 'true';
+      diag.accent_reason = 'spanish_mexico';
+    } else {
+      diag.accent_set = 'mexican';
+      diag.accent_allowed = 'false';
+      diag.accent_reason = 'spanish_mexico_catalog_reject';
+    }
   } else if (isFrenchCanadian) {
     // Prefer locale=fr-CA over hard accent filtering (accent metadata can be inconsistent)
     // Keep accent as a soft preference via keywords/ranking, not as a strict query param.
@@ -4081,7 +4674,16 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   } else if (language === 'zh' && chineseDialect) {
     // Prefer locale-based hinting for Mandarin vs Cantonese (soft)
   } else if (accent && shouldApplyParam('accent', plan, userText)) {
-    params.set('accent', accent);
+    if (isAccentAllowedByCatalog(language, accent)) {
+      params.set('accent', accent);
+      diag.accent_set = String(accent);
+      diag.accent_allowed = 'true';
+      diag.accent_reason = 'explicit_or_default';
+    } else {
+      diag.accent_set = String(accent);
+      diag.accent_allowed = 'false';
+      diag.accent_reason = 'catalog_reject';
+    }
   }
   if (gender && shouldApplyParam('gender', plan, userText)) params.set('gender', gender);
   if (qualityPref === 'high_only') {
@@ -4120,35 +4722,82 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   for (const d of descriptives) params.append('descriptives', d);
 
   let loc = inferLocale(language, isSpanishMexico ? 'mexican' : accent, userText);
-  if (loc && shouldApplyParam('locale', plan, userText)) params.set('locale', loc);
+  if (loc && shouldApplyParam('locale', plan, userText)) {
+    if (isLocaleAllowedByCatalog(language, loc)) {
+      params.set('locale', loc);
+      diag.locale_set = String(loc);
+      diag.locale_allowed = 'true';
+      diag.locale_reason = 'infer_locale';
+    } else {
+      diag.locale_set = String(loc);
+      diag.locale_allowed = 'false';
+      diag.locale_reason = 'infer_locale_catalog_reject';
+      loc = null;
+    }
+  }
   // Force es-MX locale for Spanish Mexico heuristic
   if (isSpanishMexico) {
-    params.set('locale', 'es-MX');
-    loc = 'es-MX';
+    if (isLocaleAllowedByCatalog('es', 'es-MX')) {
+      params.set('locale', 'es-MX');
+      loc = 'es-MX';
+      diag.locale_set = 'es-MX';
+      diag.locale_allowed = 'true';
+      diag.locale_reason = 'spanish_mexico';
+    }
   }
   // Force es-419 locale for LATAM Spanish briefs
   if (isSpanishLatam && !isSpanishMexico) {
-    params.set('locale', 'es-419');
-    loc = 'es-419';
+    if (isLocaleAllowedByCatalog('es', 'es-419')) {
+      params.set('locale', 'es-419');
+      loc = 'es-419';
+      diag.locale_set = 'es-419';
+      diag.locale_allowed = 'true';
+      diag.locale_reason = 'spanish_latam';
+    }
   }
   // Force es-ES locale for European/Spain Spanish briefs
   if (isSpanishSpain && !isSpanishMexico) {
-    params.set('locale', 'es-ES');
-    loc = 'es-ES';
+    if (isLocaleAllowedByCatalog('es', 'es-ES')) {
+      params.set('locale', 'es-ES');
+      loc = 'es-ES';
+      diag.locale_set = 'es-ES';
+      diag.locale_allowed = 'true';
+      diag.locale_reason = 'spanish_spain';
+    }
   }
   // Force fr-CA locale for French Canadian briefs
   if (isFrenchCanadian) {
-    params.set('locale', 'fr-CA');
-    loc = 'fr-CA';
+    if (isLocaleAllowedByCatalog('fr', 'fr-CA')) {
+      params.set('locale', 'fr-CA');
+      loc = 'fr-CA';
+      diag.locale_set = 'fr-CA';
+      diag.locale_allowed = 'true';
+      diag.locale_reason = 'french_canadian';
+    }
   }
   // Prefer dialect locale for Chinese (soft; only if allowed to apply locale)
   if (language === 'zh' && chineseDialect && chinesePreferredLocales.length && shouldApplyParam('locale', plan, userText)) {
     // Only set if not already set by other logic
     if (!loc) {
-      params.set('locale', chinesePreferredLocales[0]);
-      loc = chinesePreferredLocales[0];
+      const preferred = chinesePreferredLocales[0];
+      if (preferred && isLocaleAllowedByCatalog('zh', preferred)) {
+        params.set('locale', preferred);
+        loc = preferred;
+        diag.locale_set = String(preferred);
+        diag.locale_allowed = 'true';
+        diag.locale_reason = 'chinese_dialect_preferred';
+      }
     }
   }
+
+  // Emit a single, de-duped diagnostics line for catalog filters
+  try {
+    const sig = `${diag.language}|a:${diag.accent_set}|aok:${diag.accent_allowed}|l:${diag.locale_set}|lok:${diag.locale_allowed}`;
+    if (!global.__lastCatalogSig || global.__lastCatalogSig !== sig) {
+      trace({ stage: 'catalog_filters', params: diag, count: 0 });
+      global.__lastCatalogSig = sig;
+    }
+  } catch (_) {}
 
   if (featured && shouldApplyParam('featured', plan, userText, { featured })) params.set('featured', 'true');
   if (age && shouldApplyParam('age', plan, userText)) params.set('age', age);
@@ -4505,6 +5154,31 @@ function buildSearchReport(trace, plan, mode, summary) {
       }
     } catch (_) {}
 
+    // Accent-slug fetch diagnostics (zh)
+    try {
+      const slugEntries = trace.filter((t) => t && t.stage === 'accent_slug');
+      if (slugEntries.length) {
+        const ok = slugEntries.filter((t) => (t.count || 0) > 0);
+        const used = slugEntries
+          .map((t) => String(t?.params?.accent || '').trim())
+          .filter(Boolean);
+        const usedUniq = Array.from(new Set(used));
+        lines.push(`Accent slugs: tried=${slugEntries.length}, unique=${usedUniq.length}, with_results=${ok.length}`);
+        const topOk = ok
+          .map((t) => ({ accent: String(t?.params?.accent || ''), count: t.count || 0 }))
+          .filter((x) => x.accent)
+          .sort((a, b) => b.count - a.count)
+          .slice(0, 8);
+        if (topOk.length) {
+          lines.push('Accent slugs with results:');
+          topOk.forEach((x) => lines.push(`• ${x.accent}: ${x.count}`));
+        }
+        const fellBackBroad = trace.some((t) => t && t.stage === 'broad');
+        lines.push(`Broad fallback used: ${fellBackBroad ? 'yes' : 'no'}`);
+        lines.push('');
+      }
+    } catch (_) {}
+
     const max = Math.min(trace.length, 30);
     for (let i = 0; i < max; i++) {
       const t = trace[i];
@@ -4517,6 +5191,8 @@ function buildSearchReport(trace, plan, mode, summary) {
         lines.push(`• per_keyword_alt_use_cases: "${t.keyword}"${vTag}${cTag} (${params}) → ${t.count}`);
       } else if (t.stage === 'per_keyword_variant') {
         lines.push(`• per_keyword_variant: "${t.keyword}"${vTag}${cTag} (${params}) → ${t.count}`);
+      } else if (t.stage === 'accent_slug') {
+        lines.push(`• accent_slug (${params}) → ${t.count}`);
       } else if (t.stage === 'combined') {
         lines.push(`• combined (${params}) → ${t.count}`);
       } else if (t.stage === 'broad') {
@@ -5481,6 +6157,9 @@ app.action('cycle_quality', async ({ ack, body, client }) => {
   validateEnvOrExit();
   runDevAsserts();
   startMemoryCleanup();
+  try {
+    accentCatalog?.startBackgroundRefresh?.();
+  } catch (_) {}
   const port = process.env.PORT || 3000;
   await app.start(port);
   console.log('⚡️ voices-bot is running on port ' + port);
