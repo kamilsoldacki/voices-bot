@@ -5410,7 +5410,8 @@ function buildMessageFromSession(session) {
       } else {
         for (const g of facetGroups) renderGroup(g);
       }
-      return out.join('\n');
+      const msg = out.join('\n');
+      return msg && String(msg).trim() ? msg : labels.noVoices;
     }
   } catch (_) {}
 
@@ -5503,7 +5504,8 @@ function buildMessageFromSession(session) {
 
   // Removed follow-up hints/footers
 
-  return lines.join('\n');
+  const msg = lines.join('\n');
+  return msg && String(msg).trim() ? msg : labels.noVoices;
 }
 
 function buildBlocksFromText(text) {
@@ -6834,6 +6836,23 @@ async function postPocReportDm(client, text) {
   }
 }
 
+async function safePostMessage(client, payload, fallbackText) {
+  const labels = getLabels?.();
+  const fallback =
+    (fallbackText && String(fallbackText).trim()) ||
+    (labels?.noVoices && String(labels.noVoices).trim()) ||
+    '–';
+
+  const rawText = payload?.text;
+  const text = rawText == null ? '' : typeof rawText === 'string' ? rawText : String(rawText);
+  const safeText = text.trim() ? text : fallback;
+
+  const safePayload = { ...(payload || {}), text: safeText };
+  if (!safePayload.blocks) delete safePayload.blocks;
+
+  return await client.chat.postMessage(safePayload);
+}
+
 // -------------------------------------------------------------
 // New search handler
 // -------------------------------------------------------------
@@ -7028,12 +7047,16 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         }
         // cap blocks and post
         const blocks = buildBlocksFromText(message);
-        await client.chat.postMessage({
-          channel: event.channel,
-          thread_ts: threadTs,
-          text: message,
-          blocks: blocks || undefined
-        });
+        await safePostMessage(
+          client,
+          {
+            channel: event.channel,
+            thread_ts: threadTs,
+            text: message,
+            blocks: blocks || undefined
+          },
+          labels.noVoices
+        );
         if (process.env.POC_SEARCH_REPORT === 'true') {
           let report = buildSearchReport(searchTrace, keywordPlan, 'multi_intent', { unique_count: subSessions.reduce((acc, s) => acc + (Array.isArray(s.session.voices) ? s.session.voices.length : 0), 0) });
           report = await translateForUserLanguage(report, uiLang);
@@ -7068,14 +7091,19 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           }
         } catch (_) {}
         const outText = hint ? (noResText + (await translateForUserLanguage(hint, uiLang))) : noResText;
-        await client.chat.postMessage({
-          channel: event.channel,
-          thread_ts: threadTs,
-          text: outText
-        });
+        await safePostMessage(
+          client,
+          {
+            channel: event.channel,
+            thread_ts: threadTs,
+            text: outText
+          },
+          labels.noVoices
+        );
         return;
       }
       const ranked = await rankVoicesWithGPT(cleaned, keywordPlan, voices);
+      let softQualityNote = '';
       const session = {
         originalQuery: cleaned,
         keywordPlan,
@@ -7097,6 +7125,22 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         },
         lastActive: Date.now()
       };
+      // "preferably HQ" should be treated as a soft preference for similar-voices results:
+      // if we can't confirm any HQ results, show the best similar matches anyway (and note it).
+      try {
+        const prefersHq = (keywordPlan?.quality_preference || 'any') === 'high_only';
+        const isSoft =
+          /\b(preferably|if possible|ideally)\b/i.test(cleaned || '') ||
+          /\b(najlepiej|w\s*miarę\s*możliwości)\b/i.test(cleaned || '');
+        if (prefersHq && isSoft) {
+          const hqCount = Array.isArray(voices) ? voices.filter((v) => isHighQuality(v)).length : 0;
+          if (hqCount === 0) {
+            session.filters.quality = 'any';
+            softQualityNote =
+              "Note: I couldn't confirm any similar voices as high quality, so I’m showing the best similar matches regardless of HQ.";
+          }
+        }
+      } catch (_) {}
       sessions[threadTs] = session;
       // Similarity results: if query is strongly language-specific, enforce strict verified language matches.
       {
@@ -7146,12 +7190,16 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           let strictMessage = strictHeader + '\n' + strictBody;
           strictMessage = await translateForUserLanguage(strictMessage, session.uiLanguage);
           const strictBlocks = buildBlocksFromText(strictMessage);
-          await client.chat.postMessage({
-            channel: event.channel,
-            thread_ts: threadTs,
-            text: strictMessage,
-            blocks: strictBlocks || undefined
-          });
+          await safePostMessage(
+            client,
+            {
+              channel: event.channel,
+              thread_ts: threadTs,
+              text: strictMessage,
+              blocks: strictBlocks || undefined
+            },
+            labels.noVoices
+          );
 
           if (verifiedOnly.length) {
             let vMsg = buildVerifiedFallbackMessageSoft(
@@ -7164,12 +7212,16 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
             );
             vMsg = await translateForUserLanguage(vMsg, session.uiLanguage);
             const vBlocks = buildBlocksFromText(vMsg);
-            await client.chat.postMessage({
-              channel: event.channel,
-              thread_ts: threadTs,
-              text: vMsg,
-              blocks: vBlocks || undefined
-            });
+            await safePostMessage(
+              client,
+              {
+                channel: event.channel,
+                thread_ts: threadTs,
+                text: vMsg,
+                blocks: vBlocks || undefined
+              },
+              labels.noVoices
+            );
           }
 
           if (notVerified.length) {
@@ -7182,24 +7234,33 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
             );
             fallbackMsg = await translateForUserLanguage(fallbackMsg, session.uiLanguage);
             const fbBlocks = buildBlocksFromText(fallbackMsg);
-            await client.chat.postMessage({
-              channel: event.channel,
-              thread_ts: threadTs,
-              text: fallbackMsg,
-              blocks: fbBlocks || undefined
-            });
+            await safePostMessage(
+              client,
+              {
+                channel: event.channel,
+                thread_ts: threadTs,
+                text: fallbackMsg,
+                blocks: fbBlocks || undefined
+              },
+              labels.noVoices
+            );
           }
         } else {
           // Single unified result message
           let message = buildMessageFromSession(session);
+          if (softQualityNote) message = softQualityNote + '\n\n' + message;
           message = await translateForUserLanguage(message, session.uiLanguage);
           const blocks = buildBlocksFromText(message);
-          await client.chat.postMessage({
-            channel: event.channel,
-            thread_ts: threadTs,
-            text: message,
-            blocks: blocks || undefined
-          });
+          await safePostMessage(
+            client,
+            {
+              channel: event.channel,
+              thread_ts: threadTs,
+              text: message,
+              blocks: blocks || undefined
+            },
+            labels.noVoices
+          );
         }
       }
       if (process.env.POC_SEARCH_REPORT === 'true') {
@@ -7467,7 +7528,7 @@ app.event('app_mention', async ({ event, client }) => {
           const msg0 = buildFacetClarifyMessage(existing.pendingFacetQuestion) || getLabels().genericError;
           const msg = await translateForUserLanguage(msg0, existing.uiLanguage);
           const blocks = buildBlocksFromText(msg);
-          await client.chat.postMessage({
+          await safePostMessage(client, {
             channel: event.channel,
             thread_ts: threadTs,
             text: msg,
@@ -7496,7 +7557,11 @@ app.event('app_mention', async ({ event, client }) => {
         if (!voices.length) {
           const labels = getLabels();
           const noResText = await translateForUserLanguage(labels.noResults, existing.uiLanguage);
-          await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: noResText });
+          await safePostMessage(client, {
+            channel: event.channel,
+            thread_ts: threadTs,
+            text: noResText
+          });
           existing.keywordPlan = plan;
           existing.voices = [];
           existing.ranking = {};
@@ -7511,7 +7576,7 @@ app.event('app_mention', async ({ event, client }) => {
         let msg = buildMessageFromSession(existing);
         msg = await translateForUserLanguage(msg, existing.uiLanguage);
         const blocks = buildBlocksFromText(msg);
-        await client.chat.postMessage({
+        await safePostMessage(client, {
           channel: event.channel,
           thread_ts: threadTs,
           text: msg,
@@ -7531,7 +7596,7 @@ app.event('app_mention', async ({ event, client }) => {
       let msg = buildLanguagesMessage(existing);
       msg = await translateForUserLanguage(msg, existing.uiLanguage);
       const blocks = buildBlocksFromText(msg);
-      await client.chat.postMessage({
+      await safePostMessage(client, {
         channel: event.channel,
         thread_ts: threadTs,
         text: msg,
@@ -7544,7 +7609,7 @@ app.event('app_mention', async ({ event, client }) => {
       let msg = buildWhichHighMessage(existing);
       msg = await translateForUserLanguage(msg, existing.uiLanguage);
       const blocks = buildBlocksFromText(msg);
-      await client.chat.postMessage({
+      await safePostMessage(client, {
         channel: event.channel,
         thread_ts: threadTs,
         text: msg,
@@ -7571,7 +7636,7 @@ app.event('app_mention', async ({ event, client }) => {
         if (!voices.length) {
           const labels = getLabels();
           const noResText = await translateForUserLanguage(labels.noResults, existing.uiLanguage);
-          await client.chat.postMessage({
+          await safePostMessage(client, {
             channel: event.channel,
             thread_ts: threadTs,
             text: noResText
@@ -7590,7 +7655,7 @@ app.event('app_mention', async ({ event, client }) => {
       let msg = buildMessageFromSession(existing);
       msg = await translateForUserLanguage(msg, existing.uiLanguage);
       const blocks = buildBlocksFromText(msg);
-      await client.chat.postMessage({
+      await safePostMessage(client, {
         channel: event.channel,
         thread_ts: threadTs,
         text: msg,
@@ -7620,7 +7685,7 @@ app.event('app_mention', async ({ event, client }) => {
       if (!voices.length) {
         const labels = getLabels();
         const noResText = await translateForUserLanguage(labels.noResults, existing.uiLanguage);
-        await client.chat.postMessage({
+        await safePostMessage(client, {
           channel: event.channel,
           thread_ts: threadTs,
           text: noResText
@@ -7638,7 +7703,7 @@ app.event('app_mention', async ({ event, client }) => {
       let msg = buildMessageFromSession(existing);
       msg = await translateForUserLanguage(msg, existing.uiLanguage);
       const blocks = buildBlocksFromText(msg);
-      await client.chat.postMessage({
+      await safePostMessage(client, {
         channel: event.channel,
         thread_ts: threadTs,
         text: msg,
