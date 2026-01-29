@@ -3357,6 +3357,8 @@ IMPORTANT:
 
     // Negative accent exclusions (e.g. "not Flemish accent")
     try {
+      // Keep invariant: always either string iso2 or null (never undefined)
+      plan.__excludedAccentsIso2 = null;
       const hintedIso2 = (
         plan?.target_voice_language ||
         parseUserLanguageHints(userText)?.iso2 ||
@@ -3369,11 +3371,22 @@ IMPORTANT:
       const excluded = hintedIso2 ? extractNegativeAccents(userText, hintedIso2, facetKB) : [];
       plan.__excludedAccents = Array.isArray(excluded) ? excluded : [];
       if (plan.__excludedAccents.length) {
-        // Safety: never treat a negated accent as a positive target_accent
-        plan.target_accent = null;
+        // Persist the language used for exclusion parsing, even if we later clear target_voice_language
+        // (we may broaden search by language, but exclusions should still apply consistently).
+        plan.__excludedAccentsIso2 = hintedIso2 || null;
+
+        // Safety: only clear target_accent if it conflicts with an excluded accent.
+        const t = normalizeRequestedAccent(plan?.target_accent);
+        if (t) {
+          const exSet = new Set(plan.__excludedAccents.map((x) => normalizeRequestedAccent(x)).filter(Boolean));
+          if (exSet.has(t)) {
+            plan.target_accent = null;
+          }
+        }
       }
     } catch (_) {
       plan.__excludedAccents = Array.isArray(plan.__excludedAccents) ? plan.__excludedAccents : [];
+      plan.__excludedAccentsIso2 = null;
     }
 
     // Accent as soft preference unless explicitly mentioned by user
@@ -4953,8 +4966,16 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
 
   // Post-filter: exclude explicitly negated accents (e.g. "not Flemish accent")
   try {
-    const iso2 = (language || '').toString().toLowerCase().slice(0, 2);
     const exclArr = Array.isArray(plan?.__excludedAccents) ? plan.__excludedAccents : [];
+    const iso2 = (
+      language ||
+      plan?.__excludedAccentsIso2 ||
+      parseUserLanguageHints(userText)?.iso2 ||
+      ''
+    )
+      .toString()
+      .toLowerCase()
+      .slice(0, 2);
     if (iso2 && Array.isArray(voices) && exclArr.length) {
       const excluded = new Set(exclArr.map((x) => normalizeRequestedAccent(x)).filter(Boolean));
       const excludedLocales = new Set();
@@ -4962,6 +4983,8 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
       if (iso2 === 'nl' && excluded.has('flemish')) excludedLocales.add('nl-BE');
 
       const before = voices.length;
+      let errorRemoved = 0;
+      const errorSamples = [];
       voices = voices.filter((v) => {
         if (!v) return false;
         try {
@@ -4975,7 +4998,19 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
               if (excludedLocales.has(l)) return false;
             }
           }
-        } catch (_) {}
+        } catch (err) {
+          // Fail closed: if verification fails, do NOT include the voice,
+          // otherwise we could defeat the user's exclusion intent.
+          try {
+            errorRemoved += 1;
+            if (errorSamples.length < 3) {
+              errorSamples.push(
+                `${String(v?.voice_id || '-')}|${String(err?.message || err || 'error')}`.slice(0, 140)
+              );
+            }
+          } catch (_) {}
+          return false;
+        }
         return true;
       });
       const removed = before - voices.length;
@@ -4989,6 +5024,20 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
               excluded_locales: Array.from(excludedLocales).join(',') || '-'
             },
             count: removed
+          });
+        } catch (_) {}
+      }
+      if (errorRemoved > 0) {
+        try {
+          trace({
+            stage: 'exclude_accents_error',
+            params: {
+              iso2,
+              excluded: Array.from(excluded).join(',') || '-',
+              excluded_locales: Array.from(excludedLocales).join(',') || '-',
+              samples: errorSamples.length ? errorSamples.join(';;') : '-'
+            },
+            count: errorRemoved
           });
         } catch (_) {}
       }
