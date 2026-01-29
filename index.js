@@ -1554,11 +1554,14 @@ async function httpGetWithRetry(url, config) {
   });
 }
 
-async function httpPostWithRetry(url, data, config) {
-  return withRetry(async () => {
-    const res = await axios.post(url, data, config);
-    return res;
-  });
+async function httpPostWithRetry(url, data, config, retryOptions = null) {
+  return withRetry(
+    async () => {
+      const res = await axios.post(url, data, config);
+      return res;
+    },
+    retryOptions || undefined
+  );
 }
 
 function isDuplicateRequest(threadTs, cleaned) {
@@ -1578,6 +1581,7 @@ function safeLogAxiosError(context, err) {
   try {
     const status = err?.response?.status;
     const statusText = err?.response?.statusText;
+    const code = err?.code;
     const msg =
       err?.response?.data?.error?.message ||
       err?.message ||
@@ -1586,7 +1590,7 @@ function safeLogAxiosError(context, err) {
       err?.response?.headers?.['x-request-id'] ||
       err?.response?.headers?.['x-openai-request-id'];
     console.error(
-      `[${context}] ${status || ''} ${statusText || ''} ${msg}${
+      `[${context}] ${code ? `${code} ` : ''}${status || ''} ${statusText || ''} ${msg}${
         rid ? ` (request_id=${rid})` : ''
       }`
     );
@@ -5528,6 +5532,10 @@ Every candidate_voices.voice_id MUST appear exactly once in "ranking".
     temperature: 0
   };
 
+  const rankTimeoutMs = readEnvNumber('OPENAI_RANK_TIMEOUT_MS', 60000);
+  const rankAttempts = Math.max(1, Math.min(3, Math.floor(readEnvNumber('OPENAI_RANK_ATTEMPTS', 2))));
+  const rankBaseDelayMs = Math.max(50, Math.min(2000, Math.floor(readEnvNumber('OPENAI_RANK_BASE_DELAY_MS', 400))));
+
   try {
     const response = await httpPostWithRetry(
       'https://api.openai.com/v1/chat/completions',
@@ -5537,7 +5545,12 @@ Every candidate_voices.voice_id MUST appear exactly once in "ranking".
           Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
           'Content-Type': 'application/json'
         },
-        timeout: 25000
+        timeout: rankTimeoutMs
+      },
+      {
+        attempts: rankAttempts,
+        baseDelayMs: rankBaseDelayMs,
+        maxDelayMs: 3000
       }
     );
 
