@@ -1,8 +1,22 @@
-const { App } = require('@slack/bolt');
-const axios = require('axios');
-const FormData = require('form-data');
 const fs = require('fs');
 const path = require('path');
+
+// Allow running DEV_ASSERTS without installing external deps.
+const DEV_ASSERTS_ENABLED = ['true', '1', 'yes'].includes(
+  String(process.env.DEV_ASSERTS || '').trim().toLowerCase()
+);
+
+let axios = null;
+let FormData = null;
+try {
+  // External deps (required for runtime, optional for DEV_ASSERTS)
+  axios = require('axios');
+  FormData = require('form-data');
+} catch (e) {
+  if (!DEV_ASSERTS_ENABLED) throw e;
+}
+
+let app = null;
 
 // -------------------------------------------------------------
 // In-memory conversation sessions (per Slack thread)
@@ -28,9 +42,16 @@ const KEYWORD_TRANSLATE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 // - keep bot fast by using an in-memory index
 // - only apply accent/locale as HARD query params when they are known-valid for the language
 //
-// Default path points to ../accents_all.json so this works when index.js lives in ~/Downloads
-// and accents_all.json lives in ~/
-const DEFAULT_ACCENTS_JSON_PATH = path.resolve(__dirname, '../accents_all.json');
+// Default path:
+// - prefer ./accents_all.json (repo layout: index.js + accents_all.json in same folder)
+// - fallback to ../accents_all.json (older layout: index.js in ~/Downloads, accents_all.json in ~/)
+const DEFAULT_ACCENTS_JSON_PATH = (() => {
+  try {
+    const here = path.resolve(__dirname, './accents_all.json');
+    if (fs.existsSync(here)) return here;
+  } catch (_) {}
+  return path.resolve(__dirname, '../accents_all.json');
+})();
 
 function normalizeCatalogToken(s) {
   return (s || '')
@@ -1154,6 +1175,15 @@ const ACCENT_ALIASES = new Map([
   ['canadian', 'canadian'],
   ['irish', 'irish'],
   ['scottish', 'scottish'],
+  // Dutch
+  ['flemish', 'flemish'],
+  // Polish (best-effort)
+  ['flamandzki', 'flemish'],
+  ['flamandzkiego', 'flemish'],
+  ['flamandzkim', 'flemish'],
+  ['flamandzka', 'flemish'],
+  ['flamandzką', 'flemish'],
+  ['flamandzka', 'flemish'],
   // Spanish
   ['mexican', 'mexican'],
   ['latin american', 'latin american'],
@@ -1925,9 +1955,36 @@ function getRequestedLocale(userText, keywordPlan) {
   return candidate;
 }
 
+function hasNegatedAccentConstraint(userText) {
+  try {
+    const lower = (userText || '').toString().toLowerCase();
+    if (!lower) return false;
+    // Mirror patterns from extractNegativeAccents(), but as boolean checks.
+    return (
+      /\b(?:should|must|do)\s+not\s+(?:have|use|be|sound(?:ing)?|include)\s+(?:an?\s+)?[a-z][a-z\s\-]{0,40}?\s+(?:accent|akcent)\b/i.test(lower) ||
+      /\b(?:not|no|without)\s+(?:an?\s+)?[a-z][a-z\s\-]{0,40}?\s+(?:accent|akcent)\b/i.test(lower) ||
+      /\bbez\s+[a-ząćęłńóśżź][a-ząćęłńóśżź\s\-]{0,40}?\s+akcent(?:u)?\b/i.test(lower)
+    );
+  } catch (_) {
+    return false;
+  }
+}
+
 function hasExplicitAccentMention(userText) {
   const lower = (userText || '').toString().toLowerCase();
-  if (/\b(accent|akcent)\b/.test(lower)) return true;
+  const hasAccentWord = /\b(accent|akcent)\b/.test(lower);
+  if (hasAccentWord) {
+    // If user is NEGATING an accent ("should not have ... accent"), do not treat it
+    // as an explicit accent *preference* (otherwise we can lock in target_accent incorrectly).
+    if (hasNegatedAccentConstraint(userText)) {
+      // If user also explicitly requests an accent positively, keep it explicit.
+      if (/\b(?:with|using|use|in|as)\s+(?:an?\s+)?[a-z][a-z\s\-]{0,40}?\s+(?:accent|akcent)\b/i.test(lower)) {
+        return true;
+      }
+      return false;
+    }
+    return true;
+  }
   // Common implicit accent phrases (no explicit "accent" word)
   const implicit = [
     'general american',
@@ -3355,10 +3412,11 @@ IMPORTANT:
     const qp = detectQualityPreferenceFromText(userText);
     plan.quality_preference = qp || 'any';
 
-    // Negative accent exclusions (e.g. "not Flemish accent")
+    // Negative exclusions (accent/locale/gender)
     try {
       // Keep invariant: always either string iso2 or null (never undefined)
       plan.__excludedAccentsIso2 = null;
+      plan.__excludedLocalesIso2 = null;
       const hintedIso2 = (
         plan?.target_voice_language ||
         parseUserLanguageHints(userText)?.iso2 ||
@@ -3368,25 +3426,51 @@ IMPORTANT:
         .toString()
         .toLowerCase()
         .slice(0, 2);
-      const excluded = hintedIso2 ? extractNegativeAccents(userText, hintedIso2, facetKB) : [];
-      plan.__excludedAccents = Array.isArray(excluded) ? excluded : [];
+      const excludedAcc = hintedIso2 ? extractNegativeAccents(userText, hintedIso2, facetKB) : [];
+      const excludedLoc = hintedIso2 ? extractNegativeLocales(userText, hintedIso2, facetKB) : [];
+      const excludedG = extractExcludedGenders(userText);
+
+      plan.__excludedAccents = Array.isArray(excludedAcc) ? excludedAcc : [];
+      plan.__excludedLocales = Array.isArray(excludedLoc) ? excludedLoc : [];
+      plan.__excludedGenders = Array.isArray(excludedG) ? excludedG : [];
+
       if (plan.__excludedAccents.length) {
-        // Persist the language used for exclusion parsing, even if we later clear target_voice_language
-        // (we may broaden search by language, but exclusions should still apply consistently).
+        // Persist language used for exclusion parsing, even if we later clear target_voice_language.
         plan.__excludedAccentsIso2 = hintedIso2 || null;
 
-        // Safety: only clear target_accent if it conflicts with an excluded accent.
+        // Negation wins: clear target_accent if it conflicts with an excluded accent.
         const t = normalizeRequestedAccent(plan?.target_accent);
         if (t) {
           const exSet = new Set(plan.__excludedAccents.map((x) => normalizeRequestedAccent(x)).filter(Boolean));
-          if (exSet.has(t)) {
-            plan.target_accent = null;
-          }
+          if (exSet.has(t)) plan.target_accent = null;
+        }
+      }
+
+      if (plan.__excludedLocales.length) {
+        plan.__excludedLocalesIso2 = hintedIso2 || null;
+
+        // Negation wins: clear target_locale if it conflicts with an excluded locale.
+        const tLoc = normalizeRequestedLocale(plan?.target_locale);
+        if (tLoc) {
+          const exSet = new Set(plan.__excludedLocales.map((x) => normalizeRequestedLocale(x)).filter(Boolean));
+          if (exSet.has(tLoc)) plan.target_locale = null;
+        }
+      }
+
+      if (plan.__excludedGenders.length) {
+        // Negation wins: clear target_gender if it conflicts with an excluded gender.
+        const tg = (plan?.target_gender || '').toString().toLowerCase();
+        if (tg === 'male' || tg === 'female') {
+          const exSet = new Set(plan.__excludedGenders.map((x) => (x || '').toString().toLowerCase()).filter(Boolean));
+          if (exSet.has(tg)) plan.target_gender = null;
         }
       }
     } catch (_) {
       plan.__excludedAccents = Array.isArray(plan.__excludedAccents) ? plan.__excludedAccents : [];
       plan.__excludedAccentsIso2 = null;
+      plan.__excludedLocales = Array.isArray(plan.__excludedLocales) ? plan.__excludedLocales : [];
+      plan.__excludedLocalesIso2 = null;
+      plan.__excludedGenders = Array.isArray(plan.__excludedGenders) ? plan.__excludedGenders : [];
     }
 
     // Accent as soft preference unless explicitly mentioned by user
@@ -4964,80 +5048,157 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     voices = voices.slice(0, 120);
   }
 
-  // Post-filter: exclude explicitly negated accents (e.g. "not Flemish accent")
+  // Post-filter: apply explicit user exclusions (accent/locale/gender)
   try {
-    const exclArr = Array.isArray(plan?.__excludedAccents) ? plan.__excludedAccents : [];
+    const exclAccArr = Array.isArray(plan?.__excludedAccents) ? plan.__excludedAccents : [];
+    const exclLocArr = Array.isArray(plan?.__excludedLocales) ? plan.__excludedLocales : [];
+    const exclGenderArr = Array.isArray(plan?.__excludedGenders) ? plan.__excludedGenders : [];
     const iso2 = (
       language ||
       plan?.__excludedAccentsIso2 ||
+      plan?.__excludedLocalesIso2 ||
       parseUserLanguageHints(userText)?.iso2 ||
       ''
     )
       .toString()
       .toLowerCase()
       .slice(0, 2);
-    if (iso2 && Array.isArray(voices) && exclArr.length) {
-      const excluded = new Set(exclArr.map((x) => normalizeRequestedAccent(x)).filter(Boolean));
-      const excludedLocales = new Set();
-      // NL: Flemish is strongly associated with nl-BE in returned metadata
-      if (iso2 === 'nl' && excluded.has('flemish')) excludedLocales.add('nl-BE');
-
-      const before = voices.length;
+    if (iso2 && Array.isArray(voices) && (exclAccArr.length || exclLocArr.length || exclGenderArr.length)) {
+      const beforeAll = voices.length;
       let errorRemoved = 0;
       const errorSamples = [];
-      voices = voices.filter((v) => {
-        if (!v) return false;
-        try {
-          const accs = voiceVerifiedAccents(v, iso2);
-          for (const a of accs || []) {
-            if (excluded.has(a)) return false;
-          }
-          if (excludedLocales.size) {
-            const locs = voiceVerifiedLocales(v, iso2);
-            for (const l of locs || []) {
-              if (excludedLocales.has(l)) return false;
-            }
-          }
-        } catch (err) {
-          // Fail closed: if verification fails, do NOT include the voice,
-          // otherwise we could defeat the user's exclusion intent.
+
+      const excludedAccents = new Set(exclAccArr.map((x) => normalizeRequestedAccent(x)).filter(Boolean));
+      const excludedLocales = new Set(exclLocArr.map((x) => normalizeRequestedLocale(x)).filter(Boolean));
+      const excludedGenders = new Set(
+        exclGenderArr.map((x) => (x || '').toString().toLowerCase().trim()).filter((x) => x === 'male' || x === 'female')
+      );
+
+      // NL: Flemish is strongly associated with nl-BE in returned metadata
+      if (iso2 === 'nl' && excludedAccents.has('flemish')) excludedLocales.add('nl-BE');
+
+      // 1) Accent exclusion
+      if (excludedAccents.size) {
+        const before = voices.length;
+        voices = voices.filter((v) => {
+          if (!v) return false;
           try {
-            errorRemoved += 1;
-            if (errorSamples.length < 3) {
-              errorSamples.push(
-                `${String(v?.voice_id || '-')}|${String(err?.message || err || 'error')}`.slice(0, 140)
-              );
-            }
+            const accs = voiceVerifiedAccents(v, iso2);
+            for (const a of accs || []) if (excludedAccents.has(a)) return false;
+            return true;
+          } catch (err) {
+            try {
+              errorRemoved += 1;
+              if (errorSamples.length < 3) {
+                errorSamples.push(`${String(v?.voice_id || '-')}|${String(err?.message || err || 'error')}`.slice(0, 140));
+              }
+            } catch (_) {}
+            return false;
+          }
+        });
+        const removed = before - voices.length;
+        if (removed > 0) {
+          try {
+            trace({
+              stage: 'exclude_accents',
+              params: { iso2, excluded: Array.from(excludedAccents).join(',') || '-', excluded_locales: '-' },
+              count: removed
+            });
           } catch (_) {}
-          return false;
         }
-        return true;
-      });
-      const removed = before - voices.length;
-      if (removed > 0) {
-        try {
-          trace({
-            stage: 'exclude_accents',
-            params: {
-              iso2,
-              excluded: Array.from(excluded).join(',') || '-',
-              excluded_locales: Array.from(excludedLocales).join(',') || '-'
-            },
-            count: removed
-          });
-        } catch (_) {}
       }
+
+      // 2) Locale exclusion
+      if (excludedLocales.size) {
+        const before = voices.length;
+        voices = voices.filter((v) => {
+          if (!v) return false;
+          try {
+            const locs = voiceVerifiedLocales(v, iso2);
+            for (const l of locs || []) if (excludedLocales.has(l)) return false;
+            return true;
+          } catch (err) {
+            try {
+              errorRemoved += 1;
+              if (errorSamples.length < 3) {
+                errorSamples.push(`${String(v?.voice_id || '-')}|${String(err?.message || err || 'error')}`.slice(0, 140));
+              }
+            } catch (_) {}
+            return false;
+          }
+        });
+        const removed = before - voices.length;
+        if (removed > 0) {
+          try {
+            trace({
+              stage: 'exclude_locales',
+              params: { iso2, excluded_locales: Array.from(excludedLocales).join(',') || '-' },
+              count: removed
+            });
+          } catch (_) {}
+        }
+      }
+
+      // 3) Gender exclusion (best-effort based on available metadata)
+      if (excludedGenders.size) {
+        const before = voices.length;
+        voices = voices.filter((v) => {
+          if (!v) return false;
+          try {
+            const g = getGenderGroup(v);
+            if (g && excludedGenders.has(g)) return false;
+            return true;
+          } catch (err) {
+            try {
+              errorRemoved += 1;
+              if (errorSamples.length < 3) {
+                errorSamples.push(`${String(v?.voice_id || '-')}|${String(err?.message || err || 'error')}`.slice(0, 140));
+              }
+            } catch (_) {}
+            return false;
+          }
+        });
+        const removed = before - voices.length;
+        if (removed > 0) {
+          try {
+            trace({
+              stage: 'exclude_genders',
+              params: { excluded_genders: Array.from(excludedGenders).join(',') || '-' },
+              count: removed
+            });
+          } catch (_) {}
+        }
+      }
+
+      // Emit one consolidated error record if we had to fail-closed
       if (errorRemoved > 0) {
         try {
           trace({
-            stage: 'exclude_accents_error',
+            stage: 'exclude_exclusions_error',
             params: {
               iso2,
-              excluded: Array.from(excluded).join(',') || '-',
+              excluded: Array.from(excludedAccents).join(',') || '-',
               excluded_locales: Array.from(excludedLocales).join(',') || '-',
+              excluded_genders: Array.from(excludedGenders).join(',') || '-',
               samples: errorSamples.length ? errorSamples.join(';;') : '-'
             },
             count: errorRemoved
+          });
+        } catch (_) {}
+      }
+
+      // No-op trace: if exclusions were present but removed nothing, still record (helps debugging)
+      if (beforeAll === voices.length) {
+        try {
+          trace({
+            stage: 'exclude_exclusions',
+            params: {
+              iso2,
+              excluded: Array.from(excludedAccents).join(',') || '-',
+              excluded_locales: Array.from(excludedLocales).join(',') || '-',
+              excluded_genders: Array.from(excludedGenders).join(',') || '-'
+            },
+            count: 0
           });
         } catch (_) {}
       }
@@ -5714,6 +5875,50 @@ function detectBilingualEnEs(userText) {
   return hasBilingual && hasEn && hasEs;
 }
 
+// -------------------------------------------------------------
+// Universal negatives / exclusions (tokens, locale, gender, accent)
+// -------------------------------------------------------------
+
+const NEG_TOKEN_ALIASES = new Map([
+  // audiobook
+  ['audio book', 'audiobook'],
+  ['audiobook', 'audiobook'],
+  ['audiobooks', 'audiobook'],
+  ['audioboek', 'audiobook'], // NL
+  ['luisterboek', 'audiobook'], // NL
+  ['luisterboeken', 'audiobook'],
+  ['audiobooka', 'audiobook'], // PL inflections (best-effort)
+  ['audiobooku', 'audiobook'],
+  // narration/story
+  ['narration', 'narration'],
+  ['narrator', 'narration'],
+  ['storytelling', 'storytelling'],
+  // podcast
+  ['podcast', 'podcast'],
+  ['podcasts', 'podcast'],
+  // commercial/trailer/cartoon
+  ['commercial', 'commercial'],
+  ['commercials', 'commercial'],
+  ['trailer', 'trailer'],
+  ['trailers', 'trailer'],
+  ['cartoon', 'cartoon'],
+  ['cartoons', 'cartoon'],
+  // voice texture
+  ['whisper', 'whisper'],
+  ['raspy', 'raspy'],
+  ['growl', 'growl']
+]);
+
+function canonicalizeNegToken(s) {
+  try {
+    const norm = normalizeCatalogToken(s || '');
+    if (!norm) return null;
+    return NEG_TOKEN_ALIASES.get(norm) || norm;
+  } catch (_) {
+    return null;
+  }
+}
+
 function extractNegativeTokens(userText) {
   const lower = (userText || '').toLowerCase();
   const neg = new Set();
@@ -5733,10 +5938,53 @@ function extractNegativeTokens(userText) {
     { pat: /\b(?:not|no|without)\s+(?:an?\s+)?podcasts?\b/, tok: 'podcast' },
     { pat: /\b(?:not|no|without)\s+(?:an?\s+)?commercials?\b/, tok: 'commercial' },
     { pat: /\b(?:not|no|without)\s+(?:an?\s+)?trailers?\b/, tok: 'trailer' },
-    { pat: /\b(?:not|no|without)\s+(?:an?\s+)?cartoons?\b/, tok: 'cartoon' }
+    { pat: /\b(?:not|no|without)\s+(?:an?\s+)?cartoons?\b/, tok: 'cartoon' },
+
+    // Dutch-ish
+    { pat: /\b(?:geen|zonder)\s+(?:een\s+)?(?:luisterboeken?|audioboek(?:en)?)\b/, tok: 'audiobook' },
+
+    // Polish-ish
+    { pat: /\bbez\s+audiobook(?:a|u|ów)?\b/, tok: 'audiobook' },
+    { pat: /\bbez\s+narracji\b/, tok: 'narration' },
+    { pat: /\bbez\s+podcast(?:u|ów)?\b/, tok: 'podcast' },
+    { pat: /\bbez\s+reklam\b/, tok: 'commercial' },
+    { pat: /\bbez\s+bajek\b/, tok: 'cartoon' }
   ];
-  for (const r of rules) if (r.pat.test(lower)) neg.add(r.tok);
+  for (const r of rules) {
+    if (r.pat.test(lower)) {
+      const t = canonicalizeNegToken(r.tok) || r.tok;
+      if (t) neg.add(t);
+    }
+  }
   return neg;
+}
+
+function extractExcludedGenders(userText) {
+  try {
+    const lower = (userText || '').toString().toLowerCase();
+    const out = new Set();
+    if (!lower) return [];
+
+    const add = (g) => {
+      if (g === 'male' || g === 'female') out.add(g);
+    };
+
+    // English
+    if (/\b(?:not|no|without)\s+(?:a\s+)?(?:female|woman|women|f)\b/.test(lower)) add('female');
+    if (/\b(?:not|no|without)\s+(?:a\s+)?(?:male|man|men|m)\b/.test(lower)) add('male');
+    if (/\b(?:not|no|without)\s+(?:a\s+)?female\s+voice\b/.test(lower)) add('female');
+    if (/\b(?:not|no|without)\s+(?:a\s+)?male\s+voice\b/.test(lower)) add('male');
+
+    // Polish-ish
+    if (/\bbez\s+(?:kobiecego|żeńskiego|zenskiego)\b/.test(lower)) add('female');
+    if (/\bbez\s+(?:męskiego|meskiego)\b/.test(lower)) add('male');
+    if (/\bnie\s+(?:kobiecy|żeńskie|zenskie)\b/.test(lower)) add('female');
+    if (/\bnie\s+(?:męski|meski)\b/.test(lower)) add('male');
+
+    return Array.from(out);
+  } catch (_) {
+    return [];
+  }
 }
 
 function extractNegativeAccents(userText, iso2, kb = null) {
@@ -5811,13 +6059,125 @@ function extractNegativeAccents(userText, iso2, kb = null) {
   }
 }
 
+function extractNegativeLocales(userText, iso2, kb = null) {
+  try {
+    const text = (userText || '').toString();
+    const lower = text.toLowerCase();
+    const lang = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    if (!lower) return [];
+
+    const out = new Set();
+
+    const isAllowedLocaleForLang = (loc) => {
+      try {
+        const locale = normalizeRequestedLocale(loc);
+        if (!locale) return false;
+        const key = normalizeLocaleToken(locale);
+        if (!key) return false;
+
+        // If we don't know lang, accept the locale token (best-effort).
+        if (!lang) return true;
+
+        // Prefer FacetKB when it's loaded
+        try {
+          const useKb = kb || facetKB;
+          if (
+            useKb &&
+            typeof useKb.isLoaded === 'function' &&
+            useKb.isLoaded() &&
+            useKb.allowedLocalesByIso2 &&
+            typeof useKb.allowedLocalesByIso2.get === 'function'
+          ) {
+            const set = useKb.allowedLocalesByIso2.get(lang);
+            if (set && set.has(key)) return true;
+            // If KB is loaded and knows lang but doesn't contain it, treat as not allowed.
+            if (set) return false;
+          }
+        } catch (_) {}
+
+        // Fallback: AccentCatalog (disk-backed)
+        try {
+          if (accentCatalog && typeof accentCatalog.isLocaleAllowed === 'function') {
+            return !!accentCatalog.isLocaleAllowed(lang, locale);
+          }
+        } catch (_) {}
+
+        return false;
+      } catch (_) {
+        return false;
+      }
+    };
+
+    const patterns = [
+      // "should not use locale nl-BE", "must not include nl-BE"
+      /\b(?:should|must|do)\s+not\s+(?:have|use|be|include)\s+(?:(?:the\s+)?)?(?:locale|region|variant)\s+([a-z]{2}\s*[-_]\s*(?:[a-z]{2}|\d{3}))\b/gi,
+      // "not nl-BE", "without es-MX"
+      /\b(?:not|no|without)\s+(?:the\s+)?(?:locale\s+)?([a-z]{2}\s*[-_]\s*(?:[a-z]{2}|\d{3}))\b/gi,
+      // Polish-ish: "bez nl-BE"
+      /\bbez\s+([a-z]{2}\s*[-_]\s*(?:[a-z]{2}|\d{3}))\b/gi
+    ];
+
+    for (const re of patterns) {
+      re.lastIndex = 0;
+      let m = null;
+      // eslint-disable-next-line no-cond-assign
+      while ((m = re.exec(lower))) {
+        const raw = (m[1] || '').toString().trim();
+        if (!raw) continue;
+        const loc = normalizeRequestedLocale(raw);
+        if (!loc) continue;
+        if (isAllowedLocaleForLang(loc)) out.add(loc);
+      }
+    }
+
+    // Small, conservative region-name heuristics for common languages (opt-in by lang)
+    if (lang === 'nl') {
+      // "without Belgium", "bez Belgii" -> nl-BE
+      if (/\b(?:not|no|without)\s+(?:belgium|belgian)\b/.test(lower) || /\bbez\s+belgi(?:a|i)\b/.test(lower)) {
+        if (isAllowedLocaleForLang('nl-BE')) out.add('nl-BE');
+      }
+    }
+    if (lang === 'pt') {
+      if (/\b(?:not|no|without)\s+(?:brazil|brasil|br)\b/.test(lower)) {
+        if (isAllowedLocaleForLang('pt-BR')) out.add('pt-BR');
+      }
+      if (/\b(?:not|no|without)\s+(?:portugal|pt-pt|pt-eu)\b/.test(lower)) {
+        if (isAllowedLocaleForLang('pt-PT')) out.add('pt-PT');
+      }
+    }
+    if (lang === 'es') {
+      if (/\b(?:not|no|without)\s+(?:mexico|mx|es-mx)\b/.test(lower)) {
+        if (isAllowedLocaleForLang('es-MX')) out.add('es-MX');
+      }
+      if (/\b(?:not|no|without)\s+(?:spain|es-es)\b/.test(lower)) {
+        if (isAllowedLocaleForLang('es-ES')) out.add('es-ES');
+      }
+      if (/\b(?:not|no|without)\s+(?:latam|latin\s*america|es-419)\b/.test(lower)) {
+        if (isAllowedLocaleForLang('es-419')) out.add('es-419');
+      }
+    }
+    if (lang === 'en') {
+      if (/\b(?:not|no|without)\s+(?:us|usa|en-us)\b/.test(lower)) {
+        if (isAllowedLocaleForLang('en-US')) out.add('en-US');
+      }
+      if (/\b(?:not|no|without)\s+(?:uk|britain|en-gb|en-uk)\b/.test(lower)) {
+        if (isAllowedLocaleForLang('en-GB')) out.add('en-GB');
+      }
+    }
+
+    return Array.from(out);
+  } catch (_) {
+    return [];
+  }
+}
+
 function pruneNegativesFromList(items, negatives) {
   try {
     const arr = Array.isArray(items) ? items : [];
     const neg = Array.isArray(negatives) ? negatives : [];
     if (!arr.length || !neg.length) return arr;
-    const negSet = new Set(neg.map((x) => normalizeKw(x)).filter(Boolean));
-    return arr.filter((k) => !negSet.has(normalizeKw(k)));
+    const negSet = new Set(neg.map((x) => canonicalizeNegToken(x)).filter(Boolean));
+    return arr.filter((k) => !negSet.has(canonicalizeNegToken(k)));
   } catch (_) {
     return Array.isArray(items) ? items : [];
   }
@@ -6712,8 +7072,16 @@ function buildSearchReport(trace, plan, mode, summary) {
       plan && Array.isArray(plan.__excludedAccents) && plan.__excludedAccents.length
         ? plan.__excludedAccents.join(',')
         : '-';
+    const excludedLocales =
+      plan && Array.isArray(plan.__excludedLocales) && plan.__excludedLocales.length
+        ? plan.__excludedLocales.join(',')
+        : '-';
+    const excludedGenders =
+      plan && Array.isArray(plan.__excludedGenders) && plan.__excludedGenders.length
+        ? plan.__excludedGenders.join(',')
+        : '-';
     lines.push(
-      `Plan: lang=${plan?.target_voice_language || '-'}, accent=${plan?.target_accent || '-'}, exclude_accents=${excludedAccents}, gender=${plan?.target_gender || '-'}, quality=${plan?.quality_preference || 'any'}`
+      `Plan: lang=${plan?.target_voice_language || '-'}, accent=${plan?.target_accent || '-'}, exclude_accents=${excludedAccents}, exclude_locales=${excludedLocales}, exclude_genders=${excludedGenders}, gender=${plan?.target_gender || '-'}, quality=${plan?.quality_preference || 'any'}`
     );
     if (summary && typeof summary === 'object') {
       lines.push('');
@@ -6872,9 +7240,13 @@ function devAssert(cond, msg) {
   if (!cond) throw new Error(`DEV_ASSERT failed: ${msg}`);
 }
 
-function runDevAsserts() {
+function isDevAssertsEnabled() {
   const enabled = String(process.env.DEV_ASSERTS || '').trim().toLowerCase();
-  if (!(enabled === 'true' || enabled === '1' || enabled === 'yes')) return;
+  return enabled === 'true' || enabled === '1' || enabled === 'yes';
+}
+
+function runDevAsserts() {
+  if (!isDevAssertsEnabled()) return;
 
   // Multi-intent should NOT split on conjunctions
   devAssert(splitMultiIntents('expressive and engaging and fast-paced').length === 0, 'no split on "and"');
@@ -6981,6 +7353,38 @@ function runDevAsserts() {
   );
   const kw1 = pruneNegativesFromList(['audiobook', 'clear', 'documentary'], Array.from(n1));
   devAssert(!kw1.includes('audiobook'), 'negatives: audiobook pruned from selected keywords');
+
+  // Negatives: multilingual aliases should canonicalize
+  const n2 = extractNegativeTokens('zonder luisterboek');
+  devAssert(n2.has('audiobook'), 'negatives: NL luisterboek -> audiobook');
+  const n3 = extractNegativeTokens('bez audiobooka');
+  devAssert(n3.has('audiobook'), 'negatives: PL audiobooka -> audiobook');
+  const kw2 = pruneNegativesFromList(['audio book', 'clear'], Array.from(new Set(['audiobook'])));
+  devAssert(!kw2.includes('audio book'), 'negatives: audio book pruned via canonicalization');
+
+  // Accent explicitness: negated accent must NOT count as explicit preference
+  devAssert(
+    hasExplicitAccentMention('The voices should not have a Flemish accent') === false,
+    'accent: negated should not be explicit preference'
+  );
+  devAssert(
+    hasExplicitAccentMention('Dutch with a Flemish accent') === true,
+    'accent: positive should be explicit'
+  );
+  const a1 = extractNegativeAccents('The voices should not have a Flemish accent', 'nl', null);
+  devAssert(Array.isArray(a1) && a1.includes('flemish'), 'exclude_accents: flemish detected');
+  const a2 = extractNegativeAccents('Najlepsze głosy po niderlandzku, bez flamandzkiego akcentu', 'nl', null);
+  devAssert(Array.isArray(a2) && a2.includes('flemish'), 'exclude_accents: PL flamandzki -> flemish');
+
+  // Locale exclusions: explicit tag should be detected
+  const l1 = extractNegativeLocales('Dutch voices, not nl-BE', 'nl', null);
+  devAssert(Array.isArray(l1) && l1.includes('nl-BE'), 'exclude_locales: not nl-BE detected');
+  const l2 = extractNegativeLocales('Dutch voices, without Belgium', 'nl', null);
+  devAssert(Array.isArray(l2) && l2.includes('nl-BE'), 'exclude_locales: Belgium -> nl-BE');
+
+  // Gender exclusions
+  const g1 = extractExcludedGenders('Spanish voice, not female');
+  devAssert(Array.isArray(g1) && g1.includes('female'), 'exclude_genders: not female detected');
 }
 
 // -------------------------------------------------------------
@@ -7683,14 +8087,16 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
 // Slack Bolt app – app_mention handler
 // -------------------------------------------------------------
 
-const app = new App({
-  token: process.env.SLACK_BOT_TOKEN,
-  signingSecret: process.env.SLACK_SIGNING_SECRET,
-  socketMode: true,
-  appToken: process.env.SLACK_APP_TOKEN
-});
+if (!DEV_ASSERTS_ENABLED) {
+  const { App } = require('@slack/bolt');
+  app = new App({
+    token: process.env.SLACK_BOT_TOKEN,
+    signingSecret: process.env.SLACK_SIGNING_SECRET,
+    socketMode: true,
+    appToken: process.env.SLACK_APP_TOKEN
+  });
 
-app.event('app_mention', async ({ event, client }) => {
+  app.event('app_mention', async ({ event, client }) => {
   const rawText = event.text || '';
   const cleaned = cleanText(rawText);
   const threadTs = event.thread_ts || event.ts;
@@ -8041,13 +8447,19 @@ app.action('cycle_quality', async ({ ack, body, client }) => {
   }
 });
 
+} // end Slack wiring guard (DEV_ASSERTS_ENABLED)
+
 // -------------------------------------------------------------
 // Start the app (for Render etc.)
 // -------------------------------------------------------------
 
 (async () => {
+  // DEV_ASSERTS=true should run regression checks without requiring Slack/OpenAI env.
+  if (isDevAssertsEnabled()) {
+    runDevAsserts();
+    return;
+  }
   validateEnvOrExit();
-  runDevAsserts();
   startMemoryCleanup();
   try {
     accentCatalog?.startBackgroundRefresh?.();

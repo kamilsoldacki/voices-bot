@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@slack/bolt": "^3.18.0",
-    "axios": "^1.7.0"
+    "axios": "^1.7.0",
+    "form-data": "^4.0.0"
   }
 }
