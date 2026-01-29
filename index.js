@@ -3355,6 +3355,27 @@ IMPORTANT:
     const qp = detectQualityPreferenceFromText(userText);
     plan.quality_preference = qp || 'any';
 
+    // Negative accent exclusions (e.g. "not Flemish accent")
+    try {
+      const hintedIso2 = (
+        plan?.target_voice_language ||
+        parseUserLanguageHints(userText)?.iso2 ||
+        detectVoiceLanguageFromText(userText) ||
+        ''
+      )
+        .toString()
+        .toLowerCase()
+        .slice(0, 2);
+      const excluded = hintedIso2 ? extractNegativeAccents(userText, hintedIso2, facetKB) : [];
+      plan.__excludedAccents = Array.isArray(excluded) ? excluded : [];
+      if (plan.__excludedAccents.length) {
+        // Safety: never treat a negated accent as a positive target_accent
+        plan.target_accent = null;
+      }
+    } catch (_) {
+      plan.__excludedAccents = Array.isArray(plan.__excludedAccents) ? plan.__excludedAccents : [];
+    }
+
     // Accent as soft preference unless explicitly mentioned by user
     const explicitAccent = hasExplicitAccentMention(userText);
     if (!explicitAccent) {
@@ -4930,6 +4951,50 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     voices = voices.slice(0, 120);
   }
 
+  // Post-filter: exclude explicitly negated accents (e.g. "not Flemish accent")
+  try {
+    const iso2 = (language || '').toString().toLowerCase().slice(0, 2);
+    const exclArr = Array.isArray(plan?.__excludedAccents) ? plan.__excludedAccents : [];
+    if (iso2 && Array.isArray(voices) && exclArr.length) {
+      const excluded = new Set(exclArr.map((x) => normalizeRequestedAccent(x)).filter(Boolean));
+      const excludedLocales = new Set();
+      // NL: Flemish is strongly associated with nl-BE in returned metadata
+      if (iso2 === 'nl' && excluded.has('flemish')) excludedLocales.add('nl-BE');
+
+      const before = voices.length;
+      voices = voices.filter((v) => {
+        if (!v) return false;
+        try {
+          const accs = voiceVerifiedAccents(v, iso2);
+          for (const a of accs || []) {
+            if (excluded.has(a)) return false;
+          }
+          if (excludedLocales.size) {
+            const locs = voiceVerifiedLocales(v, iso2);
+            for (const l of locs || []) {
+              if (excludedLocales.has(l)) return false;
+            }
+          }
+        } catch (_) {}
+        return true;
+      });
+      const removed = before - voices.length;
+      if (removed > 0) {
+        try {
+          trace({
+            stage: 'exclude_accents',
+            params: {
+              iso2,
+              excluded: Array.from(excluded).join(',') || '-',
+              excluded_locales: Array.from(excludedLocales).join(',') || '-'
+            },
+            count: removed
+          });
+        } catch (_) {}
+      }
+    }
+  } catch (_) {}
+
   // Facet fallback grouping: if language has multiple variants, attach facetGroups
   // even when we used keyword search (keeps output from mixing variants).
   try {
@@ -5623,6 +5688,78 @@ function extractNegativeTokens(userText) {
   ];
   for (const r of rules) if (r.pat.test(lower)) neg.add(r.tok);
   return neg;
+}
+
+function extractNegativeAccents(userText, iso2, kb = null) {
+  try {
+    const text = (userText || '').toString();
+    const lower = text.toLowerCase();
+    const lang = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    if (!lower || !lang) return [];
+
+    const out = new Set();
+
+    const isAllowedAccentForLang = (accent) => {
+      try {
+        const a = normalizeRequestedAccent(accent);
+        if (!a) return false;
+        const key = normalizeCatalogToken(a);
+        if (!key) return false;
+
+        // Prefer FacetKB when it's loaded
+        try {
+          const useKb = kb || facetKB;
+          if (
+            useKb &&
+            typeof useKb.isLoaded === 'function' &&
+            useKb.isLoaded() &&
+            useKb.allowedAccentsByIso2 &&
+            typeof useKb.allowedAccentsByIso2.get === 'function'
+          ) {
+            const set = useKb.allowedAccentsByIso2.get(lang);
+            if (set && set.has(key)) return true;
+          }
+        } catch (_) {}
+
+        // Fallback: AccentCatalog (disk-backed)
+        try {
+          if (accentCatalog && typeof accentCatalog.isAccentAllowed === 'function') {
+            return !!accentCatalog.isAccentAllowed(lang, a);
+          }
+        } catch (_) {}
+
+        return false;
+      } catch (_) {
+        return false;
+      }
+    };
+
+    const patterns = [
+      // "should not have a Flemish accent", "must not use a Mexican accent"
+      /\b(?:should|must|do)\s+not\s+(?:have|use|be|sound(?:ing)?|include)\s+(?:an?\s+)?([a-z][a-z\s\-]{0,40}?)\s+(?:accent|akcent)\b/gi,
+      // "not Flemish accent", "without mexican accent"
+      /\b(?:not|no|without)\s+(?:an?\s+)?([a-z][a-z\s\-]{0,40}?)\s+(?:accent|akcent)\b/gi,
+      // Polish-ish: "bez flamandzkiego akcentu" (best-effort)
+      /\bbez\s+([a-ząćęłńóśżź][a-ząćęłńóśżź\s\-]{0,40}?)\s+akcent(?:u)?\b/gi
+    ];
+
+    for (const re of patterns) {
+      re.lastIndex = 0;
+      let m = null;
+      // eslint-disable-next-line no-cond-assign
+      while ((m = re.exec(lower))) {
+        const raw = (m[1] || '').toString().trim();
+        if (!raw) continue;
+        const acc = normalizeRequestedAccent(raw);
+        if (!acc) continue;
+        if (isAllowedAccentForLang(acc)) out.add(acc);
+      }
+    }
+
+    return Array.from(out);
+  } catch (_) {
+    return [];
+  }
 }
 
 function pruneNegativesFromList(items, negatives) {
@@ -6522,8 +6659,12 @@ function buildSearchReport(trace, plan, mode, summary) {
     const lines = [];
     lines.push('*Search report (POC)*');
     lines.push(`Mode: \`${mode || 'generic'}\``);
+    const excludedAccents =
+      plan && Array.isArray(plan.__excludedAccents) && plan.__excludedAccents.length
+        ? plan.__excludedAccents.join(',')
+        : '-';
     lines.push(
-      `Plan: lang=${plan?.target_voice_language || '-'}, accent=${plan?.target_accent || '-'}, gender=${plan?.target_gender || '-'}, quality=${plan?.quality_preference || 'any'}`
+      `Plan: lang=${plan?.target_voice_language || '-'}, accent=${plan?.target_accent || '-'}, exclude_accents=${excludedAccents}, gender=${plan?.target_gender || '-'}, quality=${plan?.quality_preference || 'any'}`
     );
     if (summary && typeof summary === 'object') {
       lines.push('');
