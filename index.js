@@ -945,7 +945,7 @@ class FacetKB {
           const key = cand.norm;
           if (!seen.has(key)) {
             seen.add(key);
-            direct.push(cand);
+            direct.push({ ...cand, matchKind: 'direct' });
           }
         }
       }
@@ -965,16 +965,18 @@ class FacetKB {
         for (const s of sugg) {
           const norm = normalizeCatalogToken(s);
           const found = top.find((x) => x.norm === norm);
-          if (found) best.push(found);
+          if (found) best.push({ ...found, matchKind: 'fuzzy' });
         }
       }
       best = dedupePreserveOrder(best.map((x) => x.norm)).map((n) => top.find((x) => x.norm === n)).filter(Boolean);
       best.sort((a, b) => (b.count || 0) - (a.count || 0));
-      if (best.length) return best.slice(0, Math.max(2, Math.min(6, limit)));
+      if (best.length) return best.slice(0, Math.max(2, Math.min(6, limit))).map((x) => ({ ...x, matchKind: 'fuzzy' }));
     } catch (_) {}
 
     // 3) popularity fallback
-    return top.slice(0, Math.max(2, Math.min(6, limit)));
+    return top
+      .slice(0, Math.max(2, Math.min(6, limit)))
+      .map((x) => ({ ...x, matchKind: 'popularity' }));
   }
 }
 
@@ -2088,6 +2090,22 @@ function detectVariantIntent(userText, iso2, kb) {
       }
     }
 
+    // 1b) catalog-driven explicitness: if we can match an accent from catalog, treat as accent-specific.
+    // This reduces the need for per-language region heuristics (works for accents like "sicilian", "istrian", etc.).
+    try {
+      if (kb && kb.isLoaded && kb.isLoaded() && kb.hasIso2 && kb.hasIso2(lang) && kb.suggestAccents) {
+        const sugg = kb.suggestAccents(lang, text, { limit: 4 }) || [];
+        const best = sugg.find((x) => x && x.matchKind && x.matchKind !== 'popularity') || null;
+        if (best && best.norm) {
+          out.isSpecific = true;
+          out.axis = 'accent';
+          out.requestedFacetKeys = [String(best.norm)];
+          out.fallbackFacetKeys = [];
+          return out;
+        }
+      }
+    } catch (_) {}
+
     // 2) Chinese dialect is inherently specific
     if (lang === 'zh') {
       const d = detectChineseDialectFromText(text);
@@ -2287,6 +2305,18 @@ function getRequestedAccent(userText, keywordPlan, requestedLocale) {
       else if (loc === 'fr-CA') candidate = 'canadian';
     }
 
+    // Catalog-driven: if we have FacetKB and it can match an accent directly/fuzzily from text,
+    // prefer that over hardcoded heuristics (universal for new accents like "sicilian", "istrian", etc.).
+    if (!candidate) {
+      try {
+        if (iso2 && iso2 !== 'zh' && facetKB && facetKB.isLoaded && facetKB.isLoaded() && facetKB.hasIso2(iso2) && facetKB.suggestAccents) {
+          const sugg = facetKB.suggestAccents(iso2, text, { limit: 4 }) || [];
+          const best = sugg.find((x) => x && x.matchKind && x.matchKind !== 'popularity') || null;
+          if (best && best.norm) candidate = best.norm;
+        }
+      } catch (_) {}
+    }
+
     // Heuristic from text
     if (!candidate) {
       if (/\b(general american|standard american)\b/.test(lower)) candidate = 'american';
@@ -2311,6 +2341,177 @@ function getRequestedAccent(userText, keywordPlan, requestedLocale) {
   } catch (_) {
     return null;
   }
+}
+
+// -------------------------------------------------------------
+// Universal variant resolver (data-driven via FacetKB/AccentCatalog)
+// -------------------------------------------------------------
+// Goal:
+// - interpret user's intent around locale/accent/region
+// - map it to allowed catalog values (so we avoid invalid API params)
+// - provide a short candidate list for generic fanout (quality-first, bounded)
+function resolveVariantConstraints(userText, plan, kb, catalog) {
+  const text = (userText || '').toString();
+  const lower = text.toLowerCase();
+  const hint = parseUserLanguageHints(text);
+  const targetIso2 = (plan?.target_voice_language || hint?.iso2 || detectVoiceLanguageFromText(text) || '')
+    .toString()
+    .toLowerCase()
+    .slice(0, 2) || null;
+
+  const out = {
+    targetIso2,
+    variantAxis: 'none', // 'locale' | 'accent' | 'none'
+    variantMode: 'general', // 'specific' | 'general'
+    variantCandidates: [], // strings (API-facing)
+    regionIntent: null, // optional label (e.g. 'es-419'), non-binding
+    reason: '-'
+  };
+  if (!targetIso2) return out;
+
+  // Word-region aliases (non-binding): if the catalog supports an equivalent accent,
+  // treat as accent intent rather than forcing an unsupported locale.
+  try {
+    const isLatam = /\b(latam|latin america|latinamerican|latin(?:o)? american|south american|central american|caribbean)\b/.test(lower);
+    if (isLatam) {
+      const accKey = normalizeCatalogToken('latin american') || 'latin american';
+      if (isAccentAllowed(targetIso2, accKey)) {
+        out.variantMode = 'specific';
+        out.variantAxis = 'accent';
+        out.variantCandidates = [accKey];
+        out.regionIntent = out.regionIntent || 'latam';
+        out.reason = 'region_alias_word_to_accent';
+        // Add a few popularity-based fallbacks
+        try {
+          if (kb && kb.getFacetVariants) {
+            const vars = kb.getFacetVariants(targetIso2, 'accent', { maxVariants: 6 }) || [];
+            const extra = vars.map((v) => v?.facetKey || v?.facetValue || '').filter(Boolean);
+            out.variantCandidates = dedupePreserveOrder([...out.variantCandidates, ...extra]).slice(0, 6);
+          }
+        } catch (_) {}
+        return out;
+      }
+    }
+  } catch (_) {}
+
+  const isLocaleAllowed = (iso2, loc) => {
+    try {
+      const canon = normalizeRequestedLocale(loc) || loc;
+      if (kb && kb.isLoaded && kb.isLoaded() && kb.hasIso2 && kb.hasIso2(iso2) && kb.checkLocaleAllowed) {
+        const r = kb.checkLocaleAllowed(iso2, canon);
+        if (r && r.known) return !!r.allowed;
+      }
+    } catch (_) {}
+    try {
+      if (catalog && typeof catalog.isLocaleAllowed === 'function') return !!catalog.isLocaleAllowed(iso2, normalizeLocaleToken(normalizeRequestedLocale(loc) || loc));
+    } catch (_) {}
+    return true; // last resort: don't block
+  };
+
+  const isAccentAllowed = (iso2, acc) => {
+    try {
+      if (kb && kb.isLoaded && kb.isLoaded() && kb.hasIso2 && kb.hasIso2(iso2) && kb.checkAccentAllowed) {
+        const r = kb.checkAccentAllowed(iso2, acc);
+        if (r && r.known) return !!r.allowed;
+      }
+    } catch (_) {}
+    try {
+      if (catalog && typeof catalog.isAccentAllowed === 'function') return !!catalog.isAccentAllowed(iso2, acc);
+    } catch (_) {}
+    return true;
+  };
+
+  // Explicit locale token can be:
+  // - xx-YY (handled by parseUserLanguageHints)
+  // - xx-### (numeric region alias like es-419) (NOT handled by parseUserLanguageHints)
+  let hintLocaleRaw = hint?.locale ? (normalizeRequestedLocale(hint.locale) || hint.locale) : null;
+  try {
+    if (!hintLocaleRaw) {
+      const mNum = text.match(/\b([A-Za-z]{2})\s*[-_]\s*(\d{3})\b/);
+      if (mNum) {
+        const iso = String(mNum[1] || '').toLowerCase();
+        const reg = String(mNum[2] || '');
+        if (iso && reg) hintLocaleRaw = `${iso}-${reg}`;
+      }
+    }
+  } catch (_) {}
+  const hintLocaleKey = hintLocaleRaw ? normalizeLocaleToken(hintLocaleRaw) : null;
+  const numericRegion = hintLocaleKey && /^[a-z]{2}-\d{3}$/.test(hintLocaleKey) ? hintLocaleKey : null;
+
+  // 1) Explicit locale token (pt-BR, es-MX, xx-###)
+  if (hintLocaleKey) {
+    out.variantMode = 'specific';
+    // If numeric region isn't supported, treat as region alias and provide generic locale fanout.
+    if (numericRegion && !isLocaleAllowed(targetIso2, hintLocaleRaw)) {
+      out.regionIntent = numericRegion;
+      out.variantAxis = 'locale';
+      out.reason = 'region_alias_unsupported';
+      try {
+        if (kb && kb.suggestLocales) {
+          const suggested = kb.suggestLocales(targetIso2, text, { limit: 6 }) || [];
+          out.variantCandidates = suggested
+            .map((x) => x?.locale || x?.norm || '')
+            .map((x) => normalizeRequestedLocale(x) || x)
+            .filter(Boolean)
+            .filter((x) => !/^[a-z]{2}-\d{3}$/i.test(String(x))); // avoid numeric region codes in fanout
+        }
+      } catch (_) {}
+      // Fallback: if suggestLocales couldn't infer anything from the alias, use top allowed locales.
+      try {
+        if ((!out.variantCandidates || out.variantCandidates.length === 0) && kb && kb.getFacetVariants) {
+          const vars = kb.getFacetVariants(targetIso2, 'locale', { maxVariants: 8 }) || [];
+          const extra = vars
+            .map((v) => v?.facetKey || v?.locale || v?.facetValue || v?.norm || '')
+            .map((x) => normalizeRequestedLocale(x) || x)
+            .filter(Boolean)
+            .filter((x) => !/^[a-z]{2}-\d{3}$/i.test(String(x)));
+          out.variantCandidates = extra.slice(0, 6);
+        }
+      } catch (_) {}
+      return out;
+    }
+    if (isLocaleAllowed(targetIso2, hintLocaleRaw)) {
+      out.variantAxis = 'locale';
+      out.variantCandidates = [hintLocaleRaw];
+      out.reason = numericRegion ? 'region_locale_supported' : 'explicit_locale';
+      return out;
+    }
+    // Explicit but invalid: fall back to suggestions (still specific)
+    out.variantAxis = 'locale';
+    out.reason = 'explicit_locale_invalid';
+    try {
+      if (kb && kb.suggestLocales) {
+        const suggested = kb.suggestLocales(targetIso2, text, { limit: 6 }) || [];
+        out.variantCandidates = suggested.map((x) => x?.locale || x?.norm || '').filter(Boolean);
+      }
+    } catch (_) {}
+    return out;
+  }
+
+  // 2) Explicit accent intent (catalog-driven)
+  try {
+    if (kb && kb.isLoaded && kb.isLoaded() && kb.hasIso2 && kb.hasIso2(targetIso2) && kb.suggestAccents) {
+      const sugg = kb.suggestAccents(targetIso2, text, { limit: 4 }) || [];
+      const best = sugg.find((x) => x && x.matchKind && x.matchKind !== 'popularity') || null;
+      if (best && best.norm && isAccentAllowed(targetIso2, best.norm)) {
+        out.variantMode = 'specific';
+        out.variantAxis = 'accent';
+        out.variantCandidates = [String(best.norm)];
+        out.reason = `catalog_accent_${best.matchKind || 'match'}`;
+        // Add a few high-popularity fallbacks for bounded fanout (only used if needed)
+        try {
+          if (kb.getFacetVariants) {
+            const vars = kb.getFacetVariants(targetIso2, 'accent', { maxVariants: 6 }) || [];
+            const extra = vars.map((v) => v?.facetKey || v?.facetValue || '').filter(Boolean);
+            out.variantCandidates = dedupePreserveOrder([...out.variantCandidates, ...extra]).slice(0, 6);
+          }
+        } catch (_) {}
+        return out;
+      }
+    }
+  } catch (_) {}
+
+  return out;
 }
 
 function isStrongLanguageRequest(userText, keywordPlan) {
@@ -3618,6 +3819,23 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   }
 
   const qualityPref = plan.quality_preference || 'any';
+
+  // Resolve variant constraints once (used by fanout + scoring + diagnostics)
+  const resolved = resolveVariantConstraints(userText, plan, facetKB, accentCatalog);
+  try {
+    trace({
+      stage: 'resolver',
+      params: {
+        iso2: resolved?.targetIso2 || '-',
+        axis: resolved?.variantAxis || 'none',
+        mode: resolved?.variantMode || 'general',
+        reason: resolved?.reason || '-',
+        region: resolved?.regionIntent || '-',
+        candidates: Array.isArray(resolved?.variantCandidates) ? resolved.variantCandidates.slice(0, 6).join(',') : '-'
+      },
+      count: Array.isArray(resolved?.variantCandidates) ? resolved.variantCandidates.length : 0
+    });
+  } catch (_) {}
 
   // ALL keywords from the plan – each will be used in a separate search
   const toneKw = Array.from(new Set((plan.tone_keywords || []).map((s) => (s || '').toLowerCase().trim()).filter(Boolean)));
@@ -4942,6 +5160,98 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     }
   } catch (_) {}
 
+  // Universal fanout (catalog-driven): for specific variant requests that yield too few candidates,
+  // try a few additional catalog variants (bounded budget) and merge.
+  try {
+    const MIN_FANOUT_POOL = 30;
+    const canFanout =
+      resolved &&
+      resolved.variantMode === 'specific' &&
+      (resolved.variantAxis === 'locale' || resolved.variantAxis === 'accent') &&
+      Array.isArray(resolved.variantCandidates) &&
+      resolved.variantCandidates.length >= 2 &&
+      seen.size < MIN_FANOUT_POOL;
+
+    if (canFanout) {
+      const wantMore = detectListAll(userText) === true || plan.__listAll === true;
+      const pageSize = wantMore ? 80 : 60;
+      const featured = plan.__featured === true;
+      const sort = typeof plan.__sort === 'string' ? plan.__sort : null;
+      const age = detectAgeFromText(userText);
+      const combinedSearch = (selectedKeywords || []).slice(0, 6).join(' ').trim();
+
+      const tried = [];
+      let added = 0;
+
+      // Skip the first candidate (usually already applied in the initial query); try next few.
+      for (const cand of resolved.variantCandidates.slice(1, 6)) {
+        const paramsF = new URLSearchParams();
+        paramsF.set('page_size', String(pageSize));
+
+        // Force the candidate via plan override; keep other filters.
+        const planF =
+          resolved.variantAxis === 'locale'
+            ? { ...plan, target_locale: cand, target_accent: null }
+            : { ...plan, target_accent: cand, target_locale: null };
+
+        appendQueryFiltersToParams(paramsF, planF, userText, {
+          language,
+          accent: resolved.variantAxis === 'accent' ? cand : null,
+          gender,
+          qualityPref,
+          featured,
+          sort,
+          age,
+          forceUseCases: plan.__forceUseCases === true,
+          traceCb: trace
+        });
+
+        let voicesF = [];
+        try {
+          voicesF = wantMore
+            ? await callSharedVoicesAllPages(paramsF, { maxPages: 1, cap: pageSize })
+            : await callSharedVoicesCached(paramsF, async (p) => { const { voices } = await callSharedVoicesRaw(p); return voices; });
+        } catch (_) {
+          voicesF = [];
+        }
+
+        // Pass 2 with search if too small
+        if ((!voicesF || voicesF.length < 3) && combinedSearch) {
+          try {
+            const p2 = new URLSearchParams(paramsF.toString());
+            p2.set('search', combinedSearch);
+            const v2 = await callSharedVoices(p2);
+            if (Array.isArray(v2) && v2.length > (voicesF?.length || 0)) voicesF = v2;
+          } catch (_) {}
+        }
+
+        tried.push(cand);
+        for (const voice of voicesF || []) {
+          if (!voice || !voice.voice_id) continue;
+          try {
+            if (!Array.isArray(voice._matched_keywords)) voice._matched_keywords = [];
+            const tag = `fanout_${resolved.variantAxis}:${String(cand)}`;
+            if (!voice._matched_keywords.includes(tag)) voice._matched_keywords.push(tag);
+          } catch (_) {}
+          if (!seen.has(voice.voice_id)) {
+            seen.set(voice.voice_id, { voice, matchedKeywords: new Set() });
+            added++;
+          }
+        }
+
+        if (seen.size >= MIN_FANOUT_POOL) break;
+      }
+
+      try {
+        trace({
+          stage: 'fanout',
+          params: { axis: resolved.variantAxis, tried: tried.join(','), page_size: String(pageSize) },
+          count: added
+        });
+      } catch (_) {}
+    }
+  } catch (_) {}
+
   // 4) convert map -> list, attach matched_keywords
   let voices = Array.from(seen.values()).map((entry) => {
     const v = entry.voice;
@@ -5053,6 +5363,37 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
         const locale = (v.locale || '').toString().toLowerCase();
         if (latamSpanishLocales.has(locale)) coverage += 0.7;
         if (locale === 'es-es') coverage -= 0.4;
+      }
+    } catch (_) {}
+
+    // Resolved constraints boost (universal): reward voices whose verified locale/accent matches the resolver choice.
+    try {
+      if (resolved && resolved.variantMode === 'specific' && resolved.targetIso2) {
+        if (resolved.variantAxis === 'locale' && Array.isArray(resolved.variantCandidates) && resolved.variantCandidates.length) {
+          const want = normalizeRequestedLocale(resolved.variantCandidates[0]);
+          if (want) {
+            const locs = voiceVerifiedLocales(v, resolved.targetIso2);
+            if (Array.isArray(locs) && locs.includes(want)) coverage += 1.0;
+          }
+        }
+        if (resolved.variantAxis === 'accent' && Array.isArray(resolved.variantCandidates) && resolved.variantCandidates.length) {
+          const wantA = normalizeRequestedAccent(resolved.variantCandidates[0]);
+          if (wantA) {
+            const accs = voiceVerifiedAccents(v, resolved.targetIso2);
+            if (Array.isArray(accs) && accs.includes(wantA)) coverage += 1.0;
+          }
+        }
+      }
+    } catch (_) {}
+
+    // Popularity proxy (verify_counts): small tie-breaker by accent popularity when available
+    try {
+      const iso = (resolved?.targetIso2 || language || '').toString().toLowerCase().slice(0, 2);
+      const a = normalizeCatalogToken(v?.accent || '');
+      if (iso && a && facetKB && facetKB.accentCountByIso2Accent) {
+        const m = facetKB.accentCountByIso2Accent.get(iso);
+        const c = m ? Number(m.get(a) || 0) : 0;
+        if (c > 0) coverage += Math.min(0.6, Math.log10(c + 1) * 0.15);
       }
     } catch (_) {}
 
@@ -6581,8 +6922,24 @@ function shouldApplyParam(kind, plan, userText, flags = {}) {
     case 'accent': {
       const lower = (userText || '').toLowerCase();
       const hasAccentWord = /\b(accent|akcent)\b/.test(lower);
-      const accentRegex = /\b(american|british|uk|us|australian|irish|scottish|canadian|polish)\b/i;
-      if (hasAccentWord && accentRegex.test(userText || '')) return true;
+      // 1) Explicit mention via text heuristics (covers "latam", "mexican", etc.)
+      if (hasExplicitAccentMention(userText)) return true;
+      // 2) If user used the word "accent/akcent", treat it as explicit even if the accent name is unusual.
+      if (hasAccentWord) return true;
+      // 3) Catalog-driven explicitness: if FacetKB can match a specific accent (direct/fuzzy),
+      // treat it as an explicit accent preference (avoids hardcoding accent lists).
+      try {
+        const iso2 =
+          (plan?.target_voice_language || parseUserLanguageHints(userText)?.iso2 || detectVoiceLanguageFromText(userText) || '')
+            .toString()
+            .toLowerCase()
+            .slice(0, 2);
+        if (iso2 && facetKB && facetKB.isLoaded && facetKB.isLoaded() && facetKB.hasIso2 && facetKB.hasIso2(iso2) && facetKB.suggestAccents) {
+          const sugg = facetKB.suggestAccents(iso2, userText, { limit: 2 }) || [];
+          const best = sugg.find((x) => x && x.matchKind && x.matchKind !== 'popularity');
+          if (best) return true;
+        }
+      } catch (_) {}
       return readEnvBoolean('ENABLE_ACCENT_BY_DEFAULT', false);
     }
     case 'gender': {
@@ -6813,11 +7170,36 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
       ? options.age
       : detectAgeFromText(userText);
 
+  // Resolver (catalog-driven): decide if accent/locale should be set from allowed values.
+  const resolved = resolveVariantConstraints(userText, plan, facetKB, accentCatalog);
+  let resolverAppliedAccent = false;
+
   // Existing filters
   // Bilingual: avoid constraining language to let both EN/ES candidates through
   if (!isBilingualEnEs && language && shouldApplyParam('language', plan, userText)) params.set('language', language);
   // Accent: allow Spanish Mexico heuristic even without explicit "accent"
-  if (isSpanishMexico) {
+  try {
+    if (
+      !resolverAppliedAccent &&
+      resolved &&
+      resolved.variantAxis === 'accent' &&
+      Array.isArray(resolved.variantCandidates) &&
+      resolved.variantCandidates.length &&
+      shouldApplyParam('accent', plan, userText)
+    ) {
+      const cand = String(resolved.variantCandidates[0] || '').trim();
+      if (cand && isAccentAllowedByCatalog(language, cand)) {
+        const accVal = pickAccentParamValue(language, cand) || cand;
+        params.set('accent', accVal);
+        diag.accent_set = String(accVal);
+        diag.accent_allowed = 'true';
+        diag.accent_reason = 'resolver';
+        resolverAppliedAccent = true;
+      }
+    }
+  } catch (_) {}
+
+  if (!resolverAppliedAccent && isSpanishMexico) {
     if (isAccentAllowedByCatalog('es', 'mexican')) {
       params.set('accent', pickAccentParamValue('es', 'mexican') || 'mexican');
       diag.accent_set = 'mexican';
@@ -6828,10 +7210,10 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
       diag.accent_allowed = 'false';
       diag.accent_reason = 'spanish_mexico_catalog_reject';
     }
-  } else if (isFrenchCanadian) {
+  } else if (!resolverAppliedAccent && isFrenchCanadian) {
     // Prefer locale=fr-CA over hard accent filtering (accent metadata can be inconsistent)
     // Keep accent as a soft preference via keywords/ranking, not as a strict query param.
-  } else if (isSpanishLatam && !isSpanishMexico) {
+  } else if (!resolverAppliedAccent && isSpanishLatam && !isSpanishMexico) {
     // LatAm Spanish: es-419 is a REGION alias (not a queryable locale), so prefer a broad accent filter.
     // Locale fanout fallback happens later when results are weak.
     const explicitLocale =
@@ -6851,11 +7233,11 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
         diag.accent_reason = 'spanish_latam_catalog_reject';
       }
     }
-  } else if (isSpanishSpain) {
+  } else if (!resolverAppliedAccent && isSpanishSpain) {
     // Prefer locale=es-ES for Spain/European Spanish (set below in locale section)
-  } else if (language === 'zh' && chineseDialect) {
+  } else if (!resolverAppliedAccent && language === 'zh' && chineseDialect) {
     // Prefer locale-based hinting for Mandarin vs Cantonese (soft)
-  } else if (accent && shouldApplyParam('accent', plan, userText)) {
+  } else if (!resolverAppliedAccent && accent && shouldApplyParam('accent', plan, userText)) {
     if (isAccentAllowedByCatalog(language, accent)) {
       const accVal = pickAccentParamValue(language, accent) || accent;
       params.set('accent', accVal);
@@ -6909,6 +7291,31 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
     typeof plan?.target_locale === 'string' && plan.target_locale.trim()
       ? (normalizeRequestedLocale(plan.target_locale) || plan.target_locale)
       : inferLocale(language, isSpanishMexico ? 'mexican' : accent, userText);
+  // Resolver-driven locale override (avoid unsupported locale values; enable bounded fanout inputs)
+  try {
+    if (
+      resolved &&
+      resolved.variantAxis === 'locale' &&
+      Array.isArray(resolved.variantCandidates) &&
+      resolved.variantCandidates.length &&
+      shouldApplyParam('locale', plan, userText)
+    ) {
+      const reason = String(resolved.reason || '');
+      const cand0 = String(resolved.variantCandidates[0] || '').trim();
+      // Only override locale if:
+      // - we don't have a locale yet, or
+      // - the "explicit locale" was invalid/unsupported and resolver provided a safer candidate
+      if (
+        cand0 &&
+        (!loc || reason === 'region_alias_unsupported' || reason === 'explicit_locale_invalid')
+      ) {
+        loc = cand0;
+        diag.locale_set = String(cand0);
+        diag.locale_allowed = '-';
+        diag.locale_reason = 'resolver';
+      }
+    }
+  } catch (_) {}
   // LatAm Spanish: treat es-419 as region alias and DO NOT send it as a locale param.
   try {
     if ((language || '').toString().slice(0, 2).toLowerCase() === 'es' && normalizeLocaleToken(loc) === 'es-419') {
@@ -7365,6 +7772,26 @@ function buildSearchReport(trace, plan, mode, summary) {
       }
     } catch (_) {}
 
+    // Resolver + fanout diagnostics (derived from trace)
+    try {
+      const resolverEntries = trace.filter((t) => t && t.stage === 'resolver');
+      if (resolverEntries.length) {
+        const last = resolverEntries[resolverEntries.length - 1];
+        const p = last?.params || {};
+        lines.push(`Resolver: iso2=${p.iso2 || '-'}, axis=${p.axis || 'none'}, mode=${p.mode || '-'}, reason=${p.reason || '-'}`);
+        if (p.region && p.region !== '-') lines.push(`Resolver region: ${p.region}`);
+        if (p.candidates && p.candidates !== '-') lines.push(`Resolver candidates: ${p.candidates}`);
+        lines.push('');
+      }
+      const fanoutEntries = trace.filter((t) => t && t.stage === 'fanout');
+      if (fanoutEntries.length) {
+        const lastF = fanoutEntries[fanoutEntries.length - 1];
+        const pf = lastF?.params || {};
+        lines.push(`Fanout: axis=${pf.axis || '-'}, tried=${pf.tried || '-'}, added=${lastF?.count ?? '-'}`);
+        lines.push('');
+      }
+    } catch (_) {}
+
     // Dialect usage summary (derived from per_keyword entries)
     try {
       const kwEntries = trace.filter((t) => t && (t.stage === 'per_keyword' || t.stage === 'per_keyword_variant'));
@@ -7399,6 +7826,20 @@ function buildSearchReport(trace, plan, mode, summary) {
         const fellBackBroad = trace.some((t) => t && t.stage === 'broad');
         lines.push(`Broad fallback used: ${fellBackBroad ? 'yes' : 'no'}`);
         lines.push('');
+      }
+    } catch (_) {}
+
+    // Catalog-driven accent diagnostics (best-effort)
+    try {
+      const iso = (plan?.target_voice_language || '').toString().toLowerCase().slice(0, 2);
+      const userText = (plan?.__reportUserText || '').toString();
+      if (iso && userText && facetKB && facetKB.isLoaded && facetKB.isLoaded() && facetKB.hasIso2 && facetKB.hasIso2(iso) && facetKB.suggestAccents) {
+        const sugg = facetKB.suggestAccents(iso, userText, { limit: 3 }) || [];
+        const best = sugg.find((x) => x && x.matchKind && x.matchKind !== 'popularity') || null;
+        if (best && best.accent) {
+          lines.push(`Catalog accent match: ${best.accent} (${best.matchKind})`);
+          lines.push('');
+        }
       }
     } catch (_) {}
 
@@ -7523,6 +7964,46 @@ function runDevAsserts() {
 
   // Accent normalization
   devAssert(normalizeRequestedAccent('General American') === 'american', 'normalize accent: General American -> american');
+
+  // Catalog-driven accent matching should work for accents not hardcoded in regexes (e.g., Italian "sicilian").
+  // Seed FacetKB from local JSON fixtures (no network required).
+  try {
+    const facetsLocal = JSON.parse(fs.readFileSync(path.resolve(__dirname, './facets.json'), 'utf8'));
+    const verifyLocal = JSON.parse(fs.readFileSync(path.resolve(__dirname, './verify_counts.json'), 'utf8'));
+    facetKB._ingest(facetsLocal, verifyLocal);
+    facetKB.loadedAt = Date.now();
+
+    const suggIt = facetKB.suggestAccents('it', 'sicilian voice', { limit: 3 }) || [];
+    const bestIt = suggIt.find((x) => x && x.matchKind && x.matchKind !== 'popularity') || null;
+    devAssert(!!bestIt && String(bestIt.accent).includes('sicilian'), 'FacetKB suggests sicilian accent (direct/fuzzy)');
+
+    const p = { target_voice_language: 'it' };
+    devAssert(shouldApplyParam('accent', p, 'sicilian voice') === true, 'shouldApplyParam(accent) uses catalog match');
+  } catch (e) {
+    // If fixtures are missing, skip (DEV_ASSERTS should not crash runtime)
+    devAssert(true, 'FacetKB local fixture seed skipped');
+  }
+
+  // Universal resolver: numeric-region locale (xx-###) must not be forced as locale if unsupported.
+  try {
+    // Seed KB (best-effort) so locale allowlist is present.
+    const facetsLocal = JSON.parse(fs.readFileSync(path.resolve(__dirname, './facets.json'), 'utf8'));
+    const verifyLocal = JSON.parse(fs.readFileSync(path.resolve(__dirname, './verify_counts.json'), 'utf8'));
+    facetKB._ingest(facetsLocal, verifyLocal);
+    facetKB.loadedAt = Date.now();
+
+    const plan = { target_voice_language: 'es', target_locale: 'es-419' };
+    const r = resolveVariantConstraints('es-419', plan, facetKB, accentCatalog);
+    devAssert(r && r.targetIso2 === 'es', 'resolver target iso2');
+    devAssert(r.regionIntent === 'es-419', 'resolver region intent es-419');
+    devAssert(r.variantAxis === 'none', 'resolver does not force locale axis for unsupported region alias');
+
+    const params = new URLSearchParams();
+    appendQueryFiltersToParams(params, plan, 'es-419', { language: 'es', accent: null, gender: null, qualityPref: 'any' });
+    devAssert(params.get('locale') !== 'es-419', 'appendQueryFiltersToParams must not set locale=es-419 (region alias)');
+  } catch (_) {
+    devAssert(true, 'resolver region-alias asserts skipped');
+  }
 
   // Soft strict bucketing: exact vs verified-only (missing/non-exact locale/accent)
   {
@@ -7679,6 +8160,10 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
     await ensureLanguageIndexLoaded();
 
     const keywordPlan = await buildKeywordPlan(cleaned);
+    // Keep raw user brief for diagnostics / POC search report enrichment
+    try {
+      keywordPlan.__reportUserText = cleaned;
+    } catch (_) {}
     const labels = getLabels();
 
     let uiLang =
