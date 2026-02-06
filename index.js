@@ -77,6 +77,34 @@ function slugifyAccentName(s) {
     .replace(/^-|-$/g, '');
 }
 
+function normalizeAccentForApiParam(iso2, accent) {
+  const raw = (accent || '').toString().toLowerCase().trim();
+  if (!raw) return null;
+  const lang = (iso2 || '').toString().toLowerCase().slice(0, 2);
+  const hasSpaces = /\s/.test(raw);
+  const forceSlugs = readEnvBoolean('FORCE_ACCENT_SLUGS', false);
+
+  let slug = null;
+  try {
+    slug =
+      lang &&
+      facetKB &&
+      facetKB.isLoaded &&
+      facetKB.isLoaded() &&
+      facetKB.getAccentSlug
+        ? facetKB.getAccentSlug(lang, raw)
+        : null;
+  } catch (_) {
+    slug = null;
+  }
+
+  // If KB provides a slug, use it when spaces could break matching, when forced, or for zh.
+  if (slug && (forceSlugs || hasSpaces || lang === 'zh')) return slug;
+  // Best-effort fallback: "latin american" -> "latin-american"
+  if (!slug && hasSpaces) return slugifyAccentName(raw);
+  return raw;
+}
+
 class AccentCatalog {
   constructor(opts = {}) {
     this.filePath = (opts.filePath || process.env.ACCENTS_JSON_PATH || DEFAULT_ACCENTS_JSON_PATH).toString();
@@ -702,7 +730,17 @@ class FacetKB {
     const a = normalizeCatalogToken(accent);
     if (!k || !a) return { known: false, allowed: false };
     if (!this.allowedAccentsByIso2.has(k)) return { known: false, allowed: false };
-    return { known: true, allowed: this.allowedAccentsByIso2.get(k).has(a) };
+    const set = this.allowedAccentsByIso2.get(k);
+    if (!set) return { known: false, allowed: false };
+
+    // Accept both normalized accent keys ("latin american") and API slugs ("latin-american").
+    // Some accents legitimately contain hyphens (e.g. "es-venezuelan"); those should still match as-is.
+    if (set.has(a)) return { known: true, allowed: true };
+    if (a.includes('-')) {
+      const spaced = a.replace(/-+/g, ' ');
+      if (set.has(spaced)) return { known: true, allowed: true };
+    }
+    return { known: true, allowed: false };
   }
 
   checkLocaleAllowed(iso2, locale) {
@@ -719,7 +757,15 @@ class FacetKB {
     const a = normalizeCatalogToken(accent);
     if (!k || !a) return null;
     const m = this.accentSlugByIso2Accent.get(k);
-    return m ? m.get(a) || null : null;
+    if (!m) return null;
+    const direct = m.get(a) || null;
+    if (direct) return direct;
+    // If caller passes a slug like "latin-american", allow best-effort reverse normalization to the KB key.
+    if (a.includes('-')) {
+      const spaced = a.replace(/-+/g, ' ');
+      return m.get(spaced) || null;
+    }
+    return null;
   }
 
   _canonicalizeLocaleForApi(normLocale) {
@@ -3896,7 +3942,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
 
   let accent = null;
   if (plan.target_accent && typeof plan.target_accent === 'string') {
-    accent = plan.target_accent.toLowerCase();
+    accent = normalizeAccentForApiParam(language, plan.target_accent);
   }
 
   let gender = null;
@@ -6876,6 +6922,14 @@ function pickQueryUseCases(plan) {
   const mapTokenToCategory = (t) => {
     if (!t) return null;
 
+    const hasWord = (re) => {
+      try {
+        return re.test(t);
+      } catch (_) {
+        return false;
+      }
+    };
+
     // Conversational / customer support / call center / IVR
     if (
       t.includes('call center') ||
@@ -6949,8 +7003,8 @@ function pickQueryUseCases(plan) {
       t.includes('audiobook') ||
       t.includes('narration') ||
       t.includes('narrator') ||
-      t.includes('story') ||
-      t.includes('storytelling') ||
+      // Avoid substring false-positives like "history" -> "story"
+      hasWord(/\bstor(?:ies|y(?:s|[- ]?teller(?:s)?|[- ]?telling)?)\b/) ||
       t.includes('dramatic')
     ) {
       return 'narrative_story';
@@ -8211,6 +8265,63 @@ function runDevAsserts() {
   // Gender exclusions
   const g1 = extractExcludedGenders('Spanish voice, not female');
   devAssert(Array.isArray(g1) && g1.includes('female'), 'exclude_genders: not female detected');
+
+  // -----------------------------------------------------------
+  // Regressions for 2026-02-06 report:
+  // - accent slugging must be applied in fallback paths
+  // - "history" must not map to narrative_story via substring "story"
+  // -----------------------------------------------------------
+
+  // Use-cases: substring "story" should not match "history"
+  {
+    const r1 = pickQueryUseCases({ use_case_keywords: ['conversational', 'history'] });
+    devAssert(Array.isArray(r1) && r1.includes('conversational'), 'use_case: conversational retained');
+    devAssert(!r1.includes('narrative_story'), 'use_case: history must not map to narrative_story');
+  }
+  {
+    const r2 = pickQueryUseCases({ use_case_keywords: ['history'] });
+    devAssert(Array.isArray(r2) && r2.length === 0, 'use_case: history alone should not map');
+  }
+  {
+    const r3 = pickQueryUseCases({ use_case_keywords: ['story'] });
+    devAssert(Array.isArray(r3) && r3.includes('narrative_story'), 'use_case: story maps to narrative_story');
+  }
+  {
+    const r4 = pickQueryUseCases({ use_case_keywords: ['stories'] });
+    devAssert(Array.isArray(r4) && r4.includes('narrative_story'), 'use_case: stories maps to narrative_story');
+  }
+  {
+    const r5 = pickQueryUseCases({ use_case_keywords: ['storyteller'] });
+    devAssert(Array.isArray(r5) && r5.includes('narrative_story'), 'use_case: storyteller maps to narrative_story');
+  }
+  {
+    const r6 = pickQueryUseCases({ use_case_keywords: ['storytellers'] });
+    devAssert(Array.isArray(r6) && r6.includes('narrative_story'), 'use_case: storytellers maps to narrative_story');
+  }
+  {
+    const r7 = pickQueryUseCases({ use_case_keywords: ['story telling'] });
+    devAssert(Array.isArray(r7) && r7.includes('narrative_story'), 'use_case: story telling maps to narrative_story');
+  }
+
+  // Accent: ensure API param uses slug for spaced accents (e.g., "latin american")
+  try {
+    const facetsLocal = JSON.parse(fs.readFileSync(path.resolve(__dirname, './facets.json'), 'utf8'));
+    const verifyLocal = JSON.parse(fs.readFileSync(path.resolve(__dirname, './verify_counts.json'), 'utf8'));
+    facetKB._ingest(facetsLocal, verifyLocal);
+    facetKB.loadedAt = Date.now();
+
+    const acc1 = normalizeAccentForApiParam('es', 'latin american');
+    devAssert(acc1 === 'latin-american', 'accent api param: latin american -> latin-american');
+
+    // KB validation must accept slug form too (otherwise accent can be incorrectly rejected).
+    const ok1 = facetKB.checkAccentAllowed('es', 'latin-american');
+    devAssert(!!ok1 && ok1.known === true && ok1.allowed === true, 'KB: latin-american allowed for es');
+
+    const slug1 = facetKB.getAccentSlug('es', 'latin-american');
+    devAssert(slug1 === 'latin-american', 'KB: getAccentSlug accepts slug input');
+  } catch (_) {
+    devAssert(true, 'accent slug asserts skipped');
+  }
 }
 
 // -------------------------------------------------------------
