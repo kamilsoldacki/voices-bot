@@ -1904,6 +1904,11 @@ function getRequestedLocale(userText, keywordPlan) {
   // Explicit override (used by clarification flow)
   if (typeof keywordPlan?.target_locale === 'string' && keywordPlan.target_locale.trim()) {
     const loc = normalizeRequestedLocale(keywordPlan.target_locale) || keywordPlan.target_locale;
+    // es-419 is a REGION alias (LatAm), not a queryable locale for shared-voices.
+    // Treat it as "no explicit locale" and let downstream LatAm logic handle it.
+    try {
+      if (normalizeLocaleToken(loc) === 'es-419') return null;
+    } catch (_) {}
     // If FacetKB knows the language and rejects the locale, treat as unset (conservative)
     try {
       const iso2 = (keywordPlan?.target_voice_language || '').toString().toLowerCase().slice(0, 2);
@@ -1940,10 +1945,8 @@ function getRequestedLocale(userText, keywordPlan) {
   } else if (iso2 === 'es') {
     if (/\b(mexico|mexican|es-mx|mx)\b/.test(lower)) candidate = 'es-MX';
     else if (/\b(spain|castilian|es-es)\b/.test(lower)) candidate = 'es-ES';
-    else if (/\b(latam|latin america|latinamerican|es-419)\b/.test(lower)) candidate = 'es-419';
-    else if (/\b(latino|latin(?:o)? american|south american|central american|caribbean)\b/.test(lower) && /\b(spanish|es)\b/.test(lower)) {
-      candidate = 'es-419';
-    } else if (/\b(european)\b/.test(lower) && /\b(spanish|es)\b/.test(lower)) candidate = 'es-ES';
+    // LatAm signals: treat as region intent, not as locale=es-419.
+    else if (/\b(european)\b/.test(lower) && /\b(spanish|es)\b/.test(lower)) candidate = 'es-ES';
   } else if (iso2 === 'fr') {
     if (/\b(fr-ca|french canadian|canadian french|quebec|québec|qc)\b/.test(lower)) candidate = 'fr-CA';
   }
@@ -2066,6 +2069,17 @@ function detectVariantIntent(userText, iso2, kb) {
     if (hintLocale) {
       const key = normalizeLocaleToken(hintLocale);
       if (key) {
+        // es-419 is a LatAm REGION alias, not a queryable locale facet for shared-voices.
+        // Treat it as a request for the broad Spanish LatAm accent group instead.
+        if (lang === 'es' && key === 'es-419') {
+          out.isSpecific = true;
+          out.axis = 'accent';
+          out.requestedFacetKeys = [normalizeCatalogToken('latin american') || 'latin american'];
+          out.fallbackFacetKeys = ['mexican', 'colombian', 'argentine', 'peruvian', 'chilean', 'venezuelan']
+            .map((x) => normalizeCatalogToken(x))
+            .filter(Boolean);
+          return out;
+        }
         out.isSpecific = true;
         out.axis = 'locale';
         out.requestedFacetKeys = [key];
@@ -2123,9 +2137,12 @@ function detectVariantIntent(userText, iso2, kb) {
     if (lang === 'es') {
       if (/\b(es-419|latam|latin america|latinamerican|latino|south american|central american|caribbean)\b/.test(lower)) {
         out.isSpecific = true;
-        out.axis = 'locale';
-        out.requestedFacetKeys = ['es-419'];
-        out.fallbackFacetKeys = [];
+        out.axis = 'accent';
+        out.requestedFacetKeys = [normalizeCatalogToken('latin american') || 'latin american'];
+        // Fallback-only: specific LatAm accents (only when primary returned 0)
+        out.fallbackFacetKeys = ['mexican', 'colombian', 'argentine', 'peruvian', 'chilean', 'venezuelan']
+          .map((x) => normalizeCatalogToken(x))
+          .filter(Boolean);
         return out;
       }
       if (/\b(mexico|mexican|es-mx|mx)\b/.test(lower)) {
@@ -4811,6 +4828,120 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     } catch (_) {}
   }
 
+  // LatAm Spanish quality-first fallback: if results are weak, fan out across real locales (NOT es-419)
+  // and merge candidate pools. This improves ranking quality when accent metadata is inconsistent.
+  try {
+    const lowerText = (userText || '').toLowerCase();
+    const isLatamSpanishIntent =
+      language === 'es' &&
+      /\b(es-419|latam|latin america|latinamerican|latino|latin(?:o)? american|south american|central american|caribbean)\b/.test(lowerText) &&
+      !(/\b(mexico|mexican|es-mx|mx)\b/.test(lowerText));
+
+    const MIN_LATAM_POOL = 30;
+    if (isLatamSpanishIntent && seen.size < MIN_LATAM_POOL) {
+      const candidates = ['es-MX', 'es-CO', 'es-AR', 'es-PE', 'es-CL', 'es-VE', 'es-US'];
+
+      const isLocaleAllowedForEs = (loc) => {
+        try {
+          const canon = normalizeRequestedLocale(loc) || loc;
+          const norm = normalizeLocaleToken(canon);
+          if (!norm) return false;
+          // Prefer FacetKB when loaded (authoritative)
+          if (facetKB && facetKB.isLoaded && facetKB.isLoaded() && facetKB.checkLocaleAllowed) {
+            const r = facetKB.checkLocaleAllowed('es', canon);
+            if (r && r.known) return !!r.allowed;
+          }
+          // Fallback to AccentCatalog if available
+          if (accentCatalog && typeof accentCatalog.isLocaleAllowed === 'function') {
+            return !!accentCatalog.isLocaleAllowed('es', canon);
+          }
+          return true; // last resort: don't block
+        } catch (_) {
+          return true;
+        }
+      };
+
+      const locales = candidates.filter(isLocaleAllowedForEs);
+      const wantMore = detectListAll(userText) === true || plan.__listAll === true;
+      const pageSize = wantMore ? 80 : 60;
+      const featured = plan.__featured === true;
+      const sort = typeof plan.__sort === 'string' ? plan.__sort : null;
+      const age = detectAgeFromText(userText);
+      const combinedSearch = (selectedKeywords || []).slice(0, 6).join(' ').trim();
+
+      const tried = [];
+      let added = 0;
+
+      // Keep this bounded: try only a few high-signal locales first.
+      for (const loc of locales.slice(0, 5)) {
+        const base = new URLSearchParams();
+        base.set('page_size', String(pageSize));
+
+        // Force the locale explicitly; suppress accent (locale already partitions)
+        const plan2 = { ...plan, target_locale: loc, target_accent: null };
+        appendQueryFiltersToParams(base, plan2, userText, {
+          language,
+          accent: null,
+          gender,
+          qualityPref,
+          featured,
+          sort,
+          age,
+          forceUseCases: plan.__forceUseCases === true,
+          traceCb: trace
+        });
+
+        // pass 1: no search (locale + use_cases/descriptives already narrow)
+        let voicesLoc = [];
+        try {
+          voicesLoc = wantMore
+            ? await callSharedVoicesAllPages(base, { maxPages: 1, cap: pageSize })
+            : await callSharedVoicesCached(base, async (p) => {
+                const { voices } = await callSharedVoicesRaw(p);
+                return voices;
+              });
+        } catch (_) {
+          voicesLoc = [];
+        }
+
+        // pass 2: add search only if the locale bucket is tiny
+        if ((!voicesLoc || voicesLoc.length < 3) && combinedSearch) {
+          try {
+            const p2 = new URLSearchParams(base.toString());
+            p2.set('search', combinedSearch);
+            const v2 = await callSharedVoices(p2);
+            if (Array.isArray(v2) && v2.length > (voicesLoc?.length || 0)) voicesLoc = v2;
+          } catch (_) {}
+        }
+
+        tried.push(loc);
+        for (const voice of voicesLoc || []) {
+          if (!voice || !voice.voice_id) continue;
+          // Tag for diagnostics/coverage
+          try {
+            if (!Array.isArray(voice._matched_keywords)) voice._matched_keywords = [];
+            const tag = `latam_locale:${String(loc)}`;
+            if (!voice._matched_keywords.includes(tag)) voice._matched_keywords.push(tag);
+          } catch (_) {}
+          if (!seen.has(voice.voice_id)) {
+            seen.set(voice.voice_id, { voice, matchedKeywords: new Set() });
+            added++;
+          }
+        }
+
+        if (seen.size >= MIN_LATAM_POOL) break;
+      }
+
+      try {
+        trace({
+          stage: 'latam_fallback_locales',
+          params: { iso2: 'es', tried: tried.join(','), page_size: String(pageSize) },
+          count: added
+        });
+      } catch (_) {}
+    }
+  } catch (_) {}
+
   // 4) convert map -> list, attach matched_keywords
   let voices = Array.from(seen.values()).map((entry) => {
     const v = entry.voice;
@@ -4854,6 +4985,12 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   const chineseDialect = language === 'zh' ? detectChineseDialectFromText(userText) : null;
   const preferredZhLocales = preferredLocalesForChineseDialect(chineseDialect).map((x) => String(x).toLowerCase());
   const dialectHints = new Set(dialectKeywordHints(chineseDialect).map(normalizeKw));
+  const isLatamSpanishIntent =
+    language === 'es' &&
+    /\b(es-419|latam|latin america|latinamerican|latino|latin(?:o)? american|south american|central american|caribbean)\b/.test((userText || '').toLowerCase()) &&
+    !(/\b(mexico|mexican|es-mx|mx)\b/.test((userText || '').toLowerCase())) &&
+    !(/\b(spain|castilian|es-es)\b/.test((userText || '').toLowerCase()));
+  const latamSpanishLocales = new Set(['es-mx', 'es-co', 'es-ar', 'es-pe', 'es-cl', 'es-ve', 'es-us']);
   const zhAccentSlugs = new Set(
     language === 'zh'
       ? [
@@ -4907,6 +5044,15 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
       const accent = (v.accent || '').toLowerCase();
       if (locale === 'es-mx' || accent.includes('mexican')) {
         coverage += 0.5;
+      }
+    } catch (_) {}
+
+    // Region boost: Spanish LatAm (do not rely on es-419 locale)
+    try {
+      if (isLatamSpanishIntent) {
+        const locale = (v.locale || '').toString().toLowerCase();
+        if (latamSpanishLocales.has(locale)) coverage += 0.7;
+        if (locale === 'es-es') coverage -= 0.4;
       }
     } catch (_) {}
 
@@ -6504,9 +6650,10 @@ function inferLocale(language, accent, userText) {
   if (lang === 'es') {
     if (acc.includes('mexican') || acc.includes('mx')) return 'es-MX';
     if (acc.includes('castilian') || acc.includes('spain')) return 'es-ES';
-    // LATAM / Latino signals (prefer locale over accent)
+    // LATAM / Latino signals: treat es-419 as a REGION alias, not a queryable locale.
+    // (ElevenLabs shared-voices locales typically do not include es-419; using it causes catalog rejects.)
     if (/\b(es-419|latam|latin america|latinamerican|latino|latin(?:o)? american|south american|central american|caribbean)\b/.test(lower)) {
-      return 'es-419';
+      return null;
     }
     // European Spanish phrasing
     if (/\b(european)\b/.test(lower) && /\b(spanish|es)\b/.test(lower)) return 'es-ES';
@@ -6659,6 +6806,8 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
     (/\b(es-419|latam|latin america|latinamerican|latino|latin(?:o)? american|south american|central american|caribbean)\b/.test(lowerText));
   const isSpanishSpain = (language === 'es' || /spanish|es\b/.test(lowerText)) &&
     (/\b(spain|castilian|es-es)\b/.test(lowerText) || (/\b(european)\b/.test(lowerText) && /\bspanish\b/.test(lowerText)));
+  const spanishRegion =
+    isSpanishMexico ? 'mexico' : (isSpanishSpain ? 'spain' : (isSpanishLatam ? 'latam' : null));
   const age =
     typeof options.age === 'string' && options.age
       ? options.age
@@ -6682,8 +6831,28 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   } else if (isFrenchCanadian) {
     // Prefer locale=fr-CA over hard accent filtering (accent metadata can be inconsistent)
     // Keep accent as a soft preference via keywords/ranking, not as a strict query param.
-  } else if (isSpanishLatam || isSpanishSpain) {
-    // Prefer locale-based regionalization for Spanish (accent metadata can be inconsistent)
+  } else if (isSpanishLatam && !isSpanishMexico) {
+    // LatAm Spanish: es-419 is a REGION alias (not a queryable locale), so prefer a broad accent filter.
+    // Locale fanout fallback happens later when results are weak.
+    const explicitLocale =
+      typeof plan?.target_locale === 'string' &&
+      plan.target_locale.trim() &&
+      normalizeLocaleToken(normalizeRequestedLocale(plan.target_locale) || plan.target_locale) !== 'es-419';
+    if (!explicitLocale) {
+      if (isAccentAllowedByCatalog('es', 'latin american')) {
+        const accVal = pickAccentParamValue('es', 'latin american') || 'latin american';
+        params.set('accent', accVal);
+        diag.accent_set = String(accVal);
+        diag.accent_allowed = 'true';
+        diag.accent_reason = 'spanish_latam';
+      } else {
+        diag.accent_set = 'latin american';
+        diag.accent_allowed = 'false';
+        diag.accent_reason = 'spanish_latam_catalog_reject';
+      }
+    }
+  } else if (isSpanishSpain) {
+    // Prefer locale=es-ES for Spain/European Spanish (set below in locale section)
   } else if (language === 'zh' && chineseDialect) {
     // Prefer locale-based hinting for Mandarin vs Cantonese (soft)
   } else if (accent && shouldApplyParam('accent', plan, userText)) {
@@ -6740,6 +6909,15 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
     typeof plan?.target_locale === 'string' && plan.target_locale.trim()
       ? (normalizeRequestedLocale(plan.target_locale) || plan.target_locale)
       : inferLocale(language, isSpanishMexico ? 'mexican' : accent, userText);
+  // LatAm Spanish: treat es-419 as region alias and DO NOT send it as a locale param.
+  try {
+    if ((language || '').toString().slice(0, 2).toLowerCase() === 'es' && normalizeLocaleToken(loc) === 'es-419') {
+      diag.locale_set = 'es-419';
+      diag.locale_allowed = '-';
+      diag.locale_reason = 'es-419_region_alias';
+      loc = null;
+    }
+  } catch (_) {}
   if (loc && shouldApplyParam('locale', plan, userText)) {
     if (isLocaleAllowedByCatalog(language, loc)) {
       params.set('locale', loc);
@@ -6761,16 +6939,6 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
       diag.locale_set = 'es-MX';
       diag.locale_allowed = 'true';
       diag.locale_reason = 'spanish_mexico';
-    }
-  }
-  // Force es-419 locale for LATAM Spanish briefs
-  if (isSpanishLatam && !isSpanishMexico) {
-    if (isLocaleAllowedByCatalog('es', 'es-419')) {
-      params.set('locale', 'es-419');
-      loc = 'es-419';
-      diag.locale_set = 'es-419';
-      diag.locale_allowed = 'true';
-      diag.locale_reason = 'spanish_latam';
     }
   }
   // Force es-ES locale for European/Spain Spanish briefs
@@ -6830,7 +6998,8 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
     sort,
     localeInferred: Boolean(isSpanishMexico || isSpanishLatam || isSpanishSpain || (language === 'zh' && chineseDialect)),
     bilingual: Boolean(isBilingualEnEs),
-    negatives: banned || []
+    negatives: banned || [],
+    region: spanishRegion
   };
 }
 
@@ -7172,6 +7341,30 @@ function buildSearchReport(trace, plan, mode, summary) {
       }
     } catch (_) {}
 
+    // LatAm Spanish diagnostics (derived from trace)
+    try {
+      const hasLatamAlias = trace.some(
+        (t) => t?.stage === 'catalog_filters' && t?.params?.language === 'es' && t?.params?.locale_reason === 'es-419_region_alias'
+      );
+      const hasLatamAccent = trace.some(
+        (t) => t?.stage === 'catalog_filters' && t?.params?.language === 'es' && (t?.params?.accent_reason === 'spanish_latam')
+      );
+      const latamFallback = trace
+        .filter((t) => t && t.stage === 'latam_fallback_locales')
+        .map((t) => String(t?.params?.tried || '').trim())
+        .filter(Boolean);
+
+      if (hasLatamAlias || hasLatamAccent || latamFallback.length) {
+        lines.push('LatAm:');
+        lines.push(`• es-419 treated as region alias: ${hasLatamAlias ? 'yes' : 'no'}`);
+        lines.push(`• accent=latin american applied: ${hasLatamAccent ? 'yes' : 'no'}`);
+        if (latamFallback.length) {
+          lines.push(`• fallback locales tried: ${dedupePreserveOrder(latamFallback.join(',').split(',').map((s) => s.trim()).filter(Boolean)).slice(0, 10).join(',')}`);
+        }
+        lines.push('');
+      }
+    } catch (_) {}
+
     // Dialect usage summary (derived from per_keyword entries)
     try {
       const kwEntries = trace.filter((t) => t && (t.stage === 'per_keyword' || t.stage === 'per_keyword_variant'));
@@ -7311,6 +7504,22 @@ function runDevAsserts() {
   devAssert(normalizeRequestedLocale('en-UK') === 'en-GB', 'normalize en-UK -> en-GB');
   devAssert(normalizeRequestedLocale('es-LATAM') === 'es-419', 'normalize es-LATAM -> es-419');
   devAssert(extractLocaleFromField('es-419') === 'es-419', 'parse locale with numeric region (es-419)');
+  // LatAm Spanish: es-419 is a REGION alias, not a queryable shared-voices locale
+  devAssert(inferLocale('es', '', 'spanish latam') === null, 'inferLocale: Spanish LatAm does not return es-419');
+  {
+    const vi = detectVariantIntent('best spanish latam voice', 'es', null);
+    devAssert(vi.isSpecific === true && vi.axis === 'accent', 'variant intent: Spanish LatAm -> accent axis');
+    devAssert(
+      Array.isArray(vi.requestedFacetKeys) && vi.requestedFacetKeys.some((k) => String(k).includes('latin')),
+      'variant intent: Spanish LatAm requests latin american'
+    );
+  }
+  {
+    const params = new URLSearchParams();
+    const plan = { target_voice_language: 'es', target_locale: 'es-419', quality_preference: 'any' };
+    appendQueryFiltersToParams(params, plan, 'spanish latam', { language: 'es', accent: null, gender: null, qualityPref: 'any' });
+    devAssert(params.get('locale') !== 'es-419', 'appendQueryFiltersToParams must not set locale=es-419');
+  }
 
   // Accent normalization
   devAssert(normalizeRequestedAccent('General American') === 'american', 'normalize accent: General American -> american');
