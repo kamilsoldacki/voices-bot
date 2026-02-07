@@ -31,6 +31,12 @@ const KEYWORD_SEARCH_CONCURRENCY = 6; // limit concurrent keyword searches
 const sharedVoicesCache = new Map(); // key -> { at:number, voices:any[] }
 const SHARED_VOICES_CACHE_TTL_MS = 7 * 60 * 1000; // 7 minutes
 
+// Shared-voices accent form cache (name vs slug). Purpose: avoid wasting requests on a form that returns 0.
+// Key: sv:accentForm:${iso2}:${accentNorm}
+// Value: { at:number, iso2:string, accentNorm:string, preferred:'name'|'slug', evidence:{ nameCount:number, slugCount:number } }
+const sharedVoicesAccentFormCache = new Map();
+const SHARED_VOICES_ACCENT_FORM_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
+
 // Keyword translation/expansion cache (LLM) for non-English search terms
 const keywordTranslateCache = new Map(); // key -> { at:number, iso2:string, src:string, out:string[] }
 const KEYWORD_TRANSLATE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -103,6 +109,53 @@ function normalizeAccentForApiParam(iso2, accent) {
   // Best-effort fallback: "latin american" -> "latin-american"
   if (!slug && hasSpaces) return slugifyAccentName(raw);
   return raw;
+}
+
+function accentFormCacheKey(iso2, accentNorm) {
+  const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+  const a = normalizeCatalogToken(accentNorm);
+  if (!k || !a) return null;
+  return `sv:accentForm:${k}:${a}`;
+}
+
+function getCachedAccentForm(iso2, accentNorm) {
+  try {
+    const key = accentFormCacheKey(iso2, accentNorm);
+    if (!key) return null;
+    const hit = sharedVoicesAccentFormCache.get(key);
+    if (!hit) return null;
+    if (Date.now() - (hit.at || 0) > SHARED_VOICES_ACCENT_FORM_TTL_MS) {
+      sharedVoicesAccentFormCache.delete(key);
+      return null;
+    }
+    return hit;
+  } catch (_) {
+    return null;
+  }
+}
+
+function setCachedAccentForm(iso2, accentNorm, preferred, evidence) {
+  try {
+    const key = accentFormCacheKey(iso2, accentNorm);
+    if (!key) return false;
+    const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    const a = normalizeCatalogToken(accentNorm);
+    if (!k || !a) return false;
+    if (preferred !== 'name' && preferred !== 'slug') return false;
+    sharedVoicesAccentFormCache.set(key, {
+      at: Date.now(),
+      iso2: k,
+      accentNorm: a,
+      preferred,
+      evidence: {
+        nameCount: Number(evidence?.nameCount || 0) || 0,
+        slugCount: Number(evidence?.slugCount || 0) || 0
+      }
+    });
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 class AccentCatalog {
@@ -3954,6 +4007,109 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
 
   // Resolve variant constraints once (used by fanout + scoring + diagnostics)
   const resolved = resolveVariantConstraints(userText, plan, facetKB, accentCatalog);
+
+  // -------------------------------------------------------------
+  // Accent form probe (name vs slug) for /v1/shared-voices
+  // -------------------------------------------------------------
+  // Goal: avoid wasting many per-keyword requests on an accent form that yields 0 results (200 OK).
+  // Budget: up to 2 probe requests on cache miss.
+  try {
+    const iso2 = (language || resolved?.targetIso2 || '').toString().toLowerCase().slice(0, 2);
+    const hasIso2 = Boolean(iso2);
+    const wantsAccent = hasIso2 && (() => {
+      try {
+        // consider explicit plan accent, resolver accent, or Spanish LatAm heuristic
+        if (plan?.target_accent && typeof plan.target_accent === 'string' && plan.target_accent.trim()) return true;
+        if (resolved && resolved.variantAxis === 'accent' && Array.isArray(resolved.variantCandidates) && resolved.variantCandidates.length) return true;
+        const lt = (userText || '').toLowerCase();
+        if (iso2 === 'es' && /\b(es-419|latam|latin america|latinamerican|latino|latin(?:o)? american|south american|central american|caribbean)\b/.test(lt)) return true;
+      } catch (_) {}
+      return false;
+    })();
+
+    if (hasIso2 && wantsAccent && facetKB && facetKB.isLoaded && facetKB.isLoaded() && facetKB.hasIso2 && facetKB.hasIso2(iso2)) {
+      const computeAccentPair = () => {
+        const out = { accentNorm: null, name: null, slug: null };
+        let base = null;
+        try {
+          if (plan?.target_accent && typeof plan.target_accent === 'string' && plan.target_accent.trim()) base = plan.target_accent;
+          else if (resolved && resolved.variantAxis === 'accent' && Array.isArray(resolved.variantCandidates) && resolved.variantCandidates.length) base = resolved.variantCandidates[0];
+          else if (iso2 === 'es') base = 'latin american';
+        } catch (_) {}
+        const norm = normalizeCatalogToken(base || '');
+        if (!norm) return out;
+        out.accentNorm = norm;
+        // name form: normalized accent key (spaces)
+        out.name = norm.includes('-') ? norm.replace(/-+/g, ' ').trim() : norm;
+        // slug form: KB mapping when possible (accepts name or slug input)
+        let slug = null;
+        try {
+          slug = facetKB.getAccentSlug ? facetKB.getAccentSlug(iso2, norm) : null;
+        } catch (_) {
+          slug = null;
+        }
+        out.slug = String(slug || slugifyAccentName(out.name) || '').trim() || null;
+        return out;
+      };
+
+      const pair = computeAccentPair();
+      const isAmbiguous = pair?.name && pair?.slug && pair.name !== pair.slug;
+      if (isAmbiguous && pair.accentNorm) {
+        const cached = getCachedAccentForm(iso2, pair.accentNorm);
+        if (cached && cached.preferred) {
+          try {
+            trace({
+              stage: 'accent_cache_hit',
+              params: { iso2, accent: pair.accentNorm, preferred: cached.preferred },
+              count: 0
+            });
+          } catch (_) {}
+          // Apply preference to the accent variable used in query building.
+          accent = cached.preferred === 'name' ? pair.name : pair.slug;
+        } else {
+          const probeOnce = async (accentValue) => {
+            const p = new URLSearchParams();
+            p.set('page_size', '1');
+            p.set('language', iso2);
+            if (qualityPref === 'high_only') p.set('category', 'high_quality');
+            p.set('accent', String(accentValue));
+            // Do NOT include use_cases/descriptives/search: keep probe focused on accent form behavior.
+            const voices = await callSharedVoices(p);
+            return Array.isArray(voices) ? voices.length : 0;
+          };
+
+          let nameCount = 0;
+          let slugCount = 0;
+          try { nameCount = await probeOnce(pair.name); } catch (_) { nameCount = 0; }
+          try { slugCount = await probeOnce(pair.slug); } catch (_) { slugCount = 0; }
+
+          const preferred = nameCount > 0 && slugCount === 0 ? 'name'
+            : (slugCount > 0 && nameCount === 0 ? 'slug'
+              : (nameCount >= slugCount ? 'name' : 'slug'));
+
+          setCachedAccentForm(iso2, pair.accentNorm, preferred, { nameCount, slugCount });
+          try {
+            trace({
+              stage: 'accent_probe',
+              params: {
+                iso2,
+                accent: pair.accentNorm,
+                name: pair.name,
+                slug: pair.slug,
+                name_count: String(nameCount),
+                slug_count: String(slugCount),
+                preferred
+              },
+              count: Math.max(nameCount, slugCount)
+            });
+          } catch (_) {}
+
+          accent = preferred === 'name' ? pair.name : pair.slug;
+        }
+      }
+    }
+  } catch (_) {}
+
   let primaryVariantApplied = false;
   const primaryVariant = (() => {
     try {
@@ -4697,6 +4853,12 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
           }
         }
         let voicesForKeyword;
+        // Track strict vs relaxed filter effectiveness for session-level suppression heuristics.
+        const hadUseCases = Array.isArray(appended.useCases) && appended.useCases.length > 0;
+        const hadDescriptives = Array.isArray(appended.descriptives) && appended.descriptives.length > 0;
+        let strictCount = 0;
+        let relaxUseCasesCount = 0;
+        let relaxDescriptivesCount = 0;
         const wantMore = detectListAll(userText) === true || plan.__listAll === true;
         if (wantMore) {
           voicesForKeyword = await callSharedVoicesAllPages(params, { maxPages: 3, cap: 200 });
@@ -4706,6 +4868,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             return voices;
           });
         }
+        strictCount = Array.isArray(voicesForKeyword) ? voicesForKeyword.length : 0;
 
         // Keyword variants retry (only when base query returns 0)
         if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0) {
@@ -4806,6 +4969,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             });
             try {
               const v2 = await callSharedVoices(p2);
+              relaxDescriptivesCount = Array.isArray(v2) ? v2.length : 0;
               try {
                 trace({
                   stage: 'per_keyword_relax_descriptives',
@@ -4861,6 +5025,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             });
             try {
               const v3 = await callSharedVoices(p3);
+              relaxUseCasesCount = Array.isArray(v3) ? v3.length : 0;
               try {
                 trace({
                   stage: 'per_keyword_relax_use_cases',
@@ -4877,6 +5042,22 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             } catch (_) {}
           }
         }
+
+        // Update plan-scoped stats for session-level suppression heuristics.
+        try {
+          if (hadUseCases) {
+            if (!plan.__stats_use_cases) plan.__stats_use_cases = { total: 0, strict0: 0, relaxedOk: 0 };
+            plan.__stats_use_cases.total += 1;
+            if (strictCount === 0) plan.__stats_use_cases.strict0 += 1;
+            if (strictCount === 0 && relaxUseCasesCount > 0) plan.__stats_use_cases.relaxedOk += 1;
+          }
+          if (hadDescriptives) {
+            if (!plan.__stats_descriptives) plan.__stats_descriptives = { total: 0, strict0: 0, relaxedOk: 0 };
+            plan.__stats_descriptives.total += 1;
+            if (strictCount === 0) plan.__stats_descriptives.strict0 += 1;
+            if (strictCount === 0 && relaxDescriptivesCount > 0) plan.__stats_descriptives.relaxedOk += 1;
+          }
+        } catch (_) {}
         // Alt-accent retry: if still empty and we used an accent filter, retry by flipping accent representation.
         // This addresses cases where the API expects accent NAME but we sent a slug (or vice versa),
         // e.g. "latin american" <-> "latin-american".
@@ -5041,6 +5222,47 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
       seen.set(voice.voice_id, entry);
     });
   });
+
+  // -------------------------------------------------------------
+  // Session-scoped suppression for auto-injected filters (use_cases/descriptives)
+  // -------------------------------------------------------------
+  // If the user did NOT explicitly ask for a use-case/descriptive filter, but the applied filter repeatedly
+  // yields 0 while its relaxation yields results, mark it as suppressed for subsequent requests in the same thread.
+  // This avoids wasting token/request budget on filters that don't work well for the current catalog state.
+  try {
+    // Only act when caller persists plan in session; keep changes minimal and conservative.
+    const explicitUC = hasExplicitUseCaseMention(userText);
+    const explicitDesc = hasExplicitDescriptiveMention(userText);
+
+    // Aggregate from trace is expensive; instead, rely on small counters attached by the per-keyword worker.
+    const uc = plan && plan.__stats_use_cases ? plan.__stats_use_cases : null;
+    const dc = plan && plan.__stats_descriptives ? plan.__stats_descriptives : null;
+
+    if (!explicitUC && uc && typeof uc === 'object') {
+      const strict0 = Number(uc.strict0 || 0) || 0;
+      const relaxedOk = Number(uc.relaxedOk || 0) || 0;
+      const total = Number(uc.total || 0) || 0;
+      // Heuristic: require multiple signals before suppressing.
+      if (total >= 6 && strict0 >= 4 && relaxedOk >= 3) {
+        plan.__suppressUseCases = true;
+        try {
+          trace({ stage: 'suppress_use_cases', params: { total: String(total), strict0: String(strict0), relaxedOk: String(relaxedOk) }, count: 0 });
+        } catch (_) {}
+      }
+    }
+
+    if (!explicitDesc && dc && typeof dc === 'object') {
+      const strict0 = Number(dc.strict0 || 0) || 0;
+      const relaxedOk = Number(dc.relaxedOk || 0) || 0;
+      const total = Number(dc.total || 0) || 0;
+      if (total >= 6 && strict0 >= 4 && relaxedOk >= 3) {
+        plan.__suppressDescriptives = true;
+        try {
+          trace({ stage: 'suppress_descriptives', params: { total: String(total), strict0: String(strict0), relaxedOk: String(relaxedOk) }, count: 0 });
+        } catch (_) {}
+      }
+    }
+  } catch (_) {}
 
   // Accent-slug fetch stage (zh): use UI slugs like hong-kong-cantonese / beijing-mandarin (soft)
   if (seen.size === 0 && language === 'zh') {
@@ -8195,6 +8417,11 @@ function isDevAssertsEnabled() {
   return enabled === 'true' || enabled === '1' || enabled === 'yes';
 }
 
+function isDevPocEnabled() {
+  const enabled = String(process.env.DEV_POC || '').trim().toLowerCase();
+  return enabled === 'true' || enabled === '1' || enabled === 'yes';
+}
+
 function runDevAsserts() {
   if (!isDevAssertsEnabled()) return;
 
@@ -8448,6 +8675,66 @@ function runDevAsserts() {
   } catch (_) {
     devAssert(true, 'accent slug asserts skipped');
   }
+}
+
+async function runDevPoc() {
+  if (!isDevPocEnabled()) return false;
+
+  if (!process.env.ELEVENLABS_API_KEY) {
+    console.error('DEV_POC=true requires ELEVENLABS_API_KEY.');
+    process.exit(1);
+  }
+
+  const queries = [
+    'es latam conversational',
+    'spanish latin american accent customer support',
+    'top conversational voice spanish Latin America accent, high quality'
+  ];
+
+  for (const q of queries) {
+    const trace = [];
+    const traceCb = (e) => { try { trace.push(e); } catch (_) {} };
+
+    // Minimal heuristic plan (no OpenAI required).
+    const lower = String(q || '').toLowerCase();
+    const iso2 = parseUserLanguageHints(q)?.iso2 || detectVoiceLanguageFromText(q) || null;
+    const basePlan = {
+      user_interface_language: guessUiLanguageFromText(q),
+      target_voice_language: iso2,
+      target_accent: lower.includes('latam') || lower.includes('latin america') ? 'latin american' : null,
+      target_gender: null,
+      quality_preference: /\bhigh quality\b|\bhq\b/.test(lower) ? 'high_only' : 'any',
+      tone_keywords: [],
+      use_case_keywords: ['conversational'],
+      character_keywords: [],
+      style_keywords: [],
+      extra_keywords: []
+    };
+    const plan = (typeof normalizeKeywordPlan === 'function') ? normalizeKeywordPlan(basePlan, q) : basePlan;
+
+    // Use keyword floor to create a realistic per-keyword search list.
+    const enriched = typeof ensureKeywordFloor === 'function' ? ensureKeywordFloor(q, plan) : plan;
+    let voices = [];
+    try {
+      voices = await fetchVoicesByKeywords(enriched, q, traceCb);
+    } catch (e) {
+      // Keep DEV_POC usable even with invalid keys / network issues.
+      try {
+        traceCb({ stage: 'dev_poc_error', params: { message: String(e?.message || e || 'error').slice(0, 200) }, count: 0 });
+      } catch (_) {}
+    }
+    const report = buildSearchReport(trace, enriched, 'generic', {
+      unique_count: Array.isArray(voices) ? voices.length : 0,
+      top_coverage: []
+    });
+
+    console.log('\n--- DEV_POC QUERY ---');
+    console.log(q);
+    console.log('--- DEV_POC REPORT ---');
+    console.log(report);
+  }
+
+  return true;
 }
 
 // -------------------------------------------------------------
@@ -9154,7 +9441,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
 // Slack Bolt app – app_mention handler
 // -------------------------------------------------------------
 
-if (!DEV_ASSERTS_ENABLED) {
+if (!DEV_ASSERTS_ENABLED && !isDevPocEnabled()) {
   const { App } = require('@slack/bolt');
   app = new App({
     token: process.env.SLACK_BOT_TOKEN,
@@ -9524,6 +9811,16 @@ app.action('cycle_quality', async ({ ack, body, client }) => {
   // DEV_ASSERTS=true should run regression checks without requiring Slack/OpenAI env.
   if (isDevAssertsEnabled()) {
     runDevAsserts();
+    return;
+  }
+  // DEV_POC=true runs a small CLI-style probe of shared-voices query behavior (no Slack/OpenAI required).
+  if (isDevPocEnabled()) {
+    try {
+      await runDevPoc();
+    } catch (e) {
+      console.error('DEV_POC failed:', e?.message || e);
+      process.exit(1);
+    }
     return;
   }
   validateEnvOrExit();
