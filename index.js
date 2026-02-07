@@ -1293,8 +1293,9 @@ const ACCENT_ALIASES = new Map([
   ['peninsular', 'peninsular'],
   ['european spanish', 'peninsular'],
   ['spanish (spain)', 'peninsular'],
-  ['castilian', 'castilian'],
-  ['spain', 'castilian'],
+  // Normalize common synonyms to the shared-voices facet name.
+  ['castilian', 'peninsular'],
+  ['spain', 'peninsular'],
   // Portuguese
   ['brazil', 'brazilian'],
   ['br', 'brazilian'],
@@ -7666,11 +7667,12 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
             (nameForm && nameForm !== norm ? getCachedAccentForm(k, nameForm) : null);
           if (cached && cached.preferred === 'name') return nameForm || aRaw;
           if (cached && cached.preferred === 'slug') {
+            const cacheKey = normalizeCatalogToken(cached.accentNorm || '') || null;
             const slugCached =
               facetKB && facetKB.isLoaded && facetKB.isLoaded() && facetKB.getAccentSlug
-                ? facetKB.getAccentSlug(k, norm || aRaw)
+                ? facetKB.getAccentSlug(k, cacheKey || norm || aRaw)
                 : null;
-            const slugFallback = slugifyAccentName(nameForm || norm || aRaw);
+            const slugFallback = slugifyAccentName(nameForm || cacheKey || norm || aRaw);
             return String(slugCached || slugFallback || '').trim() || aRaw;
           }
         }
