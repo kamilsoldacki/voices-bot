@@ -1289,6 +1289,10 @@ const ACCENT_ALIASES = new Map([
   ['mexican', 'mexican'],
   ['latin american', 'latin american'],
   ['latam', 'latin american'],
+  // ElevenLabs shared-voices uses "peninsular" for Spain/European Spanish.
+  ['peninsular', 'peninsular'],
+  ['european spanish', 'peninsular'],
+  ['spanish (spain)', 'peninsular'],
   ['castilian', 'castilian'],
   ['spain', 'castilian'],
   // Portuguese
@@ -4963,6 +4967,113 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             }
           } catch (_) {}
         }
+
+        // Early alt-accent retry: if accent representation is wrong (name vs slug),
+        // relaxing use_cases/descriptives won't help. Try flipping accent first to avoid a long run of zeros.
+        let didAltAccentFlip = false;
+        const tryAltAccentFlip = async () => {
+          try {
+            const currentAccent = typeof params.get === 'function' ? String(params.get('accent') || '').trim() : '';
+            if (!currentAccent) return null;
+            const iso2ForAccent = (() => {
+              try {
+                const fromParams = typeof params.get === 'function' ? params.get('language') : null;
+                const cand = (fromParams || language || resolved?.targetIso2 || '').toString().toLowerCase().slice(0, 2);
+                return cand || null;
+              } catch (_) {
+                return null;
+              }
+            })();
+
+            const getNameForSlug = (iso2, slug) => {
+              try {
+                const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+                if (!k) return null;
+                if (!facetKB || !facetKB.isLoaded || !facetKB.isLoaded()) return null;
+                const m = facetKB.accentSlugByIso2Accent && typeof facetKB.accentSlugByIso2Accent.get === 'function'
+                  ? facetKB.accentSlugByIso2Accent.get(k)
+                  : null;
+                if (!m || typeof m.entries !== 'function') return null;
+                const s = String(slug || '').trim();
+                if (!s) return null;
+                for (const [nameNorm, slugVal] of m.entries()) {
+                  if (String(slugVal || '').trim() === s) return String(nameNorm || '').trim() || null;
+                }
+              } catch (_) {}
+              return null;
+            };
+
+            const candidates = (() => {
+              try {
+                const out = [];
+                const acc = currentAccent;
+                const hasDash = acc.includes('-');
+                const hasSpace = /\s/.test(acc);
+                // slug -> name
+                if (hasDash && !hasSpace) {
+                  const kbName = iso2ForAccent ? getNameForSlug(iso2ForAccent, acc) : null;
+                  const nameLike = kbName || acc.replace(/-/g, ' ').replace(/\s+/g, ' ').trim();
+                  if (nameLike && nameLike !== acc) out.push(nameLike);
+                }
+                // name -> slug
+                if (hasSpace) {
+                  let slug = null;
+                  try {
+                    slug =
+                      iso2ForAccent &&
+                      facetKB &&
+                      facetKB.isLoaded &&
+                      facetKB.isLoaded() &&
+                      facetKB.getAccentSlug
+                        ? facetKB.getAccentSlug(iso2ForAccent, acc)
+                        : null;
+                  } catch (_) {
+                    slug = null;
+                  }
+                  const slugLike = String(slug || slugifyAccentName(acc) || '').trim();
+                  if (slugLike && slugLike !== acc) out.push(slugLike);
+                }
+                // de-dupe
+                return dedupePreserveOrder(out).filter(Boolean).slice(0, 2);
+              } catch (_) {
+                return [];
+              }
+            })();
+
+            for (const altAccent of candidates) {
+              const pAltAccent = new URLSearchParams(params.toString());
+              pAltAccent.set('accent', altAccent);
+              let altVoices = [];
+              try {
+                altVoices = await callSharedVoices(pAltAccent);
+              } catch (_) {}
+              try {
+                trace({
+                  stage: 'per_keyword_alt_accent',
+                  keyword: kwUsed,
+                  variant,
+                  kw_original: kwOriginal,
+                  typo_from: typoFrom,
+                  typo_to: typoTo,
+                  params: paramsToObject(pAltAccent),
+                  count: Array.isArray(altVoices) ? altVoices.length : 0
+                });
+              } catch (_) {}
+              if (Array.isArray(altVoices) && altVoices.length > 0) {
+                return altVoices;
+              }
+            }
+          } catch (_) {}
+          return null;
+        };
+        if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0) {
+          const alt = await tryAltAccentFlip();
+          if (Array.isArray(alt) && alt.length > 0) {
+            voicesForKeyword = alt;
+            didAltAccentFlip = true;
+          }
+        }
+
         // Progressive relaxation if empty and we added filters
         if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0) {
           // 1) drop descriptives
@@ -5064,104 +5175,13 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             if (strictCount === 0 && relaxDescriptivesCount > 0) plan.__stats_descriptives.relaxedOk += 1;
           }
         } catch (_) {}
-        // Alt-accent retry: if still empty and we used an accent filter, retry by flipping accent representation.
-        // This addresses cases where the API expects accent NAME but we sent a slug (or vice versa),
-        // e.g. "latin american" <-> "latin-american".
-        if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0) {
-          try {
-            const currentAccent = typeof params.get === 'function' ? String(params.get('accent') || '').trim() : '';
-            if (currentAccent) {
-              const iso2ForAccent = (() => {
-                try {
-                  const fromParams = typeof params.get === 'function' ? params.get('language') : null;
-                  const cand = (fromParams || language || resolved?.targetIso2 || '').toString().toLowerCase().slice(0, 2);
-                  return cand || null;
-                } catch (_) {
-                  return null;
-                }
-              })();
-
-              const getNameForSlug = (iso2, slug) => {
-                try {
-                  const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
-                  if (!k) return null;
-                  if (!facetKB || !facetKB.isLoaded || !facetKB.isLoaded()) return null;
-                  const m = facetKB.accentSlugByIso2Accent && typeof facetKB.accentSlugByIso2Accent.get === 'function'
-                    ? facetKB.accentSlugByIso2Accent.get(k)
-                    : null;
-                  if (!m || typeof m.entries !== 'function') return null;
-                  const s = String(slug || '').trim();
-                  if (!s) return null;
-                  for (const [nameNorm, slugVal] of m.entries()) {
-                    if (String(slugVal || '').trim() === s) return String(nameNorm || '').trim() || null;
-                  }
-                } catch (_) {}
-                return null;
-              };
-
-              const candidates = (() => {
-                try {
-                  const out = [];
-                  const acc = currentAccent;
-                  const hasDash = acc.includes('-');
-                  const hasSpace = /\s/.test(acc);
-                  // slug -> name
-                  if (hasDash && !hasSpace) {
-                    const kbName = iso2ForAccent ? getNameForSlug(iso2ForAccent, acc) : null;
-                    const nameLike = kbName || acc.replace(/-/g, ' ').replace(/\s+/g, ' ').trim();
-                    if (nameLike && nameLike !== acc) out.push(nameLike);
-                  }
-                  // name -> slug
-                  if (hasSpace) {
-                    let slug = null;
-                    try {
-                      slug =
-                        iso2ForAccent &&
-                        facetKB &&
-                        facetKB.isLoaded &&
-                        facetKB.isLoaded() &&
-                        facetKB.getAccentSlug
-                          ? facetKB.getAccentSlug(iso2ForAccent, acc)
-                          : null;
-                    } catch (_) {
-                      slug = null;
-                    }
-                    const slugLike = String(slug || slugifyAccentName(acc) || '').trim();
-                    if (slugLike && slugLike !== acc) out.push(slugLike);
-                  }
-                  // de-dupe
-                  return dedupePreserveOrder(out).filter(Boolean).slice(0, 2);
-                } catch (_) {
-                  return [];
-                }
-              })();
-
-              for (const altAccent of candidates) {
-                const pAltAccent = new URLSearchParams(params.toString());
-                pAltAccent.set('accent', altAccent);
-                let altVoices = [];
-                try {
-                  altVoices = await callSharedVoices(pAltAccent);
-                } catch (_) {}
-                try {
-                  trace({
-                    stage: 'per_keyword_alt_accent',
-                    keyword: kwUsed,
-                    variant,
-                    kw_original: kwOriginal,
-                    typo_from: typoFrom,
-                    typo_to: typoTo,
-                    params: paramsToObject(pAltAccent),
-                    count: Array.isArray(altVoices) ? altVoices.length : 0
-                  });
-                } catch (_) {}
-                if (Array.isArray(altVoices) && altVoices.length > 0) {
-                  voicesForKeyword = altVoices;
-                  break;
-                }
-              }
-            }
-          } catch (_) {}
+        // Late safety net: alt-accent flip (only if it wasn't already tried early).
+        if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0 && !didAltAccentFlip) {
+          const alt = await tryAltAccentFlip();
+          if (Array.isArray(alt) && alt.length > 0) {
+            voicesForKeyword = alt;
+            didAltAccentFlip = true;
+          }
         }
         // Quick relax (after triage): if still empty, retry without use_cases/accent/locale/age
         if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0) {
@@ -7629,18 +7649,43 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
 
   const pickAccentParamValue = (iso2, acc) => {
     try {
-      const a = (acc || '').toString();
-      if (!a) return null;
-      // If KB provides a slug, prefer it in cases where spaces/punctuation could break matching.
+      const aRaw = (acc || '').toString().trim();
+      if (!aRaw) return null;
+
+      const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+      const isZh = k === 'zh';
+      const norm = normalizeCatalogToken(aRaw);
+      const nameForm = norm.includes('-') ? norm.replace(/-+/g, ' ').trim() : norm;
+
+      // If accent_probe already determined the correct form (name vs slug) for this language+accent,
+      // respect it here so we don't re-introduce 0-result queries (notably: ES "latin american").
+      try {
+        if (k) {
+          const cached =
+            getCachedAccentForm(k, norm) ||
+            (nameForm && nameForm !== norm ? getCachedAccentForm(k, nameForm) : null);
+          if (cached && cached.preferred === 'name') return nameForm || aRaw;
+          if (cached && cached.preferred === 'slug') {
+            const slugCached =
+              facetKB && facetKB.isLoaded && facetKB.isLoaded() && facetKB.getAccentSlug
+                ? facetKB.getAccentSlug(k, norm || aRaw)
+                : null;
+            const slugFallback = slugifyAccentName(nameForm || norm || aRaw);
+            return String(slugCached || slugFallback || '').trim() || aRaw;
+          }
+        }
+      } catch (_) {}
+
+      // Default behavior: if KB provides a slug, prefer it when spaces could break matching, when forced, or for zh.
       const slug =
         facetKB && facetKB.isLoaded && facetKB.isLoaded() && facetKB.getAccentSlug
-          ? facetKB.getAccentSlug(iso2, a)
+          ? facetKB.getAccentSlug(k || iso2, aRaw)
           : null;
-      if (!slug) return a;
+      if (!slug) return aRaw;
       const force = readEnvBoolean('FORCE_ACCENT_SLUGS', false);
-      const hasSpaces = /\s/.test(a);
-      if (force || hasSpaces || (iso2 || '').toString().toLowerCase().slice(0, 2) === 'zh') return slug;
-      return a;
+      const hasSpaces = /\s/.test(aRaw);
+      if (force || hasSpaces || isZh) return slug;
+      return aRaw;
     } catch (_) {
       return acc;
     }
@@ -7797,9 +7842,14 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
       useCases = ['conversational'];
     }
   }
-  // IVR fast path: if ivr present in the text, start with only ivr
+  // Strong conversational signals in the user text should win over LLM plan noise.
+  // This prevents accidental narrowing to narrative_story for queries like "top conversational voice ... customer support".
+  if (/\b(conversational|customer support|customer service|call center|contact center|tech support|technical support)\b/i.test(lowerText)) {
+    useCases = ['conversational'];
+  }
+  // "IVR" is not a Voice Library use_cases enum; treat it as conversational.
   if (/\bivr\b/i.test(lowerText)) {
-    useCases = ['ivr'];
+    useCases = ['conversational'];
   }
   for (const uc of useCases) params.append('use_cases', uc);
 
@@ -8661,6 +8711,44 @@ function runDevAsserts() {
     const r7 = pickQueryUseCases({ use_case_keywords: ['story telling'] });
     devAssert(Array.isArray(r7) && r7.includes('narrative_story'), 'use_case: story telling maps to narrative_story');
   }
+  // Use-cases: support/customer-service phrases must map to conversational
+  {
+    const r8 = pickQueryUseCases({ use_case_keywords: ['customer support'] });
+    devAssert(Array.isArray(r8) && r8.includes('conversational'), 'use_case: customer support -> conversational');
+    devAssert(!r8.includes('narrative_story'), 'use_case: customer support must not map to narrative_story');
+  }
+  {
+    const r9 = pickQueryUseCases({ use_case_keywords: ['call center'] });
+    devAssert(Array.isArray(r9) && r9.includes('conversational'), 'use_case: call center -> conversational');
+  }
+  // Query builder: explicit "conversational/customer support" in user text must force conversational,
+  // even if the plan contains narrative-like use_case keywords.
+  {
+    const p = new URLSearchParams();
+    appendQueryFiltersToParams(p, { use_case_keywords: ['story'] }, 'top conversational voice Brazil pt-br, customer support', {
+      language: 'pt',
+      accent: null,
+      gender: null,
+      qualityPref: 'any',
+      forceUseCases: true
+    });
+    const ucs = typeof p.getAll === 'function' ? p.getAll('use_cases') : [];
+    devAssert(Array.isArray(ucs) && ucs.includes('conversational'), 'query: conversational text forces use_cases=conversational');
+    devAssert(!ucs.includes('narrative_story'), 'query: conversational text must not set narrative_story');
+  }
+  {
+    const p2 = new URLSearchParams();
+    appendQueryFiltersToParams(p2, { use_case_keywords: [] }, 'ivr customer support voice', {
+      language: 'en',
+      accent: null,
+      gender: null,
+      qualityPref: 'any',
+      forceUseCases: true
+    });
+    const ucs2 = typeof p2.getAll === 'function' ? p2.getAll('use_cases') : [];
+    devAssert(Array.isArray(ucs2) && ucs2.includes('conversational'), 'query: ivr treated as conversational');
+    devAssert(!ucs2.includes('ivr'), 'query: ivr must not be used as use_cases enum');
+  }
 
   // Accent: ensure API param uses slug for spaced accents (e.g., "latin american")
   try {
@@ -8861,9 +8949,39 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         const explicitLocale = !!(hint && hint.locale);
         let explicitLocaleOk = false;
 
+        // Treat a confidently resolved locale (explicit OR inferred) as fully-specified.
+        // This prevents redundant "pick an accent" prompts for cases like "European Spanish" -> es-ES.
+        try {
+          const resolvedLoc = getRequestedLocale(cleaned, keywordPlan);
+          const ok =
+            resolvedLoc && facetKB && facetKB.checkLocaleAllowed
+              ? facetKB.checkLocaleAllowed(iso2, resolvedLoc)
+              : null;
+          if (resolvedLoc && ok && ok.known && ok.allowed) {
+            explicitLocaleOk = true;
+            try {
+              keywordPlan.target_locale = resolvedLoc;
+            } catch (_) {}
+            // Infer/normalize the corresponding accent so downstream search uses consistent facet values.
+            try {
+              // Avoid letting an existing plan.target_accent override the locale-derived mapping.
+              const tmpPlan = { ...(keywordPlan || {}), target_accent: null };
+              const accFromLocale = getRequestedAccent(cleaned, tmpPlan, resolvedLoc);
+              if (accFromLocale) keywordPlan.target_accent = accFromLocale;
+            } catch (_) {}
+          }
+        } catch (_) {}
+
         // Locale: only when explicitly present but invalid
         if (explicitLocale) {
-          const reqLoc = getRequestedLocale(cleaned, keywordPlan);
+          // NOTE: use the raw explicit locale token so we can suggest alternatives even when it's invalid.
+          // getRequestedLocale() is conservative and may return null for rejected locales.
+          let reqLoc = normalizeRequestedLocale(hint.locale) || hint.locale;
+          // es-419 is a REGION alias (LatAm), not a queryable locale for shared-voices.
+          // Treat it as "no explicit locale" and let downstream LatAm logic handle it.
+          try {
+            if (normalizeLocaleToken(reqLoc) === 'es-419') reqLoc = null;
+          } catch (_) {}
           if (reqLoc && facetKB.checkLocaleAllowed) {
             const ok = facetKB.checkLocaleAllowed(iso2, reqLoc);
             // If user provided an explicit, allowed locale, treat it as fully-specified and avoid redundant accent clarification.
@@ -8927,7 +9045,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         }
 
         // Accent: when user requested accent but it's invalid/ambiguous
-        // If we have a valid explicit locale (e.g. pt-PT), do NOT ask to pick an accent even if the word \"accent\" appears.
+        // If we have a valid resolved locale (explicit or inferred; e.g. pt-PT, es-ES), do NOT ask to pick an accent
+        // even if the word/phrase implies accent.
         if (wantsAccent && !explicitLocaleOk) {
           const reqLoc = getRequestedLocale(cleaned, keywordPlan);
           const reqAcc = getRequestedAccent(cleaned, keywordPlan, reqLoc);
