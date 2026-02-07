@@ -4877,6 +4877,105 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             } catch (_) {}
           }
         }
+        // Alt-accent retry: if still empty and we used an accent filter, retry by flipping accent representation.
+        // This addresses cases where the API expects accent NAME but we sent a slug (or vice versa),
+        // e.g. "latin american" <-> "latin-american".
+        if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0) {
+          try {
+            const currentAccent = typeof params.get === 'function' ? String(params.get('accent') || '').trim() : '';
+            if (currentAccent) {
+              const iso2ForAccent = (() => {
+                try {
+                  const fromParams = typeof params.get === 'function' ? params.get('language') : null;
+                  const cand = (fromParams || language || resolved?.targetIso2 || '').toString().toLowerCase().slice(0, 2);
+                  return cand || null;
+                } catch (_) {
+                  return null;
+                }
+              })();
+
+              const getNameForSlug = (iso2, slug) => {
+                try {
+                  const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+                  if (!k) return null;
+                  if (!facetKB || !facetKB.isLoaded || !facetKB.isLoaded()) return null;
+                  const m = facetKB.accentSlugByIso2Accent && typeof facetKB.accentSlugByIso2Accent.get === 'function'
+                    ? facetKB.accentSlugByIso2Accent.get(k)
+                    : null;
+                  if (!m || typeof m.entries !== 'function') return null;
+                  const s = String(slug || '').trim();
+                  if (!s) return null;
+                  for (const [nameNorm, slugVal] of m.entries()) {
+                    if (String(slugVal || '').trim() === s) return String(nameNorm || '').trim() || null;
+                  }
+                } catch (_) {}
+                return null;
+              };
+
+              const candidates = (() => {
+                try {
+                  const out = [];
+                  const acc = currentAccent;
+                  const hasDash = acc.includes('-');
+                  const hasSpace = /\s/.test(acc);
+                  // slug -> name
+                  if (hasDash && !hasSpace) {
+                    const kbName = iso2ForAccent ? getNameForSlug(iso2ForAccent, acc) : null;
+                    const nameLike = kbName || acc.replace(/-/g, ' ').replace(/\s+/g, ' ').trim();
+                    if (nameLike && nameLike !== acc) out.push(nameLike);
+                  }
+                  // name -> slug
+                  if (hasSpace) {
+                    let slug = null;
+                    try {
+                      slug =
+                        iso2ForAccent &&
+                        facetKB &&
+                        facetKB.isLoaded &&
+                        facetKB.isLoaded() &&
+                        facetKB.getAccentSlug
+                          ? facetKB.getAccentSlug(iso2ForAccent, acc)
+                          : null;
+                    } catch (_) {
+                      slug = null;
+                    }
+                    const slugLike = String(slug || slugifyAccentName(acc) || '').trim();
+                    if (slugLike && slugLike !== acc) out.push(slugLike);
+                  }
+                  // de-dupe
+                  return dedupePreserveOrder(out).filter(Boolean).slice(0, 2);
+                } catch (_) {
+                  return [];
+                }
+              })();
+
+              for (const altAccent of candidates) {
+                const pAltAccent = new URLSearchParams(params.toString());
+                pAltAccent.set('accent', altAccent);
+                let altVoices = [];
+                try {
+                  altVoices = await callSharedVoices(pAltAccent);
+                } catch (_) {}
+                try {
+                  trace({
+                    stage: 'per_keyword_alt_accent',
+                    keyword: kwUsed,
+                    variant,
+                    kw_original: kwOriginal,
+                    typo_from: typoFrom,
+                    typo_to: typoTo,
+                    params: paramsToObject(pAltAccent),
+                    count: Array.isArray(altVoices) ? altVoices.length : 0
+                  });
+                } catch (_) {}
+                if (Array.isArray(altVoices) && altVoices.length > 0) {
+                  voicesForKeyword = altVoices;
+                  break;
+                }
+              }
+            }
+          } catch (_) {}
+        }
         // Quick relax (after triage): if still empty, retry without use_cases/accent/locale/age
         if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0) {
           const pQuick = new URLSearchParams(params.toString());
@@ -7352,6 +7451,23 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   // Existing filters
   // Bilingual: avoid constraining language to let both EN/ES candidates through
   if (!isBilingualEnEs && language && shouldApplyParam('language', plan, userText)) params.set('language', language);
+  // If we apply an accent constraint, ensure we also set a language (accent-only queries tend to return 0).
+  const ensureLanguageForAccent = (iso2) => {
+    try {
+      if (isBilingualEnEs) return;
+      const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+      if (!k) return;
+      if (typeof params.get === 'function') {
+        const already = String(params.get('language') || '').trim();
+        if (!already) params.set('language', k);
+      } else {
+        // Fallback: best-effort set
+        params.set('language', k);
+      }
+      // Keep diagnostics consistent when we set language implicitly due to accent.
+      diag.language = k;
+    } catch (_) {}
+  };
   // Accent: allow Spanish Mexico heuristic even without explicit "accent"
   try {
     if (
@@ -7363,8 +7479,12 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
       shouldApplyParam('accent', plan, userText)
     ) {
       const cand = String(resolved.variantCandidates[0] || '').trim();
-      if (cand && isAccentAllowedByCatalog(language, cand)) {
-        const accVal = pickAccentParamValue(language, cand) || cand;
+      const iso2 = (language || resolved?.targetIso2 || '').toString().toLowerCase().slice(0, 2) || null;
+      // Preserve prior behavior: if we can't determine iso2, still allow accent-only filtering
+      // (isAccentAllowedByCatalog(null, ...) is a graceful allow).
+      if (cand && isAccentAllowedByCatalog(iso2, cand)) {
+        if (iso2) ensureLanguageForAccent(iso2);
+        const accVal = pickAccentParamValue(iso2 || '', cand) || cand;
         params.set('accent', accVal);
         diag.accent_set = String(accVal);
         diag.accent_allowed = 'true';
@@ -7376,6 +7496,7 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
 
   if (!resolverAppliedAccent && isSpanishMexico) {
     if (isAccentAllowedByCatalog('es', 'mexican')) {
+      ensureLanguageForAccent('es');
       params.set('accent', pickAccentParamValue('es', 'mexican') || 'mexican');
       diag.accent_set = 'mexican';
       diag.accent_allowed = 'true';
@@ -7398,6 +7519,7 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
     if (!explicitLocale) {
       if (isAccentAllowedByCatalog('es', 'latin american')) {
         const accVal = pickAccentParamValue('es', 'latin american') || 'latin american';
+        ensureLanguageForAccent('es');
         params.set('accent', accVal);
         diag.accent_set = String(accVal);
         diag.accent_allowed = 'true';
@@ -7413,8 +7535,12 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   } else if (!resolverAppliedAccent && language === 'zh' && chineseDialect) {
     // Prefer locale-based hinting for Mandarin vs Cantonese (soft)
   } else if (!resolverAppliedAccent && accent && shouldApplyParam('accent', plan, userText)) {
-    if (isAccentAllowedByCatalog(language, accent)) {
-      const accVal = pickAccentParamValue(language, accent) || accent;
+    const iso2 = (language || resolved?.targetIso2 || '').toString().toLowerCase().slice(0, 2) || null;
+    // Preserve prior behavior: if we can't determine iso2, still allow accent-only filtering
+    // (isAccentAllowedByCatalog(null, ...) is a graceful allow).
+    if (isAccentAllowedByCatalog(iso2, accent)) {
+      if (iso2) ensureLanguageForAccent(iso2);
+      const accVal = pickAccentParamValue(iso2 || '', accent) || accent;
       params.set('accent', accVal);
       diag.accent_set = String(accVal);
       diag.accent_allowed = 'true';
