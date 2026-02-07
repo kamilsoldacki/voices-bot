@@ -1295,9 +1295,10 @@ const ACCENT_ALIASES = new Map([
   ['brazil', 'brazilian'],
   ['br', 'brazilian'],
   ['brazilian', 'brazilian'],
-  ['portugal', 'portuguese'],
-  ['european portuguese', 'portuguese'],
-  ['portuguese', 'portuguese']
+  // NOTE: shared-voices accent facet uses "european" (not "portuguese") for Portugal/pt-PT.
+  ['portugal', 'european'],
+  ['european portuguese', 'european'],
+  ['portuguese', 'european']
 ]);
 
 function normalizeRequestedLocale(input) {
@@ -2374,11 +2375,13 @@ function getRequestedAccent(userText, keywordPlan, requestedLocale) {
       .slice(0, 2);
 
     // Prefer explicit plan hint if present
-    const planAcc =
+    let planAcc =
       typeof keywordPlan?.target_accent === 'string' && keywordPlan.target_accent.trim()
         ? normalizeRequestedAccent(keywordPlan.target_accent)
         : null;
     if (planAcc) {
+      // PT: treat "portuguese" as a language label; the shared-voices accent facet uses "european".
+      if (iso2 === 'pt' && planAcc === 'portuguese') planAcc = 'european';
       // Conservative validation against FacetKB when available (skip for zh to avoid slug mismatch)
       try {
         if (iso2 && iso2 !== 'zh' && facetKB && facetKB.isLoaded && facetKB.isLoaded() && facetKB.hasIso2(iso2) && facetKB.checkAccentAllowed) {
@@ -2398,7 +2401,7 @@ function getRequestedAccent(userText, keywordPlan, requestedLocale) {
       else if (loc === 'en-AU') candidate = 'australian';
       else if (loc === 'en-CA') candidate = 'canadian';
       else if (loc === 'pt-BR') candidate = 'brazilian';
-      else if (loc === 'pt-PT') candidate = 'portuguese';
+      else if (loc === 'pt-PT') candidate = 'european';
       else if (loc === 'es-MX') candidate = 'mexican';
       else if (loc === 'es-ES') candidate = 'castilian';
       else if (loc === 'fr-CA') candidate = 'canadian';
@@ -2425,8 +2428,11 @@ function getRequestedAccent(userText, keywordPlan, requestedLocale) {
       else if (/\b(mexico|mexican|es-mx|mx)\b/.test(lower)) candidate = 'mexican';
       else if (/\b(spain|castilian|es-es)\b/.test(lower)) candidate = 'castilian';
       else if (/\b(brazil|brasil|brazilian|pt-br)\b/.test(lower)) candidate = 'brazilian';
-      else if (/\b(portugal|pt-pt|pt-eu|european)\b/.test(lower) && /\bportuguese|pt\b/.test(lower)) candidate = 'portuguese';
+      else if (/\b(portugal|pt-pt|pt-eu|european)\b/.test(lower) && /\bportuguese|pt\b/.test(lower)) candidate = 'european';
     }
+
+    // PT alias: treat "portuguese" as "european" (accent facet naming)
+    if (iso2 === 'pt' && candidate === 'portuguese') candidate = 'european';
 
     // Conservative validation against FacetKB when available (skip for zh to avoid slug mismatch)
     try {
@@ -8672,6 +8678,20 @@ function runDevAsserts() {
 
     const slug1 = facetKB.getAccentSlug('es', 'latin-american');
     devAssert(slug1 === 'latin-american', 'KB: getAccentSlug accepts slug input');
+
+    // PT: pt-PT should map to the *accent facet* \"european\" (not \"portuguese\")
+    devAssert(getRequestedLocale('pt-PT', { target_voice_language: 'pt' }) === 'pt-PT', 'pt locale: pt-PT parses');
+    devAssert(
+      getRequestedAccent('pt-PT Portuguese accent', { target_voice_language: 'pt' }, 'pt-PT') === 'european',
+      'pt accent: pt-PT -> european'
+    );
+    devAssert(
+      getRequestedAccent('pt-PT accent', { target_voice_language: 'pt', target_accent: 'portuguese' }, 'pt-PT') === 'european',
+      'pt accent: explicit portuguese -> european alias'
+    );
+    const okPt = facetKB.checkAccentAllowed('pt', 'european');
+    devAssert(!!okPt && okPt.known === true && okPt.allowed === true, 'KB: european allowed for pt');
+    devAssert(normalizeRequestedAccent('portuguese') === 'european', 'accent alias: portuguese -> european');
   } catch (_) {
     devAssert(true, 'accent slug asserts skipped');
   }
@@ -8839,12 +8859,28 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
       if (iso2 && kbReady) {
         const wantsAccent = hasExplicitAccentMention(cleaned) || (typeof keywordPlan?.target_accent === 'string' && keywordPlan.target_accent.trim());
         const explicitLocale = !!(hint && hint.locale);
+        let explicitLocaleOk = false;
 
         // Locale: only when explicitly present but invalid
         if (explicitLocale) {
           const reqLoc = getRequestedLocale(cleaned, keywordPlan);
           if (reqLoc && facetKB.checkLocaleAllowed) {
             const ok = facetKB.checkLocaleAllowed(iso2, reqLoc);
+            // If user provided an explicit, allowed locale, treat it as fully-specified and avoid redundant accent clarification.
+            if (ok && ok.known && ok.allowed) {
+              explicitLocaleOk = true;
+              try {
+                keywordPlan.target_locale = reqLoc;
+              } catch (_) {}
+              // If the user provided an explicit, allowed locale, infer/normalize the corresponding accent so downstream search
+              // uses consistent facet values (e.g. pt-PT -> european), even when the user didn't explicitly mention "accent".
+              try {
+                // Avoid letting an existing plan.target_accent override the locale-derived mapping.
+                const tmpPlan = { ...(keywordPlan || {}), target_accent: null };
+                const accFromLocale = getRequestedAccent(cleaned, tmpPlan, reqLoc);
+                if (accFromLocale) keywordPlan.target_accent = accFromLocale;
+              } catch (_) {}
+            }
             if (ok && ok.known && !ok.allowed) {
               const sugg = facetKB.suggestLocales ? facetKB.suggestLocales(iso2, cleaned, { limit: 3 }) : [];
               const toDisplay = (norm) => {
@@ -8891,11 +8927,20 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         }
 
         // Accent: when user requested accent but it's invalid/ambiguous
-        if (wantsAccent) {
+        // If we have a valid explicit locale (e.g. pt-PT), do NOT ask to pick an accent even if the word \"accent\" appears.
+        if (wantsAccent && !explicitLocaleOk) {
           const reqLoc = getRequestedLocale(cleaned, keywordPlan);
           const reqAcc = getRequestedAccent(cleaned, keywordPlan, reqLoc);
           const allowed = reqAcc && facetKB.checkAccentAllowed ? facetKB.checkAccentAllowed(iso2, reqAcc) : null;
           const accOk = !!(allowed && allowed.known && allowed.allowed);
+
+          // If the requested accent is valid after normalization (e.g. PT: portuguese -> european),
+          // persist the normalized value back into the plan so downstream search uses it.
+          if (accOk && reqAcc) {
+            try {
+              keywordPlan.target_accent = reqAcc;
+            } catch (_) {}
+          }
 
           if (!accOk) {
             const sugg = facetKB.suggestAccents ? facetKB.suggestAccents(iso2, cleaned, { limit: 3 }) : [];
