@@ -1269,6 +1269,9 @@ const ACCENT_ALIASES = new Map([
   ['us', 'american'],
   ['usa', 'american'],
   ['american', 'american'],
+  ['texan', 'american'],
+  ['southern', 'american'],
+  ['southern american', 'american'],
   ['uk', 'british'],
   ['british', 'british'],
   ['english (uk)', 'british'],
@@ -1411,6 +1414,33 @@ function parseUserLanguageHints(userText) {
       let locale = null;
       if (iso2 === 'pt' && /\b(brazil|brasil|brazilian|brasile)\b/.test(lower)) locale = 'pt-BR';
       return { iso2, locale, explicit: true, reason: 'static_alias' };
+    }
+  }
+
+  // 4b) accent terms that imply a language
+  const ACCENT_IMPLIES_LANGUAGE = new Map([
+    ['texan', 'en'],
+    ['southern', 'en'],
+    ['american', 'en'],
+    ['british', 'en'],
+    ['australian', 'en'],
+    ['canadian', 'en'],
+    ['irish', 'en'],
+    ['scottish', 'en'],
+    ['mexican', 'es'],
+    ['castilian', 'es'],
+    ['brazilian', 'pt'],
+  ]);
+  {
+    let bestAccent = null; // { pos, iso2 }
+    for (const [accent, iso2] of ACCENT_IMPLIES_LANGUAGE.entries()) {
+      const m = lower.match(new RegExp(`\\b${accent}\\b`));
+      if (m && (bestAccent === null || m.index < bestAccent.pos)) {
+        bestAccent = { pos: m.index, iso2 };
+      }
+    }
+    if (bestAccent) {
+      return { iso2: bestAccent.iso2, locale: null, explicit: true, reason: 'accent_implies_lang' };
     }
   }
 
@@ -2103,6 +2133,9 @@ function hasExplicitAccentMention(userText) {
   const implicit = [
     'general american',
     'standard american',
+    'texan',
+    'southern',
+    'american',
     'british',
     'mexican',
     'castilian',
@@ -2955,6 +2988,7 @@ function detectQualityPreferenceFromText(text) {
   const mentionsHQ =
     /\bhq\b/.test(lower) ||
     lower.includes('high quality') ||
+    lower.includes('high-quality') ||
     lower.includes('high quaility') ||
     lower.includes('wysoka jakość') ||
     lower.includes('wysokiej jakości') ||
@@ -3645,6 +3679,11 @@ function ensureKeywordFloor(userText, plan) {
     (out.style_keywords?.length || 0) +
     (out.extra_keywords?.length || 0);
   if (countAll >= 8) return out;
+
+  // If user specified a clear regional/accent term and has at least a few keywords,
+  // don't pad with generic support/call-center terms
+  const hasRegionalFocus = /\b(texan|southern|american|british|australian|mexican|irish|scottish|canadian|castilian|brazilian)\b/i.test(lower);
+  if (hasRegionalFocus && countAll >= 3) return out;
 
   const addUnique = (arr, items, cap) => {
     const base = Array.isArray(arr) ? arr : [];
