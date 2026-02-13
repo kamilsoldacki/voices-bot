@@ -4244,12 +4244,17 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     selectedKeywords.push((userText || '').toLowerCase());
   }
 
-  // Remove "high quality"/"hq" from keywords when quality_preference already constrains the search
+  // Remove "high quality"/"hq" from keywords when quality_preference already constrains the search,
+  // unless the user explicitly mentioned quality in any form (space, hyphen, abbreviation).
   if (qualityPref === 'high_only' || qualityPref === 'no_high') {
-    selectedKeywords = selectedKeywords.filter((k) => {
-      const n = normalizeKw(k);
-      return n !== 'high quality' && n !== 'hq' && n !== 'high-quality';
-    });
+    const _qLower = (userText || '').toLowerCase();
+    const _userMentionsQuality = _qLower.includes('high quality') || _qLower.includes('high-quality') || /\bhq\b/.test(_qLower);
+    if (!_userMentionsQuality) {
+      selectedKeywords = selectedKeywords.filter((k) => {
+        const n = normalizeKw(k);
+        return n !== 'high quality' && n !== 'hq' && n !== 'high-quality';
+      });
+    }
   }
 
   // Global prune of generic/noise keywords unless user explicitly asked
