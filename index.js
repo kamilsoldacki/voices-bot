@@ -1391,7 +1391,7 @@ function parseUserLanguageHints(userText) {
   // 3) language names from dynamic index
   for (const name of languageIndex.namesSorted || []) {
     if (!name) continue;
-    if (lower.includes(name)) {
+    if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(lower)) {
       const iso2 = languageIndex.byName.get(name);
       if (iso2) {
         // locale inference for common variants (best-effort)
@@ -1410,7 +1410,7 @@ function parseUserLanguageHints(userText) {
 
   // 4) minimal static aliases
   for (const [alias, iso2] of STATIC_LANGUAGE_ALIASES.entries()) {
-    if (lower.includes(alias)) {
+    if (new RegExp(`\\b${alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(lower)) {
       let locale = null;
       if (iso2 === 'pt' && /\b(brazil|brasil|brazilian|brasile)\b/.test(lower)) locale = 'pt-BR';
       return { iso2, locale, explicit: true, reason: 'static_alias' };
@@ -3607,33 +3607,6 @@ Task:
 }
 
 // -------------------------------------------------------------
-// GPT: build keyword plan from user brief
-// -------------------------------------------------------------
-
-async function buildKeywordPlan(userText) {
-  const systemPrompt = `
-You are an assistant that takes a user's description of the voice they want (in ANY language)
-and produces a JSON keyword plan for the ElevenLabs Voice Library (GET /v1/shared-voices).
-
-Return ONLY a single JSON object, no markdown, no explanations.
-
-The JSON MUST have exactly these fields:
-
-{
-  "user_interface_language": string,        // 2-letter code like "en", "pl", "es" for the language the user is writing in
-  "target_voice_language": string or null,  // 2-letter code like "en", "pl" for the language of the VOICE the user wants
-  "target_accent": string or null,          // e.g. "american", "british", "polish"
-  "target_gender": "male" | "female" | "neutral" | null,
-  "quality_preference": "any" | "high_only" | "no_high",
-
-  "tone_keywords": string[],
-  "use_case_keywords": string[],
-  "character_keywords": string[],
-  "style_keywords": string[],
-  "extra_keywords": string[]
-}
-
-// -------------------------------------------------------------
 // Plan validator / normalizer
 // -------------------------------------------------------------
 function normalizeKeywordPlan(plan, userText) {
@@ -3758,6 +3731,34 @@ function ensureKeywordFloor(userText, plan) {
   out.__floorDomain = domain;
   return out;
 }
+
+// -------------------------------------------------------------
+// GPT: build keyword plan from user brief
+// -------------------------------------------------------------
+
+async function buildKeywordPlan(userText) {
+  const systemPrompt = `
+You are an assistant that takes a user's description of the voice they want (in ANY language)
+and produces a JSON keyword plan for the ElevenLabs Voice Library (GET /v1/shared-voices).
+
+Return ONLY a single JSON object, no markdown, no explanations.
+
+The JSON MUST have exactly these fields:
+
+{
+  "user_interface_language": string,        // 2-letter code like "en", "pl", "es" for the language the user is writing in
+  "target_voice_language": string or null,  // 2-letter code like "en", "pl" for the language of the VOICE the user wants
+  "target_accent": string or null,          // e.g. "american", "british", "polish"
+  "target_gender": "male" | "female" | "neutral" | null,
+  "quality_preference": "any" | "high_only" | "no_high",
+
+  "tone_keywords": string[],
+  "use_case_keywords": string[],
+  "character_keywords": string[],
+  "style_keywords": string[],
+  "extra_keywords": string[]
+}
+
 RULES:
 
 - user_interface_language:
@@ -4057,6 +4058,12 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
 
   // Resolve variant constraints once (used by fanout + scoring + diagnostics)
   const resolved = resolveVariantConstraints(userText, plan, facetKB, accentCatalog);
+
+  // Fallback: infer language from resolver (accent-implies-language, etc.)
+  // when the GPT plan didn't set target_voice_language.
+  if (!language && resolved?.targetIso2) {
+    language = resolved.targetIso2;
+  }
 
   // -------------------------------------------------------------
   // Accent form probe (name vs slug) for /v1/shared-voices
