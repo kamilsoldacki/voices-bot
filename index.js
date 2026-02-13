@@ -4244,6 +4244,14 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     selectedKeywords.push((userText || '').toLowerCase());
   }
 
+  // Remove "high quality"/"hq" from keywords when quality_preference already constrains the search
+  if (qualityPref === 'high_only' || qualityPref === 'no_high') {
+    selectedKeywords = selectedKeywords.filter((k) => {
+      const n = normalizeKw(k);
+      return n !== 'high quality' && n !== 'hq' && n !== 'high-quality';
+    });
+  }
+
   // Global prune of generic/noise keywords unless user explicitly asked
   {
     const before = pruneNegativesFromList(selectedKeywords.slice(), plan.__negatives);
@@ -4251,7 +4259,8 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     filtered = pruneNegativesFromList(filtered, plan.__negatives);
 
     // Ensure a minimum count after filtering by refilling from dropped ones
-    const MIN_KEYWORDS_AFTER_FILTER = 12;
+    const hasRegionalFocus = /\b(texan|southern|american|british|australian|mexican|irish|scottish|canadian|castilian|brazilian)\b/i.test((userText || '').toLowerCase());
+    const MIN_KEYWORDS_AFTER_FILTER = hasRegionalFocus ? 8 : 12;
     if (filtered.length < MIN_KEYWORDS_AFTER_FILTER) {
       const dropped = before.filter((k) => !filtered.includes(k));
       // Prioritize those explicitly mentioned by the user
