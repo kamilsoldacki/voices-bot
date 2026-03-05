@@ -2180,6 +2180,20 @@ function detectChineseDialectFromText(userText) {
   return null;
 }
 
+function hasFrenchCanadianMarkers(userText) {
+  const lower = (userText || '').toString().toLowerCase();
+  return /\b(fr-ca|quebec|québec|canadian french|french canadian|qc)\b/.test(lower);
+}
+
+function hasFrenchEuropeanMarkers(userText) {
+  const lower = (userText || '').toString().toLowerCase();
+  if (!lower) return false;
+  if (hasFrenchCanadianMarkers(userText)) return false;
+  if (/\b(fr-fr|european french|metropolitan french|parisian|paris)\b/.test(lower)) return true;
+  if (/\b(france|hexagonal)\b/.test(lower) && /\b(french|fr)\b/.test(lower)) return true;
+  return /\b(european)\b/.test(lower) && /\b(french|fr)\b/.test(lower);
+}
+
 // -------------------------------------------------------------
 // Variant intent detection (specific vs general) – global
 // -------------------------------------------------------------
@@ -2333,11 +2347,24 @@ function detectVariantIntent(userText, iso2, kb) {
       }
     }
     if (lang === 'fr') {
-      if (/\b(fr-ca|quebec|québec|canadian french|french canadian|qc)\b/.test(lower)) {
+      if (hasFrenchCanadianMarkers(text)) {
         out.isSpecific = true;
         out.axis = 'locale';
         out.requestedFacetKeys = ['fr-ca'];
         out.fallbackFacetKeys = [];
+        return out;
+      }
+      if (hasFrenchEuropeanMarkers(text)) {
+        out.isSpecific = true;
+        if (/\b(parisian|paris)\b/.test(lower)) {
+          out.axis = 'accent';
+          out.requestedFacetKeys = ['parisian'];
+          out.fallbackFacetKeys = ['standard'];
+        } else {
+          out.axis = 'locale';
+          out.requestedFacetKeys = ['fr-fr'];
+          out.fallbackFacetKeys = [];
+        }
         return out;
       }
     }
@@ -2511,6 +2538,9 @@ function resolveVariantConstraints(userText, plan, kb, catalog) {
     reason: '-'
   };
   if (!targetIso2) return out;
+  const isFrenchCanadianIntent = targetIso2 === 'fr' && hasFrenchCanadianMarkers(text);
+  const isFrenchEuropeanIntent = targetIso2 === 'fr' && !isFrenchCanadianIntent && hasFrenchEuropeanMarkers(text);
+  const isFrenchParisianIntent = targetIso2 === 'fr' && /\b(parisian|paris)\b/.test(lower);
 
   const isLocaleAllowed = (iso2, loc) => {
     try {
@@ -2717,6 +2747,26 @@ function resolveVariantConstraints(userText, plan, kb, catalog) {
     return out;
   }
 
+  // French EU/CA markers without explicit locale tags.
+  if (isFrenchEuropeanIntent) {
+    // Keep European FR locale heuristic for generic requests, but let explicit
+    // Parisian requests continue to accent logic where accent prioritization applies.
+    if (!isFrenchParisianIntent) {
+      out.variantMode = 'specific';
+      out.variantAxis = 'locale';
+      out.variantCandidates = ['fr-FR'];
+      out.reason = 'fr_european_locale_heuristic';
+      return out;
+    }
+  }
+  if (isFrenchCanadianIntent) {
+    out.variantMode = 'specific';
+    out.variantAxis = 'locale';
+    out.variantCandidates = ['fr-CA'];
+    out.reason = 'fr_canadian_locale_heuristic';
+    return out;
+  }
+
   // 2) Explicit accent intent (catalog-driven)
   try {
     if (kb && kb.isLoaded && kb.isLoaded() && kb.hasIso2 && kb.hasIso2(targetIso2) && kb.suggestAccents) {
@@ -2732,7 +2782,18 @@ function resolveVariantConstraints(userText, plan, kb, catalog) {
           if (kb.getFacetVariants) {
             const vars = kb.getFacetVariants(targetIso2, 'accent', { maxVariants: 6 }) || [];
             const extra = vars.map((v) => v?.facetKey || v?.facetValue || '').filter(Boolean);
-            out.variantCandidates = dedupePreserveOrder([...out.variantCandidates, ...extra]).slice(0, 6);
+            let merged = dedupePreserveOrder([...out.variantCandidates, ...extra]);
+            if (isFrenchEuropeanIntent) {
+              const banned = new Set(['quebec', 'acadian', 'cajun', 'creole']);
+              const preferred = ['parisian', 'standard', 'central', 'southern', 'northern', 'belgian', 'swiss'];
+              const base = merged.filter((x) => !banned.has(normalizeCatalogToken(x)));
+              const prioritized = dedupePreserveOrder([
+                ...preferred.filter((p) => base.includes(p)),
+                ...base
+              ]);
+              merged = prioritized.length ? prioritized : [String(best.norm)];
+            }
+            out.variantCandidates = merged.slice(0, 6);
           }
         } catch (_) {}
         return out;
@@ -4713,7 +4774,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             await runVariantList(fallbackVariants, { allowCombine: false });
           }
 
-          // If still nothing, add OTHER/UNSURE (broad query) if budget allows
+          // If still nothing, try a controlled FR-EU fallback before broad OTHER.
           if (allVoices.length === 0 && requestBudget > 0) {
             const base = new URLSearchParams();
             base.set('page_size', String(pageSize));
@@ -4723,22 +4784,57 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             if (featured) base.set('featured', 'true');
             if (age) base.set('age', age);
             if (sort) base.set('sort', sort);
-            const p = new URLSearchParams(base.toString());
-            const fetched = await fetchOnce(p, { iso2: language, axis: 'other', pass: 'no_search', facet: '__other__' });
-            const group = { facetType: axis, facetKey: '__other__', facetLabel: 'OTHER/UNSURE', voices: [] };
-            const seenInGroup = new Set();
-            for (const voice of fetched || []) {
-              if (!voice || !voice.voice_id) continue;
-              if (!seenInGroup.has(voice.voice_id)) {
-                seenInGroup.add(voice.voice_id);
-                group.voices.push(voice);
-              }
-              if (!allSeen.has(voice.voice_id)) {
-                allSeen.add(voice.voice_id);
-                allVoices.push(voice);
+
+            if (language === 'fr') {
+              const requested = Array.isArray(variantIntent.requestedFacetKeys) ? variantIntent.requestedFacetKeys : [];
+              const wantsFrEu = requested.includes('fr-fr') || requested.includes('parisian') || hasFrenchEuropeanMarkers(userText);
+              const wantsFrCa = requested.includes('fr-ca') || hasFrenchCanadianMarkers(userText);
+              if (wantsFrEu && !wantsFrCa) {
+                const pFr = new URLSearchParams(base.toString());
+                pFr.set('locale', 'fr-FR');
+                let fetchedFr = await fetchOnce(pFr, { iso2: language, axis: 'locale', pass: 'no_search', facet: 'fr-FR', fallback: 'fr_eu_locale' });
+                if ((!fetchedFr || fetchedFr.length < 3) && combinedSearch && requestBudget > 0) {
+                  const pFrS = new URLSearchParams(pFr.toString());
+                  pFrS.set('search', combinedSearch);
+                  const fetchedFrS = await fetchOnce(pFrS, { iso2: language, axis: 'locale', pass: 'with_search', facet: 'fr-FR', fallback: 'fr_eu_locale' });
+                  const fetchedFrLen = Array.isArray(fetchedFr) ? fetchedFr.length : 0;
+                  if (Array.isArray(fetchedFrS) && fetchedFrS.length > fetchedFrLen) fetchedFr = fetchedFrS;
+                }
+                const frGroup = { facetType: 'locale', facetKey: 'fr-fr', facetLabel: 'FR-FR', voices: [] };
+                const seenFr = new Set();
+                for (const voice of fetchedFr || []) {
+                  if (!voice || !voice.voice_id) continue;
+                  if (!seenFr.has(voice.voice_id)) {
+                    seenFr.add(voice.voice_id);
+                    frGroup.voices.push(voice);
+                  }
+                  if (!allSeen.has(voice.voice_id)) {
+                    allSeen.add(voice.voice_id);
+                    allVoices.push(voice);
+                  }
+                }
+                if (frGroup.voices.length) facetGroups.push(frGroup);
               }
             }
-            if (group.voices.length) facetGroups.push(group);
+
+            if (allVoices.length === 0) {
+              const p = new URLSearchParams(base.toString());
+              const fetched = await fetchOnce(p, { iso2: language, axis: 'other', pass: 'no_search', facet: '__other__' });
+              const group = { facetType: axis, facetKey: '__other__', facetLabel: 'OTHER/UNSURE', voices: [] };
+              const seenInGroup = new Set();
+              for (const voice of fetched || []) {
+                if (!voice || !voice.voice_id) continue;
+                if (!seenInGroup.has(voice.voice_id)) {
+                  seenInGroup.add(voice.voice_id);
+                  group.voices.push(voice);
+                }
+                if (!allSeen.has(voice.voice_id)) {
+                  allSeen.add(voice.voice_id);
+                  allVoices.push(voice);
+                }
+              }
+              if (group.voices.length) facetGroups.push(group);
+            }
           }
         }
 
@@ -7603,9 +7699,10 @@ function inferLocale(language, accent, userText) {
     if (/\b(pt-pt|portugal|european)\b/.test(lower) || acc.includes('portugal')) return 'pt-PT';
   }
   if (lang === 'fr') {
-    if (/\b(fr-ca|french canadian|canadian french|quebec|québec|qc)\b/.test(lower) || acc.includes('canadian')) {
+    if (hasFrenchCanadianMarkers(userText) || acc.includes('canadian')) {
       return 'fr-CA';
     }
+    if (hasFrenchEuropeanMarkers(userText) || acc.includes('parisian')) return 'fr-FR';
   }
   if (lang === 'zh') {
     // Dialect-ish locale preferences (soft; metadata may be sparse)
@@ -7765,7 +7862,11 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   };
   const isFrenchCanadian =
     (language === 'fr' || /\bfrench\b|\bfr\b/.test(lowerText)) &&
-    (/\b(canadian|quebec|québec|fr-ca|qc|french canadian|canadian french)\b/.test(lowerText));
+    hasFrenchCanadianMarkers(userText);
+  const isFrenchEuropean =
+    !isFrenchCanadian &&
+    (language === 'fr' || /\bfrench\b|\bfr\b/.test(lowerText)) &&
+    hasFrenchEuropeanMarkers(userText);
   const isSpanishMexico = (language === 'es' || /spanish|es\b/.test(lowerText)) &&
     (/\bmexico\b|\bmexican\b|\bes-mx\b|\bmx\b/.test(lowerText));
   const isSpanishLatam = (language === 'es' || /spanish|es\b/.test(lowerText)) &&
@@ -8000,6 +8101,16 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
       diag.locale_reason = 'spanish_spain';
     }
   }
+  // Force fr-FR locale for European/Parisian French briefs
+  if (isFrenchEuropean && !isFrenchCanadian) {
+    if (isLocaleAllowedByCatalog('fr', 'fr-FR')) {
+      params.set('locale', 'fr-FR');
+      loc = 'fr-FR';
+      diag.locale_set = 'fr-FR';
+      diag.locale_allowed = 'true';
+      diag.locale_reason = 'french_european';
+    }
+  }
   // Force fr-CA locale for French Canadian briefs
   if (isFrenchCanadian) {
     if (isLocaleAllowedByCatalog('fr', 'fr-CA')) {
@@ -8045,7 +8156,7 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
     featured,
     age,
     sort,
-    localeInferred: Boolean(isSpanishMexico || isSpanishLatam || isSpanishSpain || (language === 'zh' && chineseDialect)),
+    localeInferred: Boolean(isSpanishMexico || isSpanishLatam || isSpanishSpain || isFrenchEuropean || isFrenchCanadian || (language === 'zh' && chineseDialect)),
     bilingual: Boolean(isBilingualEnEs),
     negatives: banned || [],
     region: spanishRegion,
