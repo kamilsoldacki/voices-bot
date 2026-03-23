@@ -2054,6 +2054,17 @@ function isVoiceInLanguage(voice, langCode) {
     }
   } else if (lc === 'it') {
     if (blob.includes('italian') || blob.includes('italiano')) return true;
+  } else if (lc === 'ar') {
+    if (
+      blob.includes('arabic') ||
+      /\barab\b/.test(blob) ||
+      blob.includes('gulf') ||
+      blob.includes('emirati') ||
+      blob.includes('qatari') ||
+      blob.includes('khaleeji')
+    ) {
+      return true;
+    }
   }
 
   return false;
@@ -2198,9 +2209,15 @@ function hasExplicitAccentMention(userText) {
     'en-uk',
     'es-mx',
     'pt-br',
-    'pt-pt'
+    'pt-pt',
+    'emirati',
+    'qatari',
+    'khaleeji',
+    'uae',
+    'gulf arabic'
   ];
-  return implicit.some((t) => lower.includes(t));
+  if (implicit.some((t) => lower.includes(t))) return true;
+  return detectGccArabicVoiceIntent(userText) !== null;
 }
 
 // -------------------------------------------------------------
@@ -2937,6 +2954,49 @@ function voiceVerifiedAccents(voice, iso2) {
   const vAcc = normalizeRequestedAccent(voice?.accent);
   if (vAcc) out.push(vAcc);
   return Array.from(new Set(out));
+}
+
+function voiceTextBlob(voice) {
+  if (!voice) return '';
+  const parts = [
+    voice.name,
+    voice.description,
+    voice.descriptive,
+    voice.accent,
+    voice.locale,
+    voice.language
+  ];
+  if (Array.isArray(voice.verified_languages)) {
+    for (const e of voice.verified_languages) {
+      if (!e) continue;
+      parts.push(e.language, e.locale, e.accent);
+    }
+  }
+  return parts
+    .filter(Boolean)
+    .map((x) => String(x))
+    .join(' ')
+    .toLowerCase();
+}
+
+function voiceMatchesGccIntent(voice, userText) {
+  const gcc = detectGccArabicVoiceIntent(userText);
+  if (!gcc) return false;
+  const wantNorm = normalizeCatalogToken(gcc.accent) || gcc.accent;
+  const accs = voiceVerifiedAccents(voice, 'ar');
+  for (const a of accs) {
+    const na = normalizeCatalogToken(a);
+    if (na && na === wantNorm) return true;
+  }
+  const blob = voiceTextBlob(voice);
+  if (wantNorm === 'gulf') {
+    if (/\b(gulf|khaleeji|emirati|qatari|uae|dubai|doha|bahrain|oman|gcc|emirates)\b/.test(blob)) return true;
+  } else if (wantNorm === 'kuwaiti' && /\b(kuwaiti|kuwait)\b/.test(blob)) {
+    return true;
+  } else if (wantNorm === 'saudi' && /\b(saudi|riyadh|jeddah)\b/.test(blob)) {
+    return true;
+  }
+  return false;
 }
 
 function buildSoftStrictBuckets(voices, ranking, iso2, requestedLocale, requestedAccent) {
@@ -4080,16 +4140,21 @@ IMPORTANT:
       plan.__excludedGenders = Array.isArray(plan.__excludedGenders) ? plan.__excludedGenders : [];
     }
 
-    // Accent as soft preference unless explicitly mentioned by user
+    // Accent as soft preference unless explicitly mentioned by user (or GCC regional intent)
+    const gccIntent = detectGccArabicVoiceIntent(userText);
     const explicitAccent = hasExplicitAccentMention(userText);
-    if (!explicitAccent) {
+    if (!explicitAccent && !gccIntent) {
       plan.target_accent = null;
+    } else if (gccIntent && (!plan.target_accent || !String(plan.target_accent).trim())) {
+      plan.target_accent = gccIntent.accent;
     }
 
     // If user didn't explicitly mention a language, don't constrain by language
     const explicitLanguage = hasExplicitLanguageMention(userText);
-    if (!explicitLanguage) {
+    if (!explicitLanguage && !gccIntent) {
       plan.target_voice_language = null;
+    } else if (gccIntent && (!plan.target_voice_language || String(plan.target_voice_language).toLowerCase().slice(0, 2) === 'ar')) {
+      plan.target_voice_language = 'ar';
     }
     // Bilingual EN+ES: avoid constraining by language
     if (detectBilingualEnEs(userText)) {
@@ -4130,6 +4195,20 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   try {
     if (facetKB && typeof facetKB.ensureLoaded === 'function') {
       await facetKB.ensureLoaded(trace);
+    }
+  } catch (_) {}
+
+  // GCC / Gulf: hydrate plan so API filters + facet browse see language=ar and catalog accent
+  try {
+    const gcc = detectGccArabicVoiceIntent(userText);
+    if (gcc) {
+      const lang = (plan.target_voice_language || '').toString().toLowerCase().slice(0, 2);
+      if (!lang || lang === 'ar') {
+        plan.target_voice_language = 'ar';
+        if (!plan.target_accent || !String(plan.target_accent).trim()) {
+          plan.target_accent = gcc.accent;
+        }
+      }
     }
   } catch (_) {}
 
@@ -4667,9 +4746,14 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     if (canFacetBrowse) {
       const zhDialect = language === 'zh' ? detectChineseDialectFromText(userText) : null;
       const variantIntent = detectVariantIntent(userText, language, facetKB);
+      const gccBrowse = language === 'ar' && detectGccArabicVoiceIntent(userText);
       const axis = variantIntent?.isSpecific
         ? (variantIntent.axis || 'accent')
-        : (language === 'zh' && zhDialect ? 'accent' : (facetKB.getAxisForIso2 ? facetKB.getAxisForIso2(language) : null));
+        : (language === 'zh' && zhDialect
+          ? 'accent'
+          : gccBrowse
+            ? 'accent'
+            : (facetKB.getAxisForIso2 ? facetKB.getAxisForIso2(language) : null));
       const maxVariants = 4;
       let variants = [];
       if (variantIntent && variantIntent.isSpecific) {
@@ -4682,6 +4766,21 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
           if (v) built.push(v);
         }
         variants = built;
+      } else if (
+        gccBrowse &&
+        resolved &&
+        resolved.variantAxis === 'accent' &&
+        Array.isArray(resolved.variantCandidates) &&
+        resolved.variantCandidates.length
+      ) {
+        const built = [];
+        for (const cand of resolved.variantCandidates.slice(0, maxVariants)) {
+          const key = normalizeCatalogToken(String(cand || '')) || String(cand || '').toLowerCase().trim();
+          if (!key) continue;
+          const v = facetKB.getVariantForFacetKey ? facetKB.getVariantForFacetKey(language, 'accent', key) : null;
+          if (v) built.push(v);
+        }
+        variants = built.length ? built : (facetKB.getFacetVariants ? facetKB.getFacetVariants(language, axis, { maxVariants }) : []);
       } else {
         variants = facetKB.getFacetVariants ? facetKB.getFacetVariants(language, axis, { maxVariants }) : [];
       }
@@ -6033,6 +6132,22 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     }
   }
 
+  // GCC: order voices with Gulf-aligned metadata/descriptions first when signal is strong enough
+  try {
+    const gcc = detectGccArabicVoiceIntent(userText);
+    if (gcc && language === 'ar' && Array.isArray(voices) && voices.length >= 8) {
+      const yes = [];
+      const no = [];
+      for (const v of voices) {
+        if (voiceMatchesGccIntent(v, userText)) yes.push(v);
+        else no.push(v);
+      }
+      if (yes.length >= 8) {
+        voices = [...yes, ...no];
+      }
+    }
+  } catch (_) {}
+
   // extra language filter (heuristic)
   if (language && voices.length) {
     const langFiltered = voices.filter((v) => isVoiceInLanguage(v, language));
@@ -6069,6 +6184,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
         ].map(normalizeKw)
       : []
   );
+  const isGccIntent = language === 'ar' && detectGccArabicVoiceIntent(userText);
 
   function calcCoverageScore(v) {
     const mk = Array.isArray(v._matched_keywords) ? v._matched_keywords : [];
@@ -6141,6 +6257,21 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             const accs = voiceVerifiedAccents(v, resolved.targetIso2);
             if (Array.isArray(accs) && accs.includes(wantA)) coverage += 1.0;
           }
+        }
+      }
+    } catch (_) {}
+
+    try {
+      if (isGccIntent && voiceMatchesGccIntent(v, userText)) {
+        coverage += 0.85;
+      }
+    } catch (_) {}
+
+    try {
+      if (isGccIntent) {
+        const loc = (v.locale || '').toString().toLowerCase();
+        if (loc === 'ar-sa' || loc === 'ar-kw' || loc === 'ar-bh' || loc === 'ar-qa' || loc === 'ar-ae') {
+          coverage += 0.35;
         }
       }
     } catch (_) {}
@@ -6653,7 +6784,13 @@ async function rankVoicesWithGPT(userText, keywordPlan, voices) {
     gender: v.gender || null,
     description: truncate(v.description, 240),
     descriptive: truncate(v.descriptive, 120),
-    // keep a small set of fields; omit heavy arrays/objects like verified_languages/labels
+    verified_languages: Array.isArray(v.verified_languages)
+      ? v.verified_languages.slice(0, 4).map((e) => ({
+          language: e?.language || null,
+          locale: e?.locale || null,
+          accent: truncate(e?.accent, 48)
+        }))
+      : null,
     category: v.category || null,
     usage_character_count_1y:
       v.usage_character_count_1y || v.usage_character_count_7d || null,
@@ -6684,6 +6821,7 @@ You will receive:
       "gender": string or null,
       "description": string or null,
       "descriptive": string or null,
+      "verified_languages": [{ "language": string or null, "locale": string or null, "accent": string or null }] or null,
       "category": string or null,
       "usage_character_count_1y": number or null,
       "matched_keywords": string[]
@@ -6715,6 +6853,9 @@ Think like a human curator:
        - Prefer locale matches when present (zh-HK for cantonese; zh-CN for mandarin).
        - Also strongly reward candidates that were retrieved via an ElevenLabs accent filter slug in matched_keywords
          (e.g. hong-kong-cantonese, guangzhou-cantonese, beijing-mandarin, taiwan-mandarin, standard).
+     - Gulf Arabic / GCC (Emirati, Qatari, UAE, Saudi, Kuwait, Bahrain, Oman, Khaleeji, GCC in the query):
+       - Strongly prefer Arabic voices whose accent, description, or descriptive text suggests Gulf / Khaleeji / the requested country or region.
+       - When the user names a specific Gulf country, downweight voices that clearly read as Egyptian, Levantine, or Maghrebi unless the metadata clearly matches the brief.
 
    - Gender:
      - If target_gender is clear, reward matching voices and slightly penalize opposite gender.
@@ -8511,8 +8652,28 @@ function buildSearchReport(trace, plan, mode, summary) {
       plan && Array.isArray(plan.__excludedGenders) && plan.__excludedGenders.length
         ? plan.__excludedGenders.join(',')
         : '-';
+    let planAccentDisplay = plan?.target_accent || '-';
+    if (planAccentDisplay === '-' && Array.isArray(trace)) {
+      try {
+        const resolvers = trace.filter((t) => t && t.stage === 'resolver');
+        const lastRes = resolvers.length ? resolvers[resolvers.length - 1] : null;
+        const cand = lastRes?.params?.candidates;
+        if (typeof cand === 'string' && cand.trim()) {
+          const first = cand.split(',')[0].trim();
+          if (first) planAccentDisplay = first;
+        }
+        if (planAccentDisplay === '-') {
+          const cfs = trace.filter((t) => t && t.stage === 'catalog_filters' && t.params);
+          const lastCf = cfs.length ? cfs[cfs.length - 1] : null;
+          const aset = lastCf?.params?.accent_set;
+          if (lastCf?.params?.accent_allowed === 'true' && aset && String(aset).trim()) {
+            planAccentDisplay = String(aset);
+          }
+        }
+      } catch (_) {}
+    }
     lines.push(
-      `Plan: lang=${plan?.target_voice_language || '-'}, accent=${plan?.target_accent || '-'}, exclude_accents=${excludedAccents}, exclude_locales=${excludedLocales}, exclude_genders=${excludedGenders}, gender=${plan?.target_gender || '-'}, quality=${plan?.quality_preference || 'any'}`
+      `Plan: lang=${plan?.target_voice_language || '-'}, accent=${planAccentDisplay}, exclude_accents=${excludedAccents}, exclude_locales=${excludedLocales}, exclude_genders=${excludedGenders}, gender=${plan?.target_gender || '-'}, quality=${plan?.quality_preference || 'any'}`
     );
     if (summary && typeof summary === 'object') {
       lines.push('');
