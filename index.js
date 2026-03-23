@@ -1354,6 +1354,44 @@ function normalizeRequestedAccent(input) {
   }
 }
 
+/**
+ * Gulf / Arabian Peninsula regional markers → ElevenLabs `ar` accent facet keys (see facets.json).
+ * Returns null if no GCC-style regional token is present.
+ */
+function detectGccArabicVoiceIntent(userText) {
+  const lower = (userText || '').toString().toLowerCase();
+  const rules = [
+    { re: /\b(kuwaiti|kuwait)\b/, accent: 'kuwaiti' },
+    { re: /\b(saudi|riyadh|jeddah)\b/, accent: 'saudi' },
+    { re: /\b(emirati|emirates|uae|dubai|abu[\s-]?dhabi|sharjah|ajman)\b/, accent: 'gulf' },
+    { re: /\b(qatari|qatar|doha)\b/, accent: 'gulf' },
+    { re: /\b(bahraini|bahrain|manama)\b/, accent: 'gulf' },
+    { re: /\b(omani|oman|muscat)\b/, accent: 'gulf' },
+    { re: /\b(gcc|khaleeji|khaleej|gulf arabic|peninsular arabic)\b/, accent: 'gulf' }
+  ];
+  let best = null;
+  for (const { re, accent } of rules) {
+    const m = lower.match(re);
+    if (m && (best === null || m.index < best.pos)) {
+      best = { pos: m.index, accent };
+    }
+  }
+  if (!best) return null;
+  return { iso2: 'ar', accent: best.accent };
+}
+
+function hasRegionalKeywordFocus(lowerOrText) {
+  const lower = (lowerOrText || '').toString().toLowerCase();
+  if (
+    /\b(texan|southern|american|british|australian|mexican|irish|scottish|canadian|castilian|brazilian)\b/i.test(
+      lower
+    )
+  ) {
+    return true;
+  }
+  return detectGccArabicVoiceIntent(lower) !== null;
+}
+
 function parseUserLanguageHints(userText) {
   const text = (userText || '').toString();
   const lower = text.toLowerCase();
@@ -1441,6 +1479,14 @@ function parseUserLanguageHints(userText) {
     }
     if (bestAccent) {
       return { iso2: bestAccent.iso2, locale: null, explicit: true, reason: 'accent_implies_lang' };
+    }
+  }
+
+  // 4c) GCC / Arabian Gulf regions → Arabic voice language
+  {
+    const gcc = detectGccArabicVoiceIntent(text);
+    if (gcc) {
+      return { iso2: 'ar', locale: null, explicit: true, reason: 'gcc_region' };
     }
   }
 
@@ -2676,6 +2722,26 @@ function resolveVariantConstraints(userText, plan, kb, catalog) {
     }
   } catch (_) {}
 
+  // Arabic Gulf / GCC: regional words → catalog accent (gulf, kuwaiti, saudi, …)
+  try {
+    const gcc = detectGccArabicVoiceIntent(text);
+    if (targetIso2 === 'ar' && gcc && isAccentAllowed(targetIso2, gcc.accent)) {
+      out.variantMode = 'specific';
+      out.variantAxis = 'accent';
+      out.variantCandidates = [gcc.accent];
+      out.regionIntent = out.regionIntent || 'gcc';
+      out.reason = 'gcc_region_alias';
+      try {
+        if (kb && kb.getFacetVariants) {
+          const vars = kb.getFacetVariants(targetIso2, 'accent', { maxVariants: 6 }) || [];
+          const extra = vars.map((v) => v?.facetKey || v?.facetValue || '').filter(Boolean);
+          out.variantCandidates = dedupePreserveOrder([...out.variantCandidates, ...extra]).slice(0, 6);
+        }
+      } catch (_) {}
+      return out;
+    }
+  } catch (_) {}
+
   // Explicit locale token can be:
   // - xx-YY (handled by parseUserLanguageHints)
   // - xx-### (numeric region alias like es-419) (NOT handled by parseUserLanguageHints)
@@ -2819,6 +2885,7 @@ function isStrongLanguageRequest(userText, keywordPlan) {
   if (iso2 === 'pt' && /\b(brazil|brasil|brazilian|brasile|pt-br)\b/.test(lower)) return true;
   if (iso2 === 'es' && /\b(mexico|mexican|es-mx|mx)\b/.test(lower)) return true;
   if (iso2 === 'fr' && /\b(fr-ca|french canadian|canadian french|quebec|québec|qc)\b/.test(lower)) return true;
+  if (iso2 === 'ar' && detectGccArabicVoiceIntent(text)) return true;
 
   // Any explicit language mention with a set target language counts as strong
   return true;
@@ -3700,6 +3767,24 @@ function normalizeKeywordPlan(plan, userText) {
     out.target_gender = null;
   }
 
+  try {
+    const gcc = detectGccArabicVoiceIntent(userText);
+    if (gcc) {
+      const lang = (out.target_voice_language || '').toString().toLowerCase().slice(0, 2);
+      if (!lang || lang === 'ar') {
+        out.target_voice_language = 'ar';
+        out.target_accent = gcc.accent;
+        const base = Array.isArray(out.extra_keywords) ? out.extra_keywords : [];
+        const merged = dedupePreserveOrder([
+          ...base.map((x) => normalizeKw(x)).filter(Boolean),
+          gcc.accent,
+          'arabic'
+        ]);
+        out.extra_keywords = clampArr(merged, 20);
+      }
+    }
+  } catch (_) {}
+
   return out;
 }
 
@@ -3716,7 +3801,7 @@ function ensureKeywordFloor(userText, plan) {
 
   // If user specified a clear regional/accent term and has at least a few keywords,
   // don't pad with generic support/call-center terms
-  const hasRegionalFocus = /\b(texan|southern|american|british|australian|mexican|irish|scottish|canadian|castilian|brazilian)\b/i.test(lower);
+  const hasRegionalFocus = hasRegionalKeywordFocus(lower);
   if (hasRegionalFocus && countAll >= 3) return out;
 
   const addUnique = (arr, items, cap) => {
@@ -3828,9 +3913,11 @@ RULES:
 - target_voice_language:
   - Language of the VOICE the user wants (e.g. "en" for an American English voice, "pl" for Polish).
   - Infer from explicit mentions ("American accent", "polish voice") when possible.
+  - For Emirati, Qatari, UAE, Saudi, Kuwait, Bahrain, Oman, Khaleeji, GCC, or other Gulf Arabic voice requests, use "ar".
 
 - target_accent:
   - Accent of the VOICE (e.g. "american", "british", "australian", "polish"), or null if unclear.
+  - For Gulf Arabic: use "gulf" when the user implies UAE, Qatar, Bahrain, Oman, or generic GCC/Khaleeji; "kuwaiti" for Kuwait; "saudi" for Saudi Arabia, when implied.
 
 - target_gender:
   - "male" / "female" / "neutral" when the user clearly implies it (man, woman, male/female voice, deep male, young woman, etc.), else null.
@@ -3861,6 +3948,7 @@ RULES:
 - extra_keywords:
   - Any additional important English words from the description: accent phrases, domain terms, synonyms.
   - Use this to add more synonyms to make full-text search stronger.
+  - For Gulf/GCC requests, include regional search tokens (e.g. emirati, qatari, gulf, arabic) where relevant.
 
 IMPORTANT:
 - All *_keywords arrays must contain ONLY lowercase English keywords (1–3 words each).
@@ -4325,7 +4413,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     filtered = pruneNegativesFromList(filtered, plan.__negatives);
 
     // Ensure a minimum count after filtering by refilling from dropped ones
-    const hasRegionalFocus = /\b(texan|southern|american|british|australian|mexican|irish|scottish|canadian|castilian|brazilian)\b/i.test((userText || '').toLowerCase());
+    const hasRegionalFocus = hasRegionalKeywordFocus((userText || '').toLowerCase());
     const MIN_KEYWORDS_AFTER_FILTER = hasRegionalFocus ? 8 : 12;
     if (filtered.length < MIN_KEYWORDS_AFTER_FILTER) {
       const dropped = before.filter((k) => !filtered.includes(k));
@@ -8699,6 +8787,11 @@ function runDevAsserts() {
   const h8 = parseUserLanguageHints('mandarian');
   devAssert(h8.iso2 === 'zh', 'fuzzy language: mandarian -> zh');
 
+  const hGccEmi = parseUserLanguageHints('which are the best Emirati voices');
+  devAssert(hGccEmi.iso2 === 'ar' && hGccEmi.reason === 'gcc_region', 'GCC: Emirati -> ar');
+  const hGccQa = parseUserLanguageHints('best Qatari voice');
+  devAssert(hGccQa.iso2 === 'ar' && hGccQa.reason === 'gcc_region', 'GCC: Qatari -> ar');
+
   // Locale normalization (UI aliases -> canonical)
   devAssert(normalizeRequestedLocale('PT-EU') === 'pt-PT', 'normalize PT-EU -> pt-PT');
   devAssert(normalizeRequestedLocale('en-UK') === 'en-GB', 'normalize en-UK -> en-GB');
@@ -8762,6 +8855,27 @@ function runDevAsserts() {
     devAssert(params.get('locale') !== 'es-419', 'appendQueryFiltersToParams must not set locale=es-419 (region alias)');
   } catch (_) {
     devAssert(true, 'resolver region-alias asserts skipped');
+  }
+
+  // GCC / Arabic Gulf: resolver maps regional wording to catalog accent
+  try {
+    const facetsLocal = JSON.parse(fs.readFileSync(path.resolve(__dirname, './facets.json'), 'utf8'));
+    const verifyLocal = JSON.parse(fs.readFileSync(path.resolve(__dirname, './verify_counts.json'), 'utf8'));
+    facetKB._ingest(facetsLocal, verifyLocal);
+    facetKB.loadedAt = Date.now();
+    const planAr = { target_voice_language: 'ar' };
+    const rGcc = resolveVariantConstraints('Qatari narrator voice', planAr, facetKB, accentCatalog);
+    devAssert(
+      rGcc.variantAxis === 'accent' && rGcc.variantCandidates && rGcc.variantCandidates[0] === 'gulf',
+      'resolver GCC: Qatari -> gulf accent'
+    );
+    const rKw = resolveVariantConstraints('Kuwaiti voice', planAr, facetKB, accentCatalog);
+    devAssert(
+      rKw.variantAxis === 'accent' && rKw.variantCandidates && rKw.variantCandidates[0] === 'kuwaiti',
+      'resolver GCC: Kuwaiti -> kuwaiti accent'
+    );
+  } catch (_) {
+    devAssert(true, 'resolver GCC asserts skipped');
   }
 
   // Soft strict bucketing: exact vs verified-only (missing/non-exact locale/accent)
