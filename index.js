@@ -3222,8 +3222,25 @@ function getLabels() {
     highQualityHeader: 'From the current shortlist, these are marked as high quality:',
     highQualityNone: 'None of the current suggestions are explicitly marked as high quality.',
     genericError:
-      'Something went wrong between the LLM and the Voice Library API. Please try again and I’ll take another shot.'
+      'Something went wrong between the LLM and the Voice Library API. Please try again and I’ll take another shot.',
+    creatorOwnerIdNeeded:
+      'To list that user’s shared voices in the public Voice Library, I need their **public owner ID** (UUID from ElevenLabs). ' +
+      'You can find it as `public_owner_id` on any of their shared voices (API or app details) — paste it here together with your question.',
+    creatorOwnerVoiceNotFound:
+      'I couldn’t find that voice in the public Voice Library or couldn’t read its **public owner ID**. ' +
+      'Use a Voice Library (shared) `voice_id`, or paste the creator’s public owner UUID.',
+    noResultsCreatorSuffix:
+      'Only voices that user has published to the public Voice Library can appear in this list.'
   };
+}
+
+async function translateNoResultsWithOwnerHint(uiLang, plan) {
+  const L = getLabels();
+  let t = await translateForUserLanguage(L.noResults, uiLang);
+  if (plan?.__owner_id) {
+    t += '\n\n' + (await translateForUserLanguage(L.noResultsCreatorSuffix, uiLang));
+  }
+  return t;
 }
 
 function formatVoiceLine(voice) {
@@ -3645,6 +3662,11 @@ async function refineKeywordPlanFromFollowUp(existingPlan, followUpText) {
   );
   base.style_keywords = uniqueMergeKeywords(base.style_keywords, delta.style_keywords);
   base.extra_keywords = uniqueMergeKeywords(base.extra_keywords, delta.extra_keywords);
+
+  const oidFollow = extractPublicOwnerIdFromText(followUpText);
+  if (oidFollow) {
+    base.__owner_id = oidFollow.toLowerCase();
+  }
 
   return typeof normalizeKeywordPlan === 'function' ? normalizeKeywordPlan(base, followUpText) : base;
 }
@@ -7953,6 +7975,116 @@ function detectAgeFromText(text) {
   return null;
 }
 
+// -------------------------------------------------------------
+// Voice Library: filter by public owner (GET /v1/shared-voices ?owner_id=)
+// -------------------------------------------------------------
+
+const PUBLIC_OWNER_UUID_RE =
+  /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i;
+
+function extractPublicOwnerIdFromText(text) {
+  if (!text) return null;
+  const s = String(text);
+  const direct = s.match(PUBLIC_OWNER_UUID_RE);
+  if (direct) return direct[0].toLowerCase();
+  const fromUrl = s.match(/[?&](?:owner|public_owner_id)=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+  if (fromUrl) return fromUrl[1].toLowerCase();
+  return null;
+}
+
+function detectCreatorVoicesIntent(text) {
+  const t = (text || '').toLowerCase();
+  if (t.length < 6) return false;
+
+  const patterns = [
+    /\bvoices?\s+(from|by)\s+(this|that|the|a)?\s*(creator|user|uploader)\b/,
+    /\b(shared\s+)?voices?\s+of\s+(this|that|the|a)?\s*(creator|user)\b/,
+    /\b(list|show|find|get)\s+all\s+voices?\s+(from|by)\b/,
+    /\ball\s+voices?\s+(from|by)\s+(this|that|the|a)?\s*(creator|user|uploader)\b/,
+    /\b(all|show|list|find|get)\s+(the\s+)?(shared\s+)?voices?\s+(from|by)\b/,
+    /\b(creator|user|uploader)'s\s+(shared\s+)?voices?\b/,
+    /\bshared\s+voices\s+from\s+(this|that|the|a)?\s*(creator|user|uploader)\b/,
+    /\b(voices|voice)\s+this\s+(creator|user)\s+(has|published|shared)\b/,
+    /\bgłosy\s+(użytkownika|twórcy|tego\s+użytkownika|tej\s+osoby|niego|niej)\b/,
+    /\b(użytkownika|twórcy|tego\s+twórcy)\s+(w\s+)?(voice\s+library|bibliotece|w\s+bibliotece)\b/,
+    /\b(pokaż|wszystkie|lista|jakie)\b[^.!?]{0,80}\bgłos(y|ów|ów)?\b[^.!?]{0,40}\b(twórcy|użytkownika|tej\s+osoby)\b/,
+    /\b(pvc|professional\s+voice\s+clone)\b[^.!?]{0,40}\b(użytkownika|twórcy|tego|tej)\b/,
+    /\b(głosy|głosów)\s+(z\s+)?(voice\s+library|biblioteki|bibliotece)\b[^.!?]{0,50}\b(twórcy|użytkownika)\b/,
+    /\b(owner|public\s+owner)'?s?\s+(shared\s+)?voices?\b/,
+    /\bgłosy\s+(właściciela|publicznego\s+właściciela|od\s+właściciela)\b/,
+    /\binne\s+głosy\s+(użytkownika|twórcy|od)\b/,
+    /\bznajdź\s+inne\s+głosy\b/,
+    /\b(użytkownika|twórcy)\s+.*\bktóry\s+ma\s+głos\b/,
+    /\b(other|more)\s+voices\s+(from|by)\s+(the\s+)?(user|creator)\b/,
+    /\bfind\s+other\s+voices\b/,
+    /\b(user|creator)\s+who\s+has\s+(this\s+)?(voice|a\s+voice)\b/i
+  ];
+  return patterns.some((re) => {
+    try {
+      return re.test(t);
+    } catch (_) {
+      return false;
+    }
+  });
+}
+
+function applyCreatorOwnerToPlan(plan, userText) {
+  const intent = detectCreatorVoicesIntent(userText);
+  const ownerId = extractPublicOwnerIdFromText(userText);
+  if (intent && ownerId) {
+    plan.__owner_id = ownerId;
+  }
+  return { intent, ownerId };
+}
+
+/** ElevenLabs voice_id: short alphanumeric token (not the owner UUID). */
+function extractVoiceIdForOwnerLookup(text) {
+  if (!text) return null;
+  const s = String(text);
+  const quoted = s.match(/['"`]([A-Za-z0-9_-]{8,32})['"`]/);
+  if (quoted) {
+    const id = quoted[1];
+    if (PUBLIC_OWNER_UUID_RE.test(id)) return null;
+    return id;
+  }
+  const labeled = s.match(
+    /\b(?:voice[_\s-]?id|voice_id|głos(?:u)?)\s*[:=]\s*([A-Za-z0-9_-]{8,32})\b/i
+  );
+  if (labeled) return labeled[1];
+  const afterVoice = s.match(/\b(?:voice|głos(?:u)?)\s+['`"]?([A-Za-z0-9_-]{8,32})\b/i);
+  if (afterVoice) return afterVoice[1];
+  const hasVoice = s.match(/\b(?:has|ma)\s+(?:the\s+)?(?:voice|głos)\s+['`"]?([A-Za-z0-9_-]{8,32})['`"]?\b/i);
+  if (hasVoice) return hasVoice[1];
+  return null;
+}
+
+async function resolvePublicOwnerIdFromVoiceId(voiceId, traceCb) {
+  const trace = typeof traceCb === 'function' ? traceCb : () => {};
+  if (!voiceId || typeof voiceId !== 'string') return null;
+  const vid = voiceId.trim();
+  if (!vid) return null;
+  try {
+    const shared = await fetchSharedVoiceByIdOrSearch(vid, trace);
+    let oid = shared?.public_owner_id ? String(shared.public_owner_id).trim().toLowerCase() : null;
+    if (oid) return { publicOwnerId: oid, source: 'shared' };
+    const priv = await fetchPrivateVoiceById(vid, trace);
+    oid = priv?.public_owner_id ? String(priv.public_owner_id).trim().toLowerCase() : null;
+    if (oid) return { publicOwnerId: oid, source: 'private' };
+  } catch (_) {}
+  return null;
+}
+
+async function maybeResolveOwnerIdFromVoiceReference(plan, userText, traceCb) {
+  try {
+    if ((plan?.__owner_id || '').toString().trim()) return;
+    if (!detectCreatorVoicesIntent(userText || '')) return;
+    const vid = extractVoiceIdForOwnerLookup(userText || '');
+    if (!vid) return;
+    const res = await resolvePublicOwnerIdFromVoiceId(vid, traceCb);
+    if (res?.publicOwnerId) plan.__owner_id = res.publicOwnerId;
+  } catch (_) {}
+}
+
 function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   const language = options.language || null;
   const accent = options.accent || null;
@@ -7963,6 +8095,10 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   const forceUseCases = options.forceUseCases === true;
   const forceDescriptives = options.forceDescriptives === true;
   const trace = typeof options.traceCb === 'function' ? options.traceCb : () => {};
+  try {
+    const oid = (plan?.__owner_id || '').toString().trim().toLowerCase();
+    if (oid) params.set('owner_id', oid);
+  } catch (_) {}
   const lowerText = (userText || '').toLowerCase();
   const isBilingualEnEs = detectBilingualEnEs(userText);
   const chineseDialect = detectChineseDialectFromText(userText);
@@ -9380,6 +9516,24 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
     keywordPlan.__forceUseCases = false;
     keywordPlan.__forceDescriptives = false;
 
+    const creatorOwner = applyCreatorOwnerToPlan(keywordPlan, cleaned);
+    await maybeResolveOwnerIdFromVoiceReference(keywordPlan, cleaned, () => {});
+    if (creatorOwner.intent && !keywordPlan.__owner_id) {
+      const vidTry = extractVoiceIdForOwnerLookup(cleaned);
+      const msgKey = vidTry ? labels.creatorOwnerVoiceNotFound : labels.creatorOwnerIdNeeded;
+      const msg = await translateForUserLanguage(msgKey, uiLang);
+      await safePostMessage(
+        client,
+        {
+          channel: event.channel,
+          thread_ts: threadTs,
+          text: msg
+        },
+        msgKey
+      );
+      return;
+    }
+
     // FacetKB (remote) – if user explicitly requested accent/locale but it's invalid/ambiguous, ask to clarify.
     try {
       if (facetKB && typeof facetKB.ensureLoaded === 'function') {
@@ -9560,6 +9714,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
       const traceCb = (entry) => {
         try { searchTrace.push(entry); } catch (_) {}
       };
+      const oidFull = extractPublicOwnerIdFromText(cleaned);
       for (const part of parts) {
         await ensureLanguageIndexLoaded(traceCb);
         const subPlan = await buildKeywordPlan(part);
@@ -9568,6 +9723,16 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         subPlan.__listAll = detectListAll(part);
         subPlan.__forceUseCases = false;
         subPlan.__forceDescriptives = false;
+        const oidPart = extractPublicOwnerIdFromText(part);
+        const intentPart = detectCreatorVoicesIntent(part);
+        // Only this segment may be owner-filtered; do not use full-query creator intent (other parts could be generic).
+        if (intentPart && (oidPart || oidFull)) {
+          subPlan.__owner_id = (oidPart || oidFull).toLowerCase();
+        }
+        await maybeResolveOwnerIdFromVoiceReference(subPlan, part, traceCb);
+        if (detectCreatorVoicesIntent(part) && !subPlan.__owner_id) {
+          continue;
+        }
         let voices = await fetchVoicesByKeywords(subPlan, part, traceCb);
         if (!voices.length) {
           continue;
@@ -9628,8 +9793,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
       // fall through to single search if multisplit yielded no results
     }
 
-    // Similar voices: if user asks "similar to <voice_id>"
-    const voiceIdForSimilarity = extractVoiceIdCandidate(cleaned);
+    // Similar voices: if user asks "similar to <voice_id>" (skip when listing by public owner)
+    const voiceIdForSimilarity = keywordPlan.__owner_id ? null : extractVoiceIdCandidate(cleaned);
     if (voiceIdForSimilarity) {
       const searchTrace = [];
       const traceCb = (entry) => {
@@ -9856,7 +10021,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
       );
 
       if (!voices.length) {
-        const noResText = await translateForUserLanguage(labels.noResults, uiLang);
+        const noResText = await translateNoResultsWithOwnerHint(uiLang, keywordPlan);
         await client.chat.postMessage({
           channel: event.channel,
           thread_ts: threadTs,
@@ -9892,7 +10057,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           traceCb
         );
         if (!voices.length) {
-          const noResText = await translateForUserLanguage(labels.noResults, uiLang);
+          const noResText = await translateNoResultsWithOwnerHint(uiLang, keywordPlan);
           await client.chat.postMessage({
             channel: event.channel,
             thread_ts: threadTs,
@@ -9907,7 +10072,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         voices = await fetchVoicesByKeywords(keywordPlan, cleaned, traceCb);
 
         if (!voices.length) {
-          const noResText = await translateForUserLanguage(labels.noResults, uiLang);
+          const noResText = await translateNoResultsWithOwnerHint(uiLang, keywordPlan);
           await client.chat.postMessage({
             channel: event.channel,
             thread_ts: threadTs,
@@ -10243,10 +10408,11 @@ if (!DEV_ASSERTS_ENABLED && !isDevPocEnabled()) {
           searchTrace.push(entry);
         } catch (_) {}
       };
+      await maybeResolveOwnerIdFromVoiceReference(refinedPlan, combinedQuery, traceCb);
       const voices = await fetchVoicesByKeywords(refinedPlan, combinedQuery, traceCb);
       if (!voices.length) {
         const labels = getLabels();
-        const noResText = await translateForUserLanguage(labels.noResults, existing.uiLanguage);
+        const noResText = await translateNoResultsWithOwnerHint(existing.uiLanguage, refinedPlan);
         await safePostMessage(client, {
           channel: event.channel,
           thread_ts: threadTs,
