@@ -1210,7 +1210,10 @@ const STATIC_LANGUAGE_ALIASES = new Map([
   ['portuguese', 'pt'],
   ['português', 'pt'],
   ['portugues', 'pt'],
-  ['brazilian portuguese', 'pt']
+  ['brazilian portuguese', 'pt'],
+  ['turkish', 'tr'],
+  ['türkçe', 'tr'],
+  ['turkce', 'tr']
 ]);
 
 // Fallback allowlist for ISO639-1 codes when the dynamic language index isn't loaded.
@@ -1865,6 +1868,44 @@ function detectVoiceLanguageFromText(text) {
   if (!text) return null;
   const hint = parseUserLanguageHints(text);
   return hint && hint.iso2 ? hint.iso2 : null;
+}
+
+/** Detect comma/and-separated multi-language voice requests (e.g. "Spanish, Portuguese, and Turkish voices"). */
+function detectMultipleLanguageIntents(text) {
+  try {
+    const raw = (text || '').toString().trim();
+    if (!raw) return [];
+    const lower = raw.toLowerCase();
+
+    if (!/[,;]|\s+\band\b|\s+oraz\s+|\s+&\s+/i.test(raw)) return [];
+    if (!/\bvoices?\b|\bgłos(y|ów|ami)?\b/i.test(lower)) return [];
+
+    const segments = raw
+      .split(/\s*[,;]\s*|\s+\band\b\s+|\s+oraz\s+|\s+&\s+/i)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 2);
+    if (segments.length < 2) return [];
+
+    const results = [];
+    const seenIso2 = new Set();
+    for (const seg of segments) {
+      const cleanedSeg = seg.replace(/\s+voices?\s*$/i, '').trim() || seg;
+      const hint = parseUserLanguageHints(cleanedSeg) || parseUserLanguageHints(seg);
+      if (!hint?.iso2) continue;
+      const iso2 = hint.iso2.toLowerCase().slice(0, 2);
+      if (seenIso2.has(iso2)) continue;
+      seenIso2.add(iso2);
+      results.push({
+        iso2,
+        locale: hint.locale || null,
+        segment: seg,
+        title: cleanedSeg || seg
+      });
+    }
+    return results.length >= 2 ? results : [];
+  } catch (_) {
+    return [];
+  }
 }
 
 // Detect if user explicitly mentioned a language (so we should constrain by language)
@@ -3158,7 +3199,9 @@ function buildSimilarNotVerifiedMessage(voices, ranking, iso2, requestedLocale, 
 // Detect if user explicitly wants only high quality / no high quality
 function detectQualityPreferenceFromText(text) {
   if (!text) return null;
-  const lower = text.toLowerCase();
+  const lower = text
+    .replace(/[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/g, '-')
+    .toLowerCase();
 
   // Negations take precedence
   const hasNegative =
@@ -3871,6 +3914,9 @@ function normalizeKeywordPlan(plan, userText) {
 }
 
 function ensureKeywordFloor(userText, plan) {
+  if (extractBareVoiceId(userText) || (plan?.__owner_id || '').toString().trim()) {
+    return JSON.parse(JSON.stringify(plan || {}));
+  }
   const out = JSON.parse(JSON.stringify(plan || {}));
   const lower = (userText || '').toLowerCase();
   const countAll =
@@ -4234,8 +4280,10 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     }
   } catch (_) {}
 
+  const hasOwnerFilter = Boolean((plan?.__owner_id || '').toString().trim());
+
   // Apply keyword floor enrichment if the plan is too thin (guarded)
-  if (typeof ensureKeywordFloor === 'function') {
+  if (typeof ensureKeywordFloor === 'function' && !hasOwnerFilter && !extractBareVoiceId(userText)) {
     plan = ensureKeywordFloor(userText, plan);
   }
   try {
@@ -5774,7 +5822,8 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   }
 
   // 3) broad fallback: if STILL nothing, fetch by language/accent only (no search)
-  if (seen.size === 0) {
+  // Skip when owner-filtered — never broaden to the unfiltered catalog.
+  if (seen.size === 0 && !hasOwnerFilter) {
     const params = new URLSearchParams();
     params.set('page_size', '100');
     if (language) params.set('language', language);
@@ -5813,7 +5862,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   // Note: we do NOT attempt non-ISO language aliases here either.
 
   // 2c) last-resort: no language param, then filter heuristically
-  if (seen.size === 0 && language) {
+  if (seen.size === 0 && language && !hasOwnerFilter) {
     const params = new URLSearchParams();
     params.set('page_size', '100');
     if (accent) params.set('accent', accent);
@@ -5843,7 +5892,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   }
 
   // 2d) HQ local fallback: if still empty and high_only, try without category and filter locally
-  if (seen.size === 0 && qualityPref === 'high_only') {
+  if (seen.size === 0 && qualityPref === 'high_only' && !hasOwnerFilter) {
     const params = new URLSearchParams();
     params.set('page_size', '100');
     if (language) params.set('language', language);
@@ -5870,7 +5919,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   }
 
   // Global minimum results guard: broaden if too few candidates
-  if (seen.size > 0 && seen.size < 12) {
+  if (seen.size > 0 && seen.size < 12 && !hasOwnerFilter) {
     const paramsG = new URLSearchParams();
     paramsG.set('page_size', '80');
     // keep language and category if set, drop accent/use_cases/locale/descriptives
@@ -8085,6 +8134,37 @@ async function maybeResolveOwnerIdFromVoiceReference(plan, userText, traceCb) {
   } catch (_) {}
 }
 
+async function fetchVoicesByOwner(ownerId, plan, traceCb) {
+  const trace = typeof traceCb === 'function' ? traceCb : () => {};
+  const oid = (ownerId || '').toString().trim().toLowerCase();
+  if (!oid) return [];
+  const qualityPref = plan?.quality_preference || 'any';
+  const params = new URLSearchParams();
+  params.set('page_size', '100');
+  params.set('owner_id', oid);
+  if (qualityPref === 'high_only') params.set('category', 'high_quality');
+  try {
+    const voices = await callSharedVoicesAllPages(params, { maxPages: 5, cap: 500 });
+    try {
+      trace({ stage: 'owner_browse', params: paramsToObject(params), count: voices.length });
+    } catch (_) {}
+    const excludeId = (plan?.__exclude_voice_id || '').toString().trim();
+    if (excludeId) {
+      return (voices || []).filter((v) => v && v.voice_id !== excludeId);
+    }
+    return voices || [];
+  } catch (err) {
+    safeLogAxiosError('fetchVoicesByOwner', err);
+    return [];
+  }
+}
+
+function buildCreatorVoicesMessage(session, ownerId) {
+  const header = '```CREATOR: ' + (ownerId || '').toString().slice(0, 8) + '…```';
+  const body = buildMessageFromSession(session);
+  return header + '\n' + body;
+}
+
 function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   const language = options.language || null;
   const accent = options.accent || null;
@@ -8592,6 +8672,66 @@ function extractVoiceIdCandidate(text) {
   if (!intent || !idMatch) return null;
   const candidate = idMatch.find((s) => /^[A-Za-z0-9]{18,}$/.test(s));
   return candidate || null;
+}
+
+/** Standalone ElevenLabs voice_id token (10–32 alphanumeric), excluding owner UUIDs. */
+function extractBareVoiceId(text) {
+  if (!text) return null;
+  const matches = String(text).match(/\b([A-Za-z0-9]{10,32})\b/g);
+  if (!matches) return null;
+  for (const id of matches) {
+    if (PUBLIC_OWNER_UUID_RE.test(id)) continue;
+    if (/[A-Z]/.test(id) && /[a-z]/.test(id) && id.length >= 15) return id;
+    if (id.length >= 18) return id;
+  }
+  for (const id of matches) {
+    if (PUBLIC_OWNER_UUID_RE.test(id)) continue;
+    if (/^[A-Za-z0-9]{10,32}$/.test(id) && !/^[a-z]+$/.test(id)) return id;
+  }
+  return null;
+}
+
+function detectVoiceLookupIntent(text) {
+  const t = (text || '').toLowerCase();
+  if (t.length < 6) return false;
+  const patterns = [
+    /\bwhat'?s?\s+(?:that|this)\s+voice\b/,
+    /\bwho'?s?\s+(?:that|this)\s+voice\b/,
+    /\b(identify|lookup|look\s+up)\s+(?:this|that)?\s*voice\b/,
+    /\bwhat\s+voice\s+is\s+(?:this|that)\b/,
+    /\b(which|what)\s+voice\s+is\b/,
+    /\b(co\s+to\s+za|jaki\s+to)\s+głos\b/,
+    /\b(który|ktory)\s+to\s+głos\b/
+  ];
+  return patterns.some((re) => {
+    try {
+      return re.test(t);
+    } catch (_) {
+      return false;
+    }
+  });
+}
+
+async function lookupVoiceById(voiceId, traceCb) {
+  const trace = typeof traceCb === 'function' ? traceCb : () => {};
+  if (!voiceId) return null;
+  const shared = await fetchSharedVoiceByIdOrSearch(voiceId, trace);
+  if (shared?.voice_id) return shared;
+  const priv = await fetchPrivateVoiceById(voiceId, trace);
+  return priv?.voice_id ? priv : null;
+}
+
+function buildVoiceLookupMessage(voice) {
+  if (!voice) return '';
+  const url = `https://elevenlabs.io/app/voice-library?search=${encodeURIComponent(voice.voice_id)}`;
+  const lines = [
+    `*${voice.name || 'Unknown'}* \`${voice.voice_id}\``,
+    `Language: ${voice.language || '—'}`,
+    `Accent: ${voice.accent || '—'}`
+  ];
+  if (voice.description) lines.push(`Description: ${voice.description}`);
+  lines.push(`<${url}|Open in Voice Library>`);
+  return lines.join('\n');
 }
 
 async function fetchSharedVoiceByIdOrSearch(voiceId, traceCb) {
@@ -9498,16 +9638,47 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
     // Load language index early so ISO2 validation is accurate and language-name matching works.
     await ensureLanguageIndexLoaded();
 
+    const labels = getLabels();
+    let uiLang =
+      (guessUiLanguageFromText(cleaned) || 'en').toString().slice(0, 2).toLowerCase();
+
+    // Voice ID lookup — before keyword plan / search
+    const bareVoiceId = extractBareVoiceId(cleaned);
+    if (bareVoiceId && detectVoiceLookupIntent(cleaned) && !detectCreatorVoicesIntent(cleaned)) {
+      const lookupTrace = [];
+      const traceCb = (entry) => {
+        try {
+          lookupTrace.push(entry);
+        } catch (_) {}
+      };
+      const voice = await lookupVoiceById(bareVoiceId, traceCb);
+      if (!voice) {
+        const msg = await translateForUserLanguage(
+          "I couldn't find a voice with that ID in the public Voice Library or your workspace.",
+          uiLang
+        );
+        await safePostMessage(
+          client,
+          { channel: event.channel, thread_ts: threadTs, text: msg },
+          labels.noVoices
+        );
+        return;
+      }
+      let message = buildVoiceLookupMessage(voice);
+      message = await translateForUserLanguage(message, uiLang);
+      await safePostMessage(
+        client,
+        { channel: event.channel, thread_ts: threadTs, text: message },
+        labels.noVoices
+      );
+      return;
+    }
+
     const keywordPlan = await buildKeywordPlan(cleaned);
     // Keep raw user brief for diagnostics / POC search report enrichment
     try {
       keywordPlan.__reportUserText = cleaned;
     } catch (_) {}
-    const labels = getLabels();
-
-    let uiLang =
-      (guessUiLanguageFromText(cleaned) || 'en').toString().slice(0, 2).toLowerCase();
-
     // Removed initial progress message; first message will be the results
     // Seed plan flags for server-side filtering/pagination
     keywordPlan.__featured = false;
@@ -9531,6 +9702,72 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         },
         msgKey
       );
+      return;
+    }
+
+    // Creator browse: list shared voices by public owner (no keyword search)
+    if (creatorOwner.intent && keywordPlan.__owner_id) {
+      const searchTrace = [];
+      const traceCb = (entry) => {
+        try {
+          searchTrace.push(entry);
+        } catch (_) {}
+      };
+      const refVoiceId = extractVoiceIdForOwnerLookup(cleaned);
+      if (refVoiceId) keywordPlan.__exclude_voice_id = refVoiceId;
+      let voices = await fetchVoicesByOwner(keywordPlan.__owner_id, keywordPlan, traceCb);
+      if (!voices.length) {
+        const noResText = await translateNoResultsWithOwnerHint(uiLang, keywordPlan);
+        await safePostMessage(
+          client,
+          { channel: event.channel, thread_ts: threadTs, text: noResText },
+          labels.noVoices
+        );
+        return;
+      }
+      const ranked = await rankVoicesWithGPT(cleaned, keywordPlan, voices);
+      const session = {
+        originalQuery: cleaned,
+        keywordPlan,
+        voices,
+        ranking: ranked.scoreMap,
+        uiLanguage: uiLang,
+        filters: {
+          quality: keywordPlan.quality_preference || 'any',
+          gender:
+            keywordPlan.target_gender === 'male' || keywordPlan.target_gender === 'female'
+              ? keywordPlan.target_gender
+              : 'any',
+          listAll: detectListAll(cleaned),
+          featured: false,
+          sort: null,
+          strictUseCase: false,
+          strictDescriptives: false,
+          limitPerGender: null
+        },
+        lastActive: Date.now()
+      };
+      sessions[threadTs] = session;
+      let message = buildCreatorVoicesMessage(session, keywordPlan.__owner_id);
+      message = await translateForUserLanguage(message, uiLang);
+      const blocks = buildBlocksFromText(message);
+      await safePostMessage(
+        client,
+        {
+          channel: event.channel,
+          thread_ts: threadTs,
+          text: message,
+          blocks: blocks || undefined
+        },
+        labels.noVoices
+      );
+      if (process.env.POC_SEARCH_REPORT === 'true') {
+        let report = buildSearchReport(searchTrace, keywordPlan, 'creator_browse', {
+          unique_count: voices.length
+        });
+        report = await translateForUserLanguage(report, uiLang);
+        await postPocReportDm(client, `${cleaned}\n\n${report}`);
+      }
       return;
     }
 
@@ -9705,6 +9942,98 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         }
       }
     } catch (_) {}
+
+    // Multi-language: comma/and-separated language list → one sub-search per language
+    const langIntents = detectMultipleLanguageIntents(cleaned);
+    if (
+      langIntents.length >= 2 &&
+      !keywordPlan.__owner_id &&
+      !detectCreatorVoicesIntent(cleaned) &&
+      !bareVoiceId
+    ) {
+      const subSessions = [];
+      const searchTrace = [];
+      const traceCb = (entry) => {
+        try {
+          searchTrace.push(entry);
+        } catch (_) {}
+      };
+      for (const li of langIntents) {
+        await ensureLanguageIndexLoaded(traceCb);
+        const partText = li.segment || `${li.title} voices`;
+        const subPlan = await buildKeywordPlan(partText);
+        subPlan.target_voice_language = li.iso2;
+        if (li.locale) {
+          subPlan.target_locale = li.locale;
+          try {
+            const tmpPlan = { ...subPlan, target_accent: null };
+            const accFromLocale = getRequestedAccent(partText, tmpPlan, li.locale);
+            if (accFromLocale) subPlan.target_accent = accFromLocale;
+          } catch (_) {}
+        }
+        subPlan.__featured = false;
+        subPlan.__sort = null;
+        subPlan.__listAll = detectListAll(partText);
+        subPlan.__forceUseCases = false;
+        subPlan.__forceDescriptives = false;
+        let voices = await fetchVoicesByKeywords(subPlan, partText, traceCb);
+        if (!voices.length) continue;
+        const ranked = await rankVoicesWithGPT(partText, subPlan, voices);
+        subSessions.push({
+          title: li.title || li.iso2.toUpperCase(),
+          session: {
+            originalQuery: partText,
+            keywordPlan: subPlan,
+            voices,
+            ranking: ranked.scoreMap,
+            uiLanguage: (guessUiLanguageFromText(partText) || uiLang).toString().slice(0, 2).toLowerCase(),
+            filters: {
+              quality: subPlan.quality_preference || 'any',
+              gender:
+                subPlan.target_gender === 'male' || subPlan.target_gender === 'female'
+                  ? subPlan.target_gender
+                  : 'any',
+              listAll: detectListAll(partText),
+              featured: false,
+              sort: null,
+              limitPerGender: null
+            },
+            lastActive: Date.now()
+          }
+        });
+      }
+      if (subSessions.length) {
+        let message = '';
+        for (const { title, session } of subSessions) {
+          const sectionHeader = '```FOR: ' + title + '```';
+          let body = buildMessageFromSession(session);
+          body = await translateForUserLanguage(body, session.uiLanguage);
+          message += sectionHeader + '\n' + body + '\n\n';
+        }
+        const blocks = buildBlocksFromText(message);
+        await safePostMessage(
+          client,
+          {
+            channel: event.channel,
+            thread_ts: threadTs,
+            text: message,
+            blocks: blocks || undefined
+          },
+          labels.noVoices
+        );
+        if (process.env.POC_SEARCH_REPORT === 'true') {
+          let report = buildSearchReport(searchTrace, keywordPlan, 'multi_language', {
+            unique_count: subSessions.reduce(
+              (acc, s) => acc + (Array.isArray(s.session.voices) ? s.session.voices.length : 0),
+              0
+            )
+          });
+          report = await translateForUserLanguage(report, uiLang);
+          await postPocReportDm(client, `${cleaned}\n\n${report}`);
+        }
+        return;
+      }
+    }
 
     // Multi-intent: split by semicolons and run separate sub-searches, then group
     const parts = splitMultiIntents(cleaned);
