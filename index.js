@@ -3631,6 +3631,8 @@ function applyFilterChangesFromText(session, lower) {
 }
 
 function checkLanguagesIntent(lower) {
+  // Voice+language compatibility questions are handled separately.
+  if (detectVoiceLanguageCompatibilityIntent(lower)) return false;
   // EN
   if (lower.includes('language') || lower.includes('languages')) return true;
   // PL
@@ -8734,6 +8736,129 @@ function buildVoiceLookupMessage(voice) {
   return lines.join('\n');
 }
 
+function detectVoiceLanguageCompatibilityIntent(text) {
+  const raw = (text || '').toString();
+  const lower = raw.toLowerCase();
+  const hint = parseUserLanguageHints(raw);
+  const iso2 = hint?.iso2 ? hint.iso2.toLowerCase().slice(0, 2) : null;
+  if (!iso2) return null;
+
+  const hasVoiceRef =
+    !!extractBareVoiceId(raw) ||
+    !!extractVoiceIdForOwnerLookup(raw) ||
+    /\b(this|that|the|ten|ta|tego|tej)\s+(voice|głos|glos)\b/i.test(lower);
+  if (!hasVoiceRef) return null;
+
+  const compatSignals = [
+    /\b(will|would|can|could|does|do|is|are|czy)\b/i,
+    /\b(work(?:s|ing)?|support(?:s|ed)?|compatible|verification|verified)\b/i,
+    /\b(artifact(?:s)?|pronunciation|accent bleed)\b/i,
+    /\b(good with|work with|works with|dobra?(?: do)?|działa|obsługuje|nada się)\b/i,
+    /\b(expect|oczekiwać|oczekiwac)\b/i
+  ];
+  const isSearchBrief =
+    /\b(find|search|show|list|recommend|suggest|give me|szukam|znajdź|znajdz|pokaż|pokaz)\b/i.test(lower) &&
+    /\bvoices?\b/i.test(lower) &&
+    !compatSignals.some((re) => re.test(lower));
+  if (isSearchBrief) return null;
+
+  if (!compatSignals.some((re) => re.test(lower))) return null;
+  return { iso2 };
+}
+
+function resolveVoiceForCompatibilityQuestion(text, session) {
+  const raw = (text || '').toString();
+  const voiceId = extractBareVoiceId(raw) || extractVoiceIdForOwnerLookup(raw);
+  if (voiceId) {
+    const inSession = session?.voices?.find((v) => v?.voice_id === voiceId);
+    if (inSession) return inSession;
+    return { voice_id: voiceId, __needsLookup: true };
+  }
+
+  const lower = raw.toLowerCase();
+  if (
+    /\b(this|that|the|ten|ta|tego|tej)\s+(voice|głos|glos)\b/i.test(lower) &&
+    Array.isArray(session?.voices) &&
+    session.voices.length
+  ) {
+    const sorted = [...session.voices].sort(
+      (a, b) => (session.ranking?.[b.voice_id] || 0) - (session.ranking?.[a.voice_id] || 0)
+    );
+    return sorted[0] || null;
+  }
+  return null;
+}
+
+function formatVerifiedLanguageEntry(entry) {
+  if (!entry) return null;
+  const parts = [];
+  if (entry.locale) parts.push(`locale: ${entry.locale}`);
+  if (entry.accent) parts.push(`accent: ${entry.accent}`);
+  return parts.length ? parts.join(', ') : null;
+}
+
+function buildVoiceLanguageCompatibilityMessage(voice, iso2) {
+  if (!voice || !iso2) return '';
+  const langLabel = iso2.toUpperCase();
+  const verified = voiceHasVerifiedIso2(voice, iso2);
+  const entries = voiceVerifiedEntriesForIso2(voice, iso2);
+  const url = `https://elevenlabs.io/app/voice-library?search=${encodeURIComponent(voice.voice_id)}`;
+  const lines = [`*${voice.name || 'Unknown'}* \`${voice.voice_id}\``];
+
+  if (verified) {
+    lines.push(`This voice is *verified* for ${langLabel} in the Voice Library.`);
+    const details = entries.map(formatVerifiedLanguageEntry).filter(Boolean);
+    if (details.length) lines.push(`Verified entries: ${details.join('; ')}`);
+    lines.push(
+      'Verified languages indicate ElevenLabs tested the voice for that language — results should generally be reliable, though edge cases can still happen.'
+    );
+  } else {
+    lines.push(`This voice is *not* listed as verified for ${langLabel}.`);
+    if (voice.language) lines.push(`Primary language: ${voice.language}`);
+    lines.push(
+      `Using an unverified language may produce artifacts or inconsistent pronunciation. Consider a voice verified for ${langLabel}.`
+    );
+  }
+  lines.push(`<${url}|Open in Voice Library>`);
+  return lines.join('\n');
+}
+
+async function respondVoiceLanguageCompatibility(event, cleaned, threadTs, client, session, uiLang) {
+  const intent = detectVoiceLanguageCompatibilityIntent(cleaned);
+  if (!intent) return false;
+
+  const resolved = resolveVoiceForCompatibilityQuestion(cleaned, session);
+  if (!resolved) {
+    const msg = await translateForUserLanguage(
+      'To check language verification, mention *this voice* in a thread with search results, or paste a voice_id.',
+      uiLang
+    );
+    await safePostMessage(client, { channel: event.channel, thread_ts: threadTs, text: msg });
+    return true;
+  }
+
+  let voice = resolved;
+  if (resolved.__needsLookup) {
+    voice = await lookupVoiceById(resolved.voice_id, () => {});
+    if (!voice) {
+      const msg = await translateForUserLanguage(
+        "I couldn't find a voice with that ID in the public Voice Library or your workspace.",
+        uiLang
+      );
+      await safePostMessage(client, { channel: event.channel, thread_ts: threadTs, text: msg });
+      return true;
+    }
+  } else if (!Array.isArray(voice.verified_languages)) {
+    const fresh = await lookupVoiceById(voice.voice_id, () => {});
+    if (fresh) voice = fresh;
+  }
+
+  let message = buildVoiceLanguageCompatibilityMessage(voice, intent.iso2);
+  message = await translateForUserLanguage(message, uiLang);
+  await safePostMessage(client, { channel: event.channel, thread_ts: threadTs, text: message });
+  return true;
+}
+
 async function fetchSharedVoiceByIdOrSearch(voiceId, traceCb) {
   const XI_KEY = process.env.ELEVENLABS_API_KEY;
   try {
@@ -9507,6 +9632,49 @@ function runDevAsserts() {
   } catch (_) {
     devAssert(true, 'accent slug asserts skipped');
   }
+
+  // Voice+language compatibility questions should not fall through to shortlist language summary or search.
+  {
+    const q =
+      'will this voice works good with polish language or we can expect some artifacts?';
+    const compat = detectVoiceLanguageCompatibilityIntent(q);
+    devAssert(!!compat && compat.iso2 === 'pl', 'compat intent: polish voice question');
+    devAssert(!checkLanguagesIntent(q.toLowerCase()), 'compat intent: not shortlist languages');
+    devAssert(
+      !detectVoiceLanguageCompatibilityIntent('what languages do these voices support?'),
+      'compat intent: shortlist meta excluded'
+    );
+    devAssert(
+      !detectVoiceLanguageCompatibilityIntent('find a polish female voice for narration'),
+      'compat intent: search brief excluded'
+    );
+
+    const vPl = {
+      voice_id: 'vPl',
+      name: 'Test PL',
+      language: 'en',
+      verified_languages: [{ language: 'pl', locale: 'pl-PL', accent: 'standard' }]
+    };
+    const vEn = {
+      voice_id: 'vEn',
+      name: 'Test EN',
+      language: 'en',
+      verified_languages: [{ language: 'en' }]
+    };
+    devAssert(
+      buildVoiceLanguageCompatibilityMessage(vPl, 'pl').includes('verified'),
+      'compat message: verified voice'
+    );
+    devAssert(
+      buildVoiceLanguageCompatibilityMessage(vEn, 'pl').includes('not'),
+      'compat message: unverified voice'
+    );
+    const session = { voices: [vPl, vEn], ranking: { vPl: 0.9, vEn: 0.8 } };
+    devAssert(
+      resolveVoiceForCompatibilityQuestion('will this voice work with polish?', session)?.voice_id === 'vPl',
+      'compat resolve: this voice -> top ranked'
+    );
+  }
 }
 
 async function runDevPoc() {
@@ -9671,6 +9839,11 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         { channel: event.channel, thread_ts: threadTs, text: message },
         labels.noVoices
       );
+      return;
+    }
+
+    const compatUiLang = (guessUiLanguageFromText(cleaned) || 'en').toString().slice(0, 2).toLowerCase();
+    if (await respondVoiceLanguageCompatibility(event, cleaned, threadTs, client, null, compatUiLang)) {
       return;
     }
 
@@ -10642,6 +10815,10 @@ if (!DEV_ASSERTS_ENABLED && !isDevPocEnabled()) {
       } catch (_) {
         // If something fails, fall through to normal flow
       }
+    }
+
+    if (await respondVoiceLanguageCompatibility(event, cleaned, threadTs, client, existing, existing.uiLanguage)) {
+      return;
     }
 
     const wantsLanguages = checkLanguagesIntent(lower);
