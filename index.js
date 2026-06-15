@@ -8744,9 +8744,21 @@ function extractBareVoiceId(text) {
   return null;
 }
 
+function detectVoiceIdQualityQuestion(text) {
+  if (!extractBareVoiceId(text)) return false;
+  if (detectQualityPreferenceFromText(text)) return true;
+  const t = (text || '').toLowerCase();
+  return (
+    /\b(is|are|czy)\b/.test(t) &&
+    (/\b(high quality|high-quality|hq|quality|jakość|jakosc|calidad)\b/.test(t) ||
+      /\b(voice|głos|glos)\b/.test(t))
+  );
+}
+
 function detectVoiceLookupIntent(text) {
   const t = (text || '').toLowerCase();
   if (t.length < 6) return false;
+  if (detectVoiceIdQualityQuestion(text)) return true;
   const patterns = [
     /\bwhat'?s?\s+(?:that|this)\s+voice\b/,
     /\bwho'?s?\s+(?:that|this)\s+voice\b/,
@@ -8774,7 +8786,7 @@ async function lookupVoiceById(voiceId, traceCb) {
   return priv?.voice_id ? priv : null;
 }
 
-function buildVoiceLookupMessage(voice) {
+function buildVoiceLookupMessage(voice, userText) {
   if (!voice) return '';
   const url = `https://elevenlabs.io/app/voice-library?search=${encodeURIComponent(voice.voice_id)}`;
   const lines = [
@@ -8782,6 +8794,14 @@ function buildVoiceLookupMessage(voice) {
     `Language: ${voice.language || '—'}`,
     `Accent: ${voice.accent || '—'}`
   ];
+  if (detectVoiceIdQualityQuestion(userText)) {
+    const hq = isHighQuality(voice);
+    lines.push(
+      hq
+        ? 'High quality: Yes — this voice is marked as high quality in the Voice Library.'
+        : 'High quality: No — this voice is not marked as high quality in the Voice Library.'
+    );
+  }
   if (voice.description) lines.push(`Description: ${voice.description}`);
   lines.push(`<${url}|Open in Voice Library>`);
   return lines.join('\n');
@@ -9727,6 +9747,31 @@ function runDevAsserts() {
     );
   }
 
+  // Voice ID lookup: quality questions about a specific voice_id
+  {
+    const qualityQ = 'is KHmfNHtEjHhLK9eER20w high quality voice?';
+    devAssert(
+      extractBareVoiceId(qualityQ) === 'KHmfNHtEjHhLK9eER20w',
+      'extractBareVoiceId: mixed-case voice id'
+    );
+    devAssert(detectVoiceIdQualityQuestion(qualityQ), 'voice id quality question detected');
+    devAssert(detectVoiceLookupIntent(qualityQ), 'voice lookup intent: quality question with id');
+    const hqVoice = { voice_id: 'KHmfNHtEjHhLK9eER20w', name: 'Test HQ', category: 'high_quality' };
+    const stdVoice = { voice_id: 'KHmfNHtEjHhLK9eER20w', name: 'Test Std', category: 'generated' };
+    devAssert(
+      buildVoiceLookupMessage(hqVoice, qualityQ).includes('High quality: Yes'),
+      'voice lookup message: hq voice'
+    );
+    devAssert(
+      buildVoiceLookupMessage(stdVoice, qualityQ).includes('High quality: No'),
+      'voice lookup message: standard voice'
+    );
+    devAssert(
+      !detectVoiceLookupIntent('find a high quality polish female voice'),
+      'voice lookup intent: generic hq search excluded'
+    );
+  }
+
   // Creator browse: intent + voice-id extraction for owner lookup
   {
     const creatorQ = "find other voices from the user who has 'covxL85MSd0uUrktE45z'";
@@ -9898,7 +9943,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         );
         return;
       }
-      let message = buildVoiceLookupMessage(voice);
+      let message = buildVoiceLookupMessage(voice, cleaned);
       message = await translateForUserLanguage(message, uiLang);
       await safePostMessage(
         client,
