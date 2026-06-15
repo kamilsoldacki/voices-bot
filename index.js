@@ -3273,12 +3273,17 @@ function getLabels() {
       'I couldn’t find that voice in the public Voice Library or couldn’t read its **public owner ID**. ' +
       'Use a Voice Library (shared) `voice_id`, or paste the creator’s public owner UUID.',
     noResultsCreatorSuffix:
-      'Only voices that user has published to the public Voice Library can appear in this list.'
+      'Only voices that user has published to the public Voice Library can appear in this list.',
+    noResultsCreatorNoOther:
+      'This creator has no other public voices in the Voice Library.'
   };
 }
 
 async function translateNoResultsWithOwnerHint(uiLang, plan) {
   const L = getLabels();
+  if (plan?.__owner_id && plan?.__exclude_voice_id) {
+    return await translateForUserLanguage(L.noResultsCreatorNoOther, uiLang);
+  }
   let t = await translateForUserLanguage(L.noResults, uiLang);
   if (plan?.__owner_id) {
     t += '\n\n' + (await translateForUserLanguage(L.noResultsCreatorSuffix, uiLang));
@@ -8106,6 +8111,12 @@ function extractVoiceIdForOwnerLookup(text) {
   if (afterVoice) return afterVoice[1];
   const hasVoice = s.match(/\b(?:has|ma)\s+(?:the\s+)?(?:voice|głos)\s+['`"]?([A-Za-z0-9_-]{8,32})['`"]?\b/i);
   if (hasVoice) return hasVoice[1];
+  const hasId = s.match(/\b(?:has|ma)\s+['"`]?([A-Za-z0-9_-]{10,32})['"`]?\s*$/);
+  if (hasId) {
+    const id = hasId[1];
+    if (PUBLIC_OWNER_UUID_RE.test(id)) return null;
+    return id;
+  }
   return null;
 }
 
@@ -8129,7 +8140,7 @@ async function maybeResolveOwnerIdFromVoiceReference(plan, userText, traceCb) {
   try {
     if ((plan?.__owner_id || '').toString().trim()) return;
     if (!detectCreatorVoicesIntent(userText || '')) return;
-    const vid = extractVoiceIdForOwnerLookup(userText || '');
+    const vid = extractVoiceIdForOwnerLookup(userText || '') || extractBareVoiceId(userText || '');
     if (!vid) return;
     const res = await resolvePublicOwnerIdFromVoiceId(vid, traceCb);
     if (res?.publicOwnerId) plan.__owner_id = res.publicOwnerId;
@@ -8165,6 +8176,46 @@ function buildCreatorVoicesMessage(session, ownerId) {
   const header = '```CREATOR: ' + (ownerId || '').toString().slice(0, 8) + '…```';
   const body = buildMessageFromSession(session);
   return header + '\n' + body;
+}
+
+async function handleCreatorVoicesBrowse(plan, userText, traceCb, options = {}) {
+  const uiLang = (options.uiLang || 'en').toString().slice(0, 2).toLowerCase();
+  const originalQuery = (options.originalQuery || userText || '').toString();
+  const ownerId = (plan?.__owner_id || '').toString().trim().toLowerCase();
+  if (!ownerId) return { ok: false, reason: 'no_owner' };
+
+  const refVoiceId = extractVoiceIdForOwnerLookup(userText) || extractBareVoiceId(userText);
+  if (refVoiceId) plan.__exclude_voice_id = refVoiceId;
+
+  const voices = await fetchVoicesByOwner(ownerId, plan, traceCb);
+  if (!voices.length) {
+    return { ok: false, reason: 'no_voices', ownerId, plan };
+  }
+
+  const ranked = await rankVoicesWithGPT(userText, plan, voices);
+  const session = {
+    originalQuery,
+    keywordPlan: plan,
+    voices,
+    ranking: ranked.scoreMap,
+    uiLanguage: uiLang,
+    filters: {
+      quality: plan.quality_preference || 'any',
+      gender:
+        plan.target_gender === 'male' || plan.target_gender === 'female'
+          ? plan.target_gender
+          : 'any',
+      listAll: detectListAll(userText),
+      featured: plan.__featured === true,
+      sort: plan.__sort || null,
+      strictUseCase: plan.__forceUseCases === true,
+      strictDescriptives: plan.__forceDescriptives === true,
+      limitPerGender: null
+    },
+    lastActive: Date.now()
+  };
+  const message = buildCreatorVoicesMessage(session, ownerId);
+  return { ok: true, voices, ranked, session, message, ownerId };
 }
 
 function appendQueryFiltersToParams(params, plan, userText, options = {}) {
@@ -9675,6 +9726,21 @@ function runDevAsserts() {
       'compat resolve: this voice -> top ranked'
     );
   }
+
+  // Creator browse: intent + voice-id extraction for owner lookup
+  {
+    const creatorQ = "find other voices from the user who has 'covxL85MSd0uUrktE45z'";
+    devAssert(detectCreatorVoicesIntent(creatorQ), 'creator intent: find other voices from user who has voice id');
+    devAssert(
+      extractVoiceIdForOwnerLookup(creatorQ) === 'covxL85MSd0uUrktE45z',
+      'extractVoiceIdForOwnerLookup: quoted id after who has'
+    );
+    devAssert(
+      extractVoiceIdForOwnerLookup('find other voices from the user who has covxL85MSd0uUrktE45z') ===
+        'covxL85MSd0uUrktE45z',
+      'extractVoiceIdForOwnerLookup: bare id after who has'
+    );
+  }
 }
 
 async function runDevPoc() {
@@ -9886,10 +9952,11 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           searchTrace.push(entry);
         } catch (_) {}
       };
-      const refVoiceId = extractVoiceIdForOwnerLookup(cleaned);
-      if (refVoiceId) keywordPlan.__exclude_voice_id = refVoiceId;
-      let voices = await fetchVoicesByOwner(keywordPlan.__owner_id, keywordPlan, traceCb);
-      if (!voices.length) {
+      const browse = await handleCreatorVoicesBrowse(keywordPlan, cleaned, traceCb, {
+        uiLang,
+        originalQuery: cleaned
+      });
+      if (!browse.ok) {
         const noResText = await translateNoResultsWithOwnerHint(uiLang, keywordPlan);
         await safePostMessage(
           client,
@@ -9898,30 +9965,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         );
         return;
       }
-      const ranked = await rankVoicesWithGPT(cleaned, keywordPlan, voices);
-      const session = {
-        originalQuery: cleaned,
-        keywordPlan,
-        voices,
-        ranking: ranked.scoreMap,
-        uiLanguage: uiLang,
-        filters: {
-          quality: keywordPlan.quality_preference || 'any',
-          gender:
-            keywordPlan.target_gender === 'male' || keywordPlan.target_gender === 'female'
-              ? keywordPlan.target_gender
-              : 'any',
-          listAll: detectListAll(cleaned),
-          featured: false,
-          sort: null,
-          strictUseCase: false,
-          strictDescriptives: false,
-          limitPerGender: null
-        },
-        lastActive: Date.now()
-      };
-      sessions[threadTs] = session;
-      let message = buildCreatorVoicesMessage(session, keywordPlan.__owner_id);
+      sessions[threadTs] = browse.session;
+      let message = browse.message;
       message = await translateForUserLanguage(message, uiLang);
       const blocks = buildBlocksFromText(message);
       await safePostMessage(
@@ -9936,7 +9981,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
       );
       if (process.env.POC_SEARCH_REPORT === 'true') {
         let report = buildSearchReport(searchTrace, keywordPlan, 'creator_browse', {
-          unique_count: voices.length
+          unique_count: browse.voices.length
         });
         report = await translateForUserLanguage(report, uiLang);
         await postPocReportDm(client, `${cleaned}\n\n${report}`);
@@ -10235,11 +10280,23 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         if (detectCreatorVoicesIntent(part) && !subPlan.__owner_id) {
           continue;
         }
-        let voices = await fetchVoicesByKeywords(subPlan, part, traceCb);
-        if (!voices.length) {
-          continue;
+        let voices;
+        let ranked;
+        if (intentPart && subPlan.__owner_id) {
+          const browse = await handleCreatorVoicesBrowse(subPlan, part, traceCb, {
+            uiLang: (guessUiLanguageFromText(part) || uiLang).toString().slice(0, 2).toLowerCase(),
+            originalQuery: part
+          });
+          if (!browse.ok) continue;
+          voices = browse.voices;
+          ranked = browse.ranked;
+        } else {
+          voices = await fetchVoicesByKeywords(subPlan, part, traceCb);
+          if (!voices.length) {
+            continue;
+          }
+          ranked = await rankVoicesWithGPT(part, subPlan, voices);
         }
-        const ranked = await rankVoicesWithGPT(part, subPlan, voices);
         subSessions.push({
           title: part,
           session: {
@@ -10914,7 +10971,61 @@ if (!DEV_ASSERTS_ENABLED && !isDevPocEnabled()) {
           searchTrace.push(entry);
         } catch (_) {}
       };
+      applyCreatorOwnerToPlan(refinedPlan, combinedQuery);
       await maybeResolveOwnerIdFromVoiceReference(refinedPlan, combinedQuery, traceCb);
+      const creatorRefText = cleaned || combinedQuery;
+      if (detectCreatorVoicesIntent(creatorRefText)) {
+        if (!refinedPlan.__owner_id) {
+          const labels = getLabels();
+          const vidTry =
+            extractVoiceIdForOwnerLookup(combinedQuery) || extractBareVoiceId(combinedQuery);
+          const msgKey = vidTry ? labels.creatorOwnerVoiceNotFound : labels.creatorOwnerIdNeeded;
+          const msg = await translateForUserLanguage(msgKey, existing.uiLanguage);
+          await safePostMessage(client, {
+            channel: event.channel,
+            thread_ts: threadTs,
+            text: msg
+          });
+          return;
+        }
+        const browse = await handleCreatorVoicesBrowse(refinedPlan, combinedQuery, traceCb, {
+          uiLang: existing.uiLanguage,
+          originalQuery: combinedQuery
+        });
+        if (!browse.ok) {
+          const noResText = await translateNoResultsWithOwnerHint(existing.uiLanguage, refinedPlan);
+          await safePostMessage(client, {
+            channel: event.channel,
+            thread_ts: threadTs,
+            text: noResText
+          });
+          return;
+        }
+        existing.keywordPlan = refinedPlan;
+        existing.originalQuery = combinedQuery;
+        existing.voices = browse.voices;
+        existing.ranking = browse.ranked.scoreMap;
+        existing.lastActive = Date.now();
+
+        let msg = browse.message;
+        msg = await translateForUserLanguage(msg, existing.uiLanguage);
+        const blocks = buildBlocksFromText(msg);
+        await safePostMessage(client, {
+          channel: event.channel,
+          thread_ts: threadTs,
+          text: msg,
+          blocks: blocks || undefined
+        });
+        if (process.env.POC_SEARCH_REPORT === 'true') {
+          let report = buildSearchReport(searchTrace, refinedPlan, 'creator_browse', {
+            unique_count: browse.voices.length
+          });
+          report = await translateForUserLanguage(report, existing.uiLanguage);
+          const dmText = `${cleaned}\n\n${report}`;
+          await postPocReportDm(client, dmText);
+        }
+        return;
+      }
       const voices = await fetchVoicesByKeywords(refinedPlan, combinedQuery, traceCb);
       if (!voices.length) {
         const labels = getLabels();
