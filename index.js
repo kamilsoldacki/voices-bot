@@ -4231,9 +4231,16 @@ IMPORTANT:
     } else if (gccIntent && (!plan.target_voice_language || String(plan.target_voice_language).toLowerCase().slice(0, 2) === 'ar')) {
       plan.target_voice_language = 'ar';
     }
-    // Bilingual EN+ES: avoid constraining by language
+    // Bilingual EN+ES: avoid constraining by language or single-language accent
     if (detectBilingualEnEs(userText)) {
       plan.target_voice_language = null;
+      plan.target_accent = null;
+    }
+
+    // One male + one female: keep both genders in play (do not collapse to a single target_gender).
+    if (detectOneMaleOneFemale(userText)) {
+      plan.target_gender = null;
+      plan.__dualGenderOneEach = true;
     }
 
     return plan;
@@ -4355,7 +4362,10 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   }
 
   let gender = null;
-  if (plan.target_gender === 'male' || plan.target_gender === 'female') {
+  if (
+    !wantsOneMaleOneFemale(plan, userText) &&
+    (plan.target_gender === 'male' || plan.target_gender === 'female')
+  ) {
     gender = plan.target_gender;
   }
 
@@ -4366,7 +4376,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
 
   // Fallback: infer language from resolver (accent-implies-language, etc.)
   // when the GPT plan didn't set target_voice_language.
-  if (!language && resolved?.targetIso2) {
+  if (!language && resolved?.targetIso2 && !detectBilingualEnEs(userText)) {
     language = resolved.targetIso2;
   }
 
@@ -6247,8 +6257,9 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   const chineseDialect = language === 'zh' ? detectChineseDialectFromText(userText) : null;
   const preferredZhLocales = preferredLocalesForChineseDialect(chineseDialect).map((x) => String(x).toLowerCase());
   const dialectHints = new Set(dialectKeywordHints(chineseDialect).map(normalizeKw));
+  const isBilingualEnEsRank = detectBilingualEnEs(userText);
   const isLatamSpanishIntent =
-    language === 'es' &&
+    (language === 'es' || isBilingualEnEsRank) &&
     /\b(es-419|latam|latin america|latinamerican|latino|latin(?:o)? american|south american|central american|caribbean)\b/.test((userText || '').toLowerCase()) &&
     !(/\b(mexico|mexican|es-mx|mx)\b/.test((userText || '').toLowerCase())) &&
     !(/\b(spain|castilian|es-es)\b/.test((userText || '').toLowerCase()));
@@ -7347,10 +7358,85 @@ function splitMultiIntents(text) {
 
 function detectBilingualEnEs(userText) {
   const lower = (userText || '').toLowerCase();
-  const hasBilingual = /\bbilingual\b/.test(lower) || /\ben\s*\/\s*es\b/.test(lower);
   const hasEn = /\benglish\b|\ben\b/.test(lower);
-  const hasEs = /\bspanish\b|\bes\b/.test(lower);
-  return hasBilingual && hasEn && hasEs;
+  const hasEs =
+    /\bspanish\b|\bespanol\b|\bespañol\b|\bes\b/.test(lower) ||
+    (hasEn && /\blatin american\b/.test(lower));
+  if (!hasEn || !hasEs) return false;
+
+  if (/\bbilingual\b/.test(lower)) return true;
+  if (/\ben\s*\/\s*es\b/.test(lower)) return true;
+
+  // Explicit language pair: "English + Spanish", "native English and Latin American Spanish", etc.
+  const enTerm = '(?:native\\s+)?english';
+  const esTerm = '(?:latin american\\s+)?(?:spanish|espa[nñ]ol|es)';
+  const connector = '\\s*(?:[+&]|,|\\band\\b)\\s*';
+  const pairPattern = new RegExp(
+    `(\\b${enTerm}\\b${connector}[\\s\\S]{0,80}?\\b${esTerm}\\b)|(\\b${esTerm}\\b${connector}[\\s\\S]{0,80}?\\b${enTerm}\\b)`,
+    'i'
+  );
+  return pairPattern.test(lower);
+}
+
+// User wants one male AND one female voice recommendation (not a single-gender filter).
+function detectOneMaleOneFemale(userText) {
+  try {
+    const lower = (userText || '').toLowerCase();
+    if (!lower) return false;
+
+    // Single-gender-only follow-ups / filters
+    if (/\b(?:only|just|tylko)\s+(?:male|female|m[eę]sk\w*|[zż]e[nń]sk\w*|kobiec\w*)\b/i.test(lower)) {
+      return false;
+    }
+    if (/\b(?:male|female|m[eę]sk\w*|[zż]e[nń]sk\w*|kobiec\w*)\s+only\b/i.test(lower)) return false;
+    if (/\b(?:show|poka[zż])\s+(?:only\s+)?(?:male|female|m[eę]sk\w*|[zż]e[nń]sk\w*)\b/i.test(lower)) {
+      return false;
+    }
+
+    const maleTerm = '(?:male|man|men|m[eę]sk(?:i|iego|a|ie)?|mesk(?:i|iego|a|ie)?)';
+    const femaleTerm =
+      '(?:female|woman|women|kobiec(?:a|y|e|iego)?|[zż]e[nń]sk(?:i|a|iego|ie)?|zensk(?:i|a|iego|ie)?)';
+    const qty = '(?:one|1|a|an|jedn(?:a|y|e|ego)?|po\\s+jedn(?:ym|ej)?)';
+    const connector = '(?:and|&|oraz|,|\\bi\\b)';
+
+    const oneEach = new RegExp(
+      `\\b${qty}\\s+${maleTerm}\\b[\\s\\S]{0,40}?\\b${qty}\\s+${femaleTerm}\\b|` +
+        `\\b${qty}\\s+${femaleTerm}\\b[\\s\\S]{0,40}?\\b${qty}\\s+${maleTerm}\\b`,
+      'i'
+    );
+    if (oneEach.test(lower)) return true;
+
+    if (/\b(?:one|1)\s+male\s+(?:one|1)\s+female\b/i.test(lower)) return true;
+    if (/\b(?:one|1)\s+female\s+(?:one|1)\s+male\b/i.test(lower)) return true;
+
+    const pairPattern = new RegExp(
+      `${maleTerm}[\\s\\S]{0,40}?\\b${connector}\\b[\\s\\S]{0,40}?${femaleTerm}|` +
+        `${femaleTerm}[\\s\\S]{0,40}?\\b${connector}\\b[\\s\\S]{0,40}?${maleTerm}`,
+      'i'
+    );
+    if (pairPattern.test(lower)) return true;
+
+    // Polish shorthand without ASCII word boundaries (JS \\b breaks on ę/ż).
+    if (/\bm[eę]sk\w*\s+(?:i|oraz)\s+[zż]e[nń]sk\w*/i.test(lower)) return true;
+    if (/\bm[eę]sk\w*\s+(?:i|oraz)\s+kobiec\w*/i.test(lower)) return true;
+
+    return false;
+  } catch (_) {
+    return false;
+  }
+}
+
+function wantsOneMaleOneFemale(plan, userText) {
+  return plan?.__dualGenderOneEach === true || detectOneMaleOneFemale(userText);
+}
+
+function getSessionGenderAndLimit(plan, userText) {
+  if (wantsOneMaleOneFemale(plan, userText)) {
+    return { gender: 'any', limitPerGender: 1 };
+  }
+  const gender =
+    plan?.target_gender === 'male' || plan?.target_gender === 'female' ? plan.target_gender : 'any';
+  return { gender, limitPerGender: null };
 }
 
 // -------------------------------------------------------------
@@ -8193,6 +8279,7 @@ async function handleCreatorVoicesBrowse(plan, userText, traceCb, options = {}) 
   }
 
   const ranked = await rankVoicesWithGPT(userText, plan, voices);
+  const genderLimit = getSessionGenderAndLimit(plan, userText);
   const session = {
     originalQuery,
     keywordPlan: plan,
@@ -8201,16 +8288,13 @@ async function handleCreatorVoicesBrowse(plan, userText, traceCb, options = {}) 
     uiLanguage: uiLang,
     filters: {
       quality: plan.quality_preference || 'any',
-      gender:
-        plan.target_gender === 'male' || plan.target_gender === 'female'
-          ? plan.target_gender
-          : 'any',
+      gender: genderLimit.gender,
       listAll: detectListAll(userText),
       featured: plan.__featured === true,
       sort: plan.__sort || null,
       strictUseCase: plan.__forceUseCases === true,
       strictDescriptives: plan.__forceDescriptives === true,
-      limitPerGender: null
+      limitPerGender: genderLimit.limitPerGender
     },
     lastActive: Date.now()
   };
@@ -8443,7 +8527,7 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   } else if (!resolverAppliedAccent && isFrenchCanadian) {
     // Prefer locale=fr-CA over hard accent filtering (accent metadata can be inconsistent)
     // Keep accent as a soft preference via keywords/ranking, not as a strict query param.
-  } else if (!resolverAppliedAccent && isSpanishLatam && !isSpanishMexico) {
+  } else if (!resolverAppliedAccent && !isBilingualEnEs && isSpanishLatam && !isSpanishMexico) {
     // LatAm Spanish: es-419 is a REGION alias (not a queryable locale), so prefer a broad accent filter.
     // Locale fanout fallback happens later when results are weak.
     const explicitLocale =
@@ -9425,6 +9509,40 @@ function runDevAsserts() {
   const hGccQa = parseUserLanguageHints('best Qatari voice');
   devAssert(hGccQa.iso2 === 'ar' && hGccQa.reason === 'gcc_region', 'GCC: Qatari -> ar');
 
+  // Bilingual EN+ES: explicit word, en/es, and language-pair connectors (+, and, comma)
+  devAssert(
+    detectBilingualEnEs('high quality native English + Latin American Spanish, one male one female'),
+    'bilingual: English + Latin American Spanish'
+  );
+  devAssert(
+    detectBilingualEnEs('can you recommend a female high quality native English + Latin American Spanish'),
+    'bilingual: recommend female English + Latin American Spanish'
+  );
+  devAssert(detectBilingualEnEs('bilingual english and spanish voice'), 'bilingual: explicit bilingual keyword');
+  devAssert(detectBilingualEnEs('en/es voice for IVR'), 'bilingual: en/es shorthand');
+  devAssert(!detectBilingualEnEs('American English voice for a Spanish course'), 'bilingual: not inferred from unrelated English+Spanish mention');
+
+  // One male + one female voice recommendations
+  devAssert(detectOneMaleOneFemale('one male one female'), 'dual gender: one male one female');
+  devAssert(detectOneMaleOneFemale('one male, one female voice'), 'dual gender: comma separated');
+  devAssert(detectOneMaleOneFemale('male and female'), 'dual gender: male and female');
+  devAssert(detectOneMaleOneFemale('męski i żeński'), 'dual gender: Polish męski i żeński');
+  devAssert(
+    detectOneMaleOneFemale('high quality native English + Latin American Spanish, one male one female'),
+    'dual gender: bilingual query with one male one female'
+  );
+  devAssert(detectOneMaleOneFemale('a male and a female voice'), 'dual gender: a male and a female');
+  devAssert(!detectOneMaleOneFemale('female voice for audiobook'), 'dual gender: single female only');
+  devAssert(!detectOneMaleOneFemale('only male voices'), 'dual gender: male-only filter');
+  devAssert(
+    getSessionGenderAndLimit({ target_gender: 'female' }, 'one male one female').limitPerGender === 1,
+    'dual gender: session limitPerGender is 1'
+  );
+  devAssert(
+    getSessionGenderAndLimit({ target_gender: 'female' }, 'one male one female').gender === 'any',
+    'dual gender: session gender stays any'
+  );
+
   // Locale normalization (UI aliases -> canonical)
   devAssert(normalizeRequestedLocale('PT-EU') === 'pt-PT', 'normalize PT-EU -> pt-PT');
   devAssert(normalizeRequestedLocale('en-UK') === 'en-GB', 'normalize en-UK -> en-GB');
@@ -10124,19 +10242,19 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
                   ranking: {},
                   uiLanguage: uiLang,
                   pendingFacetQuestion: pending,
-                  filters: {
-                    quality: keywordPlan.quality_preference || 'any',
-                    gender:
-                      keywordPlan.target_gender === 'male' || keywordPlan.target_gender === 'female'
-                        ? keywordPlan.target_gender
-                        : 'any',
-                    listAll: detectListAll(cleaned),
-                    featured: false,
-                    sort: null,
-                    strictUseCase: false,
-                    strictDescriptives: false,
-                    limitPerGender: null
-                  },
+                  filters: (() => {
+                    const genderLimit = getSessionGenderAndLimit(keywordPlan, cleaned);
+                    return {
+                      quality: keywordPlan.quality_preference || 'any',
+                      gender: genderLimit.gender,
+                      listAll: detectListAll(cleaned),
+                      featured: false,
+                      sort: null,
+                      strictUseCase: false,
+                      strictDescriptives: false,
+                      limitPerGender: genderLimit.limitPerGender
+                    };
+                  })(),
                   lastActive: Date.now()
                 };
                 await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: msg, blocks: buildBlocksFromText(msg) || undefined });
@@ -10183,19 +10301,19 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
                 ranking: {},
                 uiLanguage: uiLang,
                 pendingFacetQuestion: pending,
-                filters: {
-                  quality: keywordPlan.quality_preference || 'any',
-                  gender:
-                    keywordPlan.target_gender === 'male' || keywordPlan.target_gender === 'female'
-                      ? keywordPlan.target_gender
-                      : 'any',
-                  listAll: detectListAll(cleaned),
-                  featured: false,
-                  sort: null,
-                  strictUseCase: false,
-                  strictDescriptives: false,
-                  limitPerGender: null
-                },
+                filters: (() => {
+                  const genderLimit = getSessionGenderAndLimit(keywordPlan, cleaned);
+                  return {
+                    quality: keywordPlan.quality_preference || 'any',
+                    gender: genderLimit.gender,
+                    listAll: detectListAll(cleaned),
+                    featured: false,
+                    sort: null,
+                    strictUseCase: false,
+                    strictDescriptives: false,
+                    limitPerGender: genderLimit.limitPerGender
+                  };
+                })(),
                 lastActive: Date.now()
               };
               await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: msg, blocks: buildBlocksFromText(msg) || undefined });
@@ -10239,9 +10357,14 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         subPlan.__listAll = detectListAll(partText);
         subPlan.__forceUseCases = false;
         subPlan.__forceDescriptives = false;
+        if (detectOneMaleOneFemale(cleaned)) {
+          subPlan.__dualGenderOneEach = true;
+          subPlan.target_gender = null;
+        }
         let voices = await fetchVoicesByKeywords(subPlan, partText, traceCb);
         if (!voices.length) continue;
         const ranked = await rankVoicesWithGPT(partText, subPlan, voices);
+        const genderLimit = getSessionGenderAndLimit(subPlan, cleaned);
         subSessions.push({
           title: li.title || li.iso2.toUpperCase(),
           session: {
@@ -10252,14 +10375,11 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
             uiLanguage: (guessUiLanguageFromText(partText) || uiLang).toString().slice(0, 2).toLowerCase(),
             filters: {
               quality: subPlan.quality_preference || 'any',
-              gender:
-                subPlan.target_gender === 'male' || subPlan.target_gender === 'female'
-                  ? subPlan.target_gender
-                  : 'any',
+              gender: genderLimit.gender,
               listAll: detectListAll(partText),
               featured: false,
               sort: null,
-              limitPerGender: null
+              limitPerGender: genderLimit.limitPerGender
             },
             lastActive: Date.now()
           }
@@ -10315,6 +10435,10 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         subPlan.__listAll = detectListAll(part);
         subPlan.__forceUseCases = false;
         subPlan.__forceDescriptives = false;
+        if (detectOneMaleOneFemale(cleaned)) {
+          subPlan.__dualGenderOneEach = true;
+          subPlan.target_gender = null;
+        }
         const oidPart = extractPublicOwnerIdFromText(part);
         const intentPart = detectCreatorVoicesIntent(part);
         // Only this segment may be owner-filtered; do not use full-query creator intent (other parts could be generic).
@@ -10342,6 +10466,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           }
           ranked = await rankVoicesWithGPT(part, subPlan, voices);
         }
+        const genderLimit = getSessionGenderAndLimit(subPlan, cleaned);
         subSessions.push({
           title: part,
           session: {
@@ -10352,14 +10477,11 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
             uiLanguage: (guessUiLanguageFromText(part) || uiLang).toString().slice(0,2).toLowerCase(),
             filters: {
               quality: subPlan.quality_preference || 'any',
-              gender:
-                subPlan.target_gender === 'male' || subPlan.target_gender === 'female'
-                  ? subPlan.target_gender
-                  : 'any',
+              gender: genderLimit.gender,
               listAll: detectListAll(part),
               featured: false,
               sort: null,
-              limitPerGender: null
+              limitPerGender: genderLimit.limitPerGender
             },
             lastActive: Date.now()
           }
@@ -10433,6 +10555,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
       }
       const ranked = await rankVoicesWithGPT(cleaned, keywordPlan, voices);
       let softQualityNote = '';
+      const genderLimit = getSessionGenderAndLimit(keywordPlan, cleaned);
       const session = {
         originalQuery: cleaned,
         keywordPlan,
@@ -10441,16 +10564,13 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         uiLanguage: uiLang,
         filters: {
           quality: keywordPlan.quality_preference || 'any',
-          gender:
-            keywordPlan.target_gender === 'male' || keywordPlan.target_gender === 'female'
-              ? keywordPlan.target_gender
-              : 'any',
+          gender: genderLimit.gender,
           listAll: detectListAll(cleaned),
           featured: false,
           sort: null,
           strictUseCase: false,
           strictDescriptives: false,
-          limitPerGender: null
+          limitPerGender: genderLimit.limitPerGender
         },
         lastActive: Date.now()
       };
@@ -10690,6 +10810,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
       }
     }
 
+    const genderLimit = getSessionGenderAndLimit(keywordPlan, cleaned);
     const session = {
       originalQuery: cleaned,
       keywordPlan,
@@ -10698,16 +10819,13 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
       uiLanguage: uiLang,
       filters: {
         quality: keywordPlan.quality_preference || 'any',
-        gender:
-          keywordPlan.target_gender === 'male' || keywordPlan.target_gender === 'female'
-            ? keywordPlan.target_gender
-            : 'any',
+        gender: genderLimit.gender,
         listAll: detectListAll(cleaned),
         featured: false,
         sort: null,
         strictUseCase: false,
         strictDescriptives: false,
-        limitPerGender: null
+        limitPerGender: genderLimit.limitPerGender
       },
       lastActive: Date.now()
     };
