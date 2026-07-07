@@ -1853,6 +1853,30 @@ function isHighQuality(voice) {
   return false;
 }
 
+function voiceSupportsModel(voice, modelId) {
+  if (!voice || typeof voice !== 'object' || !modelId) return false;
+  const ids = voice.high_quality_base_model_ids;
+  if (!Array.isArray(ids) || !ids.length) return false;
+  const want = String(modelId).toLowerCase().trim();
+  return ids.some((id) => String(id || '').toLowerCase().trim() === want);
+}
+
+function isV3Voice(voice) {
+  return voiceSupportsModel(voice, 'eleven_v3');
+}
+
+function filterVoicesByModelPreference(voices, modelPref) {
+  if (!Array.isArray(voices) || !voices.length) return voices || [];
+  const pref = modelPref || 'any';
+  if (pref === 'any') return voices;
+  const matched = voices.filter((v) => voiceSupportsModel(v, pref));
+  return matched.length ? matched : voices;
+}
+
+function hasCustomRateMultiplier(voice) {
+  return Number(voice?.rate) > 1;
+}
+
 // Very rough guess of the language the user is typing in
 function guessUiLanguageFromText(text) {
   if (!text) return 'en';
@@ -2028,6 +2052,13 @@ function enrichKeywordsByIntent(userText, keywords) {
     ]);
     const banPos = new Set(['playful','whimsical','friendly','cheerful','uplifting','calm','warm']);
     out = out.filter((k) => !(banPos.has((k || '').toLowerCase()) && !explicitlyMentionedInText(k, userText)));
+  }
+
+  // Bilingual EN+ES: add Spanish-side recall tokens without constraining API language/accent.
+  if (detectBilingualEnEs(userText)) {
+    const esSide = ['spanish', 'bilingual', 'español', 'espanol', 'latin american', 'latino'];
+    if (/\blatin american\b/.test(lower)) esSide.push('latin american spanish');
+    out = pushFront(out, esSide);
   }
 
   // Deduplicate
@@ -2641,6 +2672,12 @@ function resolveVariantConstraints(userText, plan, kb, catalog) {
     regionIntent: null, // optional label (e.g. 'es-419'), non-binding
     reason: '-'
   };
+  // Bilingual EN+ES: do not anchor to a single language or accent variant.
+  if (detectBilingualEnEs(text)) {
+    out.targetIso2 = null;
+    out.reason = 'bilingual_en_es';
+    return out;
+  }
   if (!targetIso2) return out;
   const isFrenchCanadianIntent = targetIso2 === 'fr' && hasFrenchCanadianMarkers(text);
   const isFrenchEuropeanIntent = targetIso2 === 'fr' && !isFrenchCanadianIntent && hasFrenchEuropeanMarkers(text);
@@ -2962,6 +2999,14 @@ function voiceHasVerifiedIso2(voice, iso2) {
   return false;
 }
 
+function voiceHasVerifiedEnAndEs(voice) {
+  if (!voice) return false;
+  const langs = new Set();
+  if (voiceHasVerifiedIso2(voice, 'en')) langs.add('en');
+  if (voiceHasVerifiedIso2(voice, 'es')) langs.add('es');
+  return langs.has('en') && langs.has('es');
+}
+
 function voiceVerifiedEntriesForIso2(voice, iso2) {
   const target = (iso2 || '').toString().toLowerCase().slice(0, 2);
   if (!voice || !target) return [];
@@ -3232,6 +3277,30 @@ function detectQualityPreferenceFromText(text) {
   return null;
 }
 
+function detectModelPreferenceFromText(text) {
+  if (!text) return null;
+  const lower = text
+    .replace(/[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/g, '-')
+    .toLowerCase();
+
+  if (/\b(without|no|exclude|bez)\s+(eleven[\s_-]?v3|v3\s+model|model\s+v3)\b/.test(lower)) {
+    return null;
+  }
+
+  if (
+    /\beleven[\s_-]?v3\b/.test(lower) ||
+    /\bv3\s+model\b/.test(lower) ||
+    /\bmodel\s+v3\b/.test(lower) ||
+    /\bwith\s+v3\b/.test(lower) ||
+    /\bna\s+v3\b/.test(lower) ||
+    /\bw\s+model(u|em)?\s+v3\b/.test(lower)
+  ) {
+    return 'eleven_v3';
+  }
+
+  return null;
+}
+
 // UI labels – EN only (all user-facing base text)
 // (then translated per userLanguage before sending)
 function getLabels() {
@@ -3295,7 +3364,8 @@ function formatVoiceLine(voice) {
   const url = `https://elevenlabs.io/app/voice-library?search=${encodeURIComponent(
     voice.voice_id
   )}`;
-  return `<${url}|${voice.name}> \`${voice.voice_id}\``;
+  const name = hasCustomRateMultiplier(voice) ? `💲${voice.name}` : voice.name;
+  return `<${url}|${name}> \`${voice.voice_id}\``;
 }
 
 function detectListAll(text) {
@@ -3693,6 +3763,15 @@ async function refineKeywordPlanFromFollowUp(existingPlan, followUpText) {
   const qpOverride = detectQualityPreferenceFromText(followUpText);
   base.quality_preference = qpOverride || base.quality_preference || 'any';
 
+  const mpOverride = detectModelPreferenceFromText(followUpText);
+  if (mpOverride) {
+    base.model_preference = mpOverride;
+  } else if (delta && delta.model_preference === 'eleven_v3') {
+    base.model_preference = 'eleven_v3';
+  } else if (!base.model_preference) {
+    base.model_preference = 'any';
+  }
+
   if (delta && typeof delta.target_voice_language === 'string' && delta.target_voice_language) {
     base.target_voice_language = delta.target_voice_language;
   }
@@ -3732,6 +3811,8 @@ function detectSpecialIntent(userText, plan) {
     lower.includes('top used') ||
     lower.includes('top voices') ||
     lower.includes('top polish voices') ||
+    /\btop\s+\d+\s+voices?\b/.test(lower) ||
+    (/\btop\s+\d+\b/.test(lower) && /\bvoices?\b/.test(lower)) ||
     lower.includes('most frequently used') ||
     lower.includes('najczęściej używan') ||
     lower.includes('najczesciej uzywan') ||
@@ -3894,6 +3975,14 @@ function normalizeKeywordPlan(plan, userText) {
     out.quality_preference = 'any';
   }
 
+  const mpFromText = detectModelPreferenceFromText(userText);
+  if (mpFromText) {
+    out.model_preference = mpFromText;
+  }
+  if (out.model_preference !== 'eleven_v3') {
+    out.model_preference = 'any';
+  }
+
   // sanitize gender
   if (out.target_gender !== 'male' && out.target_gender !== 'female' && out.target_gender !== 'neutral') {
     out.target_gender = null;
@@ -4032,6 +4121,7 @@ The JSON MUST have exactly these fields:
   "target_accent": string or null,          // e.g. "american", "british", "polish"
   "target_gender": "male" | "female" | "neutral" | null,
   "quality_preference": "any" | "high_only" | "no_high",
+  "model_preference": "any" | "eleven_v3",
 
   "tone_keywords": string[],
   "use_case_keywords": string[],
@@ -4064,6 +4154,11 @@ RULES:
     (e.g. "without high quality", "no high quality", "standard only").
   - Words like "best", "top", "great", "good", "premium" are NOT enough to set "high_only".
   - In all other cases use "any".
+
+- model_preference:
+  - "eleven_v3" when the user explicitly asks for ElevenLabs V3 / eleven v3 / V3 model support
+    (e.g. "with V3 model", "eleven v3 voices", "na modelu V3").
+  - "any" in all other cases (including when the user only says "best" or "top" without mentioning V3).
 
 - tone_keywords:
   - Many short English adjectives (1–3 words) describing tone and pacing:
@@ -4136,6 +4231,9 @@ IMPORTANT:
     if (!['any', 'high_only', 'no_high'].includes(plan.quality_preference)) {
       plan.quality_preference = 'any';
     }
+    if (plan.model_preference !== 'eleven_v3') {
+      plan.model_preference = 'any';
+    }
 
     const normalizeArray = (arr) =>
       Array.isArray(arr)
@@ -4153,6 +4251,12 @@ IMPORTANT:
     // Manual override from raw text if needed
     const qp = detectQualityPreferenceFromText(userText);
     plan.quality_preference = qp || 'any';
+
+    const mp = detectModelPreferenceFromText(userText);
+    plan.model_preference = mp || plan.model_preference || 'any';
+    if (plan.model_preference !== 'eleven_v3') {
+      plan.model_preference = 'any';
+    }
 
     // Negative exclusions (accent/locale/gender)
     try {
@@ -4248,6 +4352,7 @@ IMPORTANT:
     safeLogAxiosError('buildKeywordPlan', error);
 
     const qp = detectQualityPreferenceFromText(userText);
+    const mp = detectModelPreferenceFromText(userText);
 
     return {
       user_interface_language: guessUiLanguageFromText(userText),
@@ -4255,6 +4360,7 @@ IMPORTANT:
       target_accent: null,
       target_gender: null,
       quality_preference: qp || 'any',
+      model_preference: mp || 'any',
       tone_keywords: [],
       use_case_keywords: [],
       character_keywords: [],
@@ -4370,9 +4476,15 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   }
 
   const qualityPref = plan.quality_preference || 'any';
+  const modelPref = plan.model_preference || 'any';
 
   // Resolve variant constraints once (used by fanout + scoring + diagnostics)
   const resolved = resolveVariantConstraints(userText, plan, facetKB, accentCatalog);
+  const isBilingualEnEsSearch = detectBilingualEnEs(userText);
+  if (isBilingualEnEsSearch) {
+    language = null;
+    accent = null;
+  }
 
   // Fallback: infer language from resolver (accent-implies-language, etc.)
   // when the GPT plan didn't set target_voice_language.
@@ -4386,6 +4498,9 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   // Goal: avoid wasting many per-keyword requests on an accent form that yields 0 results (200 OK).
   // Budget: up to 2 probe requests on cache miss.
   try {
+    if (isBilingualEnEsSearch) {
+      accent = null;
+    } else {
     const iso2 = (language || resolved?.targetIso2 || '').toString().toLowerCase().slice(0, 2);
     const hasIso2 = Boolean(iso2);
     const wantsAccent = hasIso2 && (() => {
@@ -4479,6 +4594,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
           accent = preferred === 'name' ? pair.name : pair.slug;
         }
       }
+    }
     }
   } catch (_) {}
 
@@ -5992,7 +6108,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   try {
     const lowerText = (userText || '').toLowerCase();
     const isLatamSpanishIntent =
-      language === 'es' &&
+      (language === 'es' || isBilingualEnEsSearch) &&
       /\b(es-419|latam|latin america|latinamerican|latino|latin(?:o)? american|south american|central american|caribbean)\b/.test(lowerText) &&
       !(/\b(mexico|mexican|es-mx|mx)\b/.test(lowerText));
 
@@ -6038,8 +6154,9 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
 
         // Force the locale explicitly; suppress accent (locale already partitions)
         const plan2 = { ...plan, target_locale: loc, target_accent: null };
+        const fanoutLanguage = language || (isBilingualEnEsSearch ? 'es' : null);
         appendQueryFiltersToParams(base, plan2, userText, {
-          language,
+          language: fanoutLanguage,
           accent: null,
           gender,
           qualityPref,
@@ -6047,6 +6164,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
           sort,
           age,
           forceUseCases: plan.__forceUseCases === true,
+          forceLanguage: isBilingualEnEsSearch ? 'es' : null,
           traceCb: trace
         });
 
@@ -6205,6 +6323,24 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     return v;
   });
 
+  // Bilingual EN+ES: prefer voices verified for both English and Spanish.
+  if (isBilingualEnEsSearch && voices.length) {
+    const verifiedBoth = voices.filter(voiceHasVerifiedEnAndEs);
+    try {
+      trace({
+        stage: 'bilingual_filter',
+        params: {
+          verified_both: String(verifiedBoth.length),
+          total_before: String(voices.length)
+        },
+        count: verifiedBoth.length
+      });
+    } catch (_) {}
+    if (verifiedBoth.length > 0) {
+      voices = verifiedBoth;
+    }
+  }
+
   // Post-filter: prefer candidates matching at least one non-generic keyword
   {
     const nonGeneric = [];
@@ -6251,6 +6387,18 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   } else if (qualityPref === 'no_high') {
     const onlyStandard = voices.filter((v) => !isHighQuality(v));
     if (onlyStandard.length) voices = onlyStandard;
+  }
+
+  if (modelPref !== 'any') {
+    const beforeModel = voices.length;
+    voices = filterVoicesByModelPreference(voices, modelPref);
+    try {
+      trace({
+        stage: 'model_filter',
+        params: { model: modelPref, before: String(beforeModel), after: String(voices.length) },
+        count: voices.length
+      });
+    } catch (_) {}
   }
 
   // Candidate ranking prep: coverage score + diversity seeding before cap
@@ -6847,6 +6995,19 @@ async function fetchTopVoicesByLanguage(languageCode, qualityPreference, plan, u
       return ub - ua;
     });
 
+    const modelPref = plan?.model_preference || 'any';
+    if (modelPref !== 'any') {
+      const beforeModel = voices.length;
+      voices = filterVoicesByModelPreference(voices, modelPref);
+      try {
+        trace({
+          stage: 'model_filter',
+          params: { model: modelPref, before: String(beforeModel), after: String(voices.length) },
+          count: voices.length
+        });
+      } catch (_) {}
+    }
+
     return voices.slice(0, 80);
   } catch (err) {
     console.error('Error in fetchTopVoicesByLanguage:', err.message || err);
@@ -6865,26 +7026,35 @@ async function rankVoicesWithGPT(userText, keywordPlan, voices) {
     const s = String(val);
     return s.length > max ? s.slice(0, max) : s;
   };
-  const candidates = voices.slice(0, MAX_VOICES).map((v) => ({
-    voice_id: v.voice_id,
-    name: truncate(v.name, 80),
-    language: v.language || null,
-    accent: truncate(v.accent, 40),
-    gender: v.gender || null,
-    description: truncate(v.description, 240),
-    descriptive: truncate(v.descriptive, 120),
-    verified_languages: Array.isArray(v.verified_languages)
-      ? v.verified_languages.slice(0, 4).map((e) => ({
-          language: e?.language || null,
-          locale: e?.locale || null,
-          accent: truncate(e?.accent, 48)
-        }))
-      : null,
-    category: v.category || null,
-    usage_character_count_1y:
-      v.usage_character_count_1y || v.usage_character_count_7d || null,
-    matched_keywords: Array.isArray(v._matched_keywords) ? v._matched_keywords : []
-  }));
+  const wantsModelInfo = (keywordPlan?.model_preference || 'any') !== 'any';
+  const candidates = voices.slice(0, MAX_VOICES).map((v) => {
+    const entry = {
+      voice_id: v.voice_id,
+      name: truncate(v.name, 80),
+      language: v.language || null,
+      accent: truncate(v.accent, 40),
+      gender: v.gender || null,
+      description: truncate(v.description, 240),
+      descriptive: truncate(v.descriptive, 120),
+      verified_languages: Array.isArray(v.verified_languages)
+        ? v.verified_languages.slice(0, 4).map((e) => ({
+            language: e?.language || null,
+            locale: e?.locale || null,
+            accent: truncate(e?.accent, 48)
+          }))
+        : null,
+      category: v.category || null,
+      usage_character_count_1y:
+        v.usage_character_count_1y || v.usage_character_count_7d || null,
+      matched_keywords: Array.isArray(v._matched_keywords) ? v._matched_keywords : []
+    };
+    if (wantsModelInfo) {
+      entry.high_quality_base_model_ids = Array.isArray(v.high_quality_base_model_ids)
+        ? v.high_quality_base_model_ids.slice(0, 8)
+        : [];
+    }
+    return entry;
+  });
 
   const systemPrompt = `
 You are a world-class voice curator at ElevenLabs.
@@ -6913,7 +7083,8 @@ You will receive:
       "verified_languages": [{ "language": string or null, "locale": string or null, "accent": string or null }] or null,
       "category": string or null,
       "usage_character_count_1y": number or null,
-      "matched_keywords": string[]
+      "matched_keywords": string[],
+      "high_quality_base_model_ids": string[] (optional; present when user asked for a specific model)
     },
     ...
   ]
@@ -6954,6 +7125,10 @@ Think like a human curator:
      - If "high_only", slightly reward voices that look premium/high-quality,
        but do NOT completely discard standard if they are a great style match.
      - If "no_high", slightly prefer more neutral / standard voices.
+
+   - Model preference:
+     - If model_preference is "eleven_v3", strongly prefer voices whose high_quality_base_model_ids includes "eleven_v3".
+     - When the user asked for V3, voices without eleven_v3 support should score much lower unless nothing else fits.
 
    - Keyword coverage:
      - matched_keywords tells you which individual keywords brought this voice.
@@ -8247,11 +8422,19 @@ async function fetchVoicesByOwner(ownerId, plan, traceCb) {
     try {
       trace({ stage: 'owner_browse', params: paramsToObject(params), count: voices.length });
     } catch (_) {}
+    let out = voices || [];
+    const modelPref = plan?.model_preference || 'any';
+    if (modelPref !== 'any') {
+      out = filterVoicesByModelPreference(out, modelPref);
+      try {
+        trace({ stage: 'model_filter', params: { model: modelPref }, count: out.length });
+      } catch (_) {}
+    }
     const excludeId = (plan?.__exclude_voice_id || '').toString().trim();
     if (excludeId) {
-      return (voices || []).filter((v) => v && v.voice_id !== excludeId);
+      return out.filter((v) => v && v.voice_id !== excludeId);
     }
-    return voices || [];
+    return out;
   } catch (err) {
     safeLogAxiosError('fetchVoicesByOwner', err);
     return [];
@@ -8468,7 +8651,10 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
 
   // Existing filters
   // Bilingual: avoid constraining language to let both EN/ES candidates through
-  if (!isBilingualEnEs && language && shouldApplyParam('language', plan, userText)) params.set('language', language);
+  const langForParams = options.forceLanguage || language;
+  if ((!isBilingualEnEs || options.forceLanguage) && langForParams && shouldApplyParam('language', plan, userText)) {
+    params.set('language', langForParams);
+  }
   // If we apply an accent constraint, ensure we also set a language (accent-only queries tend to return 0).
   const ensureLanguageForAccent = (iso2) => {
     try {
@@ -8489,6 +8675,7 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   // Accent: allow Spanish Mexico heuristic even without explicit "accent"
   try {
     if (
+      !isBilingualEnEs &&
       !resolverAppliedAccent &&
       resolved &&
       resolved.variantAxis === 'accent' &&
@@ -8550,9 +8737,9 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
     }
   } else if (!resolverAppliedAccent && isSpanishSpain) {
     // Prefer locale=es-ES for Spain/European Spanish (set below in locale section)
-  } else if (!resolverAppliedAccent && language === 'zh' && chineseDialect) {
+  } else if (!resolverAppliedAccent && !isBilingualEnEs && language === 'zh' && chineseDialect) {
     // Prefer locale-based hinting for Mandarin vs Cantonese (soft)
-  } else if (!resolverAppliedAccent && accent && shouldApplyParam('accent', plan, userText)) {
+  } else if (!resolverAppliedAccent && !isBilingualEnEs && accent && shouldApplyParam('accent', plan, userText)) {
     const iso2 = (language || resolved?.targetIso2 || '').toString().toLowerCase().slice(0, 2) || null;
     // Preserve prior behavior: if we can't determine iso2, still allow accent-only filtering
     // (isAccentAllowedByCatalog(null, ...) is a graceful allow).
@@ -9229,11 +9416,14 @@ function buildSearchReport(trace, plan, mode, summary) {
       } catch (_) {}
     }
     lines.push(
-      `Plan: lang=${plan?.target_voice_language || '-'}, accent=${planAccentDisplay}, exclude_accents=${excludedAccents}, exclude_locales=${excludedLocales}, exclude_genders=${excludedGenders}, gender=${plan?.target_gender || '-'}, quality=${plan?.quality_preference || 'any'}`
+      `Plan: lang=${plan?.target_voice_language || '-'}, accent=${planAccentDisplay}, exclude_accents=${excludedAccents}, exclude_locales=${excludedLocales}, exclude_genders=${excludedGenders}, gender=${plan?.target_gender || '-'}, quality=${plan?.quality_preference || 'any'}, model=${plan?.model_preference || 'any'}`
     );
     if (summary && typeof summary === 'object') {
       lines.push('');
       lines.push(`Summary: unique_voices=${summary.unique_count ?? '-'}`);
+      if (summary.verified_en_es != null) {
+        lines.push(`Bilingual KPIs: verified_en_es=${summary.verified_en_es}, pool=${summary.unique_count ?? '-'}`);
+      }
       if (Array.isArray(summary.top_coverage) && summary.top_coverage.length) {
         const top = summary.top_coverage.slice(0, 10);
         lines.push('Top coverage (voice_id : matched_keywords_count):');
@@ -9309,6 +9499,13 @@ function buildSearchReport(trace, plan, mode, summary) {
 
     // LatAm Spanish diagnostics (derived from trace)
     try {
+      const bilingualTrace = trace.filter((t) => t && t.stage === 'bilingual_filter');
+      if (bilingualTrace.length) {
+        const last = bilingualTrace[bilingualTrace.length - 1];
+        lines.push('Bilingual:');
+        lines.push(`• verified_en_es=${last?.params?.verified_both ?? '-'} (pool before filter=${last?.params?.total_before ?? '-'})`);
+        lines.push('');
+      }
       const hasLatamAlias = trace.some(
         (t) => t?.stage === 'catalog_filters' && t?.params?.language === 'es' && t?.params?.locale_reason === 'es-419_region_alias'
       );
@@ -9521,6 +9718,33 @@ function runDevAsserts() {
   devAssert(detectBilingualEnEs('bilingual english and spanish voice'), 'bilingual: explicit bilingual keyword');
   devAssert(detectBilingualEnEs('en/es voice for IVR'), 'bilingual: en/es shorthand');
   devAssert(!detectBilingualEnEs('American English voice for a Spanish course'), 'bilingual: not inferred from unrelated English+Spanish mention');
+
+  // Bilingual: accent must not be applied to shared-voices queries
+  {
+    const params = new URLSearchParams();
+    const plan = { target_voice_language: null, target_accent: 'american', quality_preference: 'any' };
+    const q = 'female high quality native English + Latin American Spanish';
+    appendQueryFiltersToParams(params, plan, q, {
+      language: null,
+      accent: 'american',
+      gender: 'female',
+      qualityPref: 'high_only'
+    });
+    devAssert(!params.get('accent'), 'bilingual: no accent param');
+    devAssert(!params.get('language'), 'bilingual: no language param');
+  }
+
+  // voiceHasVerifiedEnAndEs
+  devAssert(
+    voiceHasVerifiedEnAndEs({
+      verified_languages: [{ language: 'en' }, { language: 'es', accent: 'latin american' }]
+    }),
+    'verified en+es: both languages present'
+  );
+  devAssert(
+    !voiceHasVerifiedEnAndEs({ verified_languages: [{ language: 'en' }] }),
+    'verified en+es: spanish missing'
+  );
 
   // One male + one female voice recommendations
   devAssert(detectOneMaleOneFemale('one male one female'), 'dual gender: one male one female');
@@ -9933,6 +10157,7 @@ async function runDevPoc() {
       target_accent: lower.includes('latam') || lower.includes('latin america') ? 'latin american' : null,
       target_gender: null,
       quality_preference: /\bhigh quality\b|\bhq\b/.test(lower) ? 'high_only' : 'any',
+      model_preference: detectModelPreferenceFromText(q) || 'any',
       tone_keywords: [],
       use_case_keywords: ['conversational'],
       character_keywords: [],
@@ -9954,6 +10179,9 @@ async function runDevPoc() {
     }
     const report = buildSearchReport(trace, enriched, 'generic', {
       unique_count: Array.isArray(voices) ? voices.length : 0,
+      verified_en_es: detectBilingualEnEs(q) && Array.isArray(voices)
+        ? voices.filter(voiceHasVerifiedEnAndEs).length
+        : undefined,
       top_coverage: []
     });
 
@@ -10917,7 +11145,13 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           }))
         : [];
       coverage.sort((a, b) => b.matchedCount - a.matchedCount);
-      const summary = { unique_count: Array.isArray(voices) ? voices.length : 0, top_coverage: coverage.slice(0, 10) };
+      const summary = {
+        unique_count: Array.isArray(voices) ? voices.length : 0,
+        top_coverage: coverage.slice(0, 10)
+      };
+      if (detectBilingualEnEs(cleaned) && Array.isArray(voices)) {
+        summary.verified_en_es = voices.filter(voiceHasVerifiedEnAndEs).length;
+      }
       let report = buildSearchReport(searchTrace, keywordPlan, special.mode, summary);
       report = await translateForUserLanguage(report, uiLang);
       const dmText = `${cleaned}\n\n${report}`;
