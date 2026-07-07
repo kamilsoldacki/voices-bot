@@ -4018,6 +4018,39 @@ function normalizeKeywordPlan(plan, userText) {
     }
   } catch (_) {}
 
+  // Drop keywords that conflict with the dominant use_case (e.g. cartoonish on conversational briefs).
+  try {
+    const useKw = Array.isArray(out.use_case_keywords) ? out.use_case_keywords : [];
+    const lower = (userText || '').toLowerCase();
+    const isConversational =
+      useKw.some((k) => /\b(conversational|support|customer|call center|contact center|ivr|agent)\b/.test(k)) ||
+      /\b(conversational|customer support|customer service|call center|contact center|ivr)\b/.test(lower);
+    if (isConversational) {
+      const deny = new Set([
+        'cartoonish',
+        'cartoon',
+        'animated',
+        'animation',
+        'character',
+        'villain',
+        'antagonist',
+        'evil',
+        'cinematic',
+        'trailer'
+      ]);
+      const prune = (arr) =>
+        Array.isArray(arr)
+          ? arr.filter((k) => {
+              const n = normalizeKw(k);
+              return !deny.has(n) || explicitlyMentionedInText(n, userText);
+            })
+          : arr;
+      out.style_keywords = prune(out.style_keywords);
+      out.character_keywords = prune(out.character_keywords);
+      out.extra_keywords = prune(out.extra_keywords);
+    }
+  } catch (_) {}
+
   return out;
 }
 
@@ -4358,6 +4391,10 @@ IMPORTANT:
     if (detectOneMaleOneFemale(userText)) {
       plan.target_gender = null;
       plan.__dualGenderOneEach = true;
+    } else if (detectBothGendersIntent(userText)) {
+      // Both genders catalog filter: do not collapse to a single target_gender.
+      plan.target_gender = null;
+      plan.__bothGendersCatalog = true;
     }
 
     return plan;
@@ -4483,6 +4520,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   let gender = null;
   if (
     !wantsOneMaleOneFemale(plan, userText) &&
+    !wantsBothGendersCatalog(plan, userText) &&
     (plan.target_gender === 'male' || plan.target_gender === 'female')
   ) {
     gender = plan.target_gender;
@@ -4822,6 +4860,9 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
       selectedKeywords = merged.slice(0, MAX_KEYWORD_QUERIES);
     }
   } catch (_) {}
+
+  // Both-genders catalog: symmetric male/female voice tokens in per_keyword searches.
+  selectedKeywords = ensureBothGenderSearchKeywords(userText, selectedKeywords, MAX_KEYWORD_QUERIES, plan);
 
   // -------------------------------------------------------------
   // LLM keyword translation/expansion (for search=) – improves recall outside EN
@@ -7612,9 +7653,66 @@ function wantsOneMaleOneFemale(plan, userText) {
   return plan?.__dualGenderOneEach === true || detectOneMaleOneFemale(userText);
 }
 
+// User wants a balanced male+female catalog (not a single-gender filter, not one-of-each).
+function detectBothGendersIntent(userText) {
+  try {
+    const lower = (userText || '').toLowerCase();
+    if (!lower) return false;
+    if (detectOneMaleOneFemale(userText)) return false;
+
+    if (/\b(?:only|just|tylko)\s+(?:male|female|m[eę]sk\w*|[zż]e[nń]sk\w*|kobiec\w*)\b/i.test(lower)) {
+      return false;
+    }
+    if (/\b(?:male|female|m[eę]sk\w*|[zż]e[nń]sk\w*|kobiec\w*)\s+only\b/i.test(lower)) return false;
+    if (/\b(?:show|poka[zż])\s+(?:only\s+)?(?:male|female|m[eę]sk\w*|[zż]e[nń]sk\w*)\b/i.test(lower)) {
+      return false;
+    }
+
+    const maleTerm = '(?:male|man|men|m[eę]sk(?:i|iego|a|ie)?|mesk(?:i|iego|a|ie)?)';
+    const femaleTerm =
+      '(?:female|woman|women|kobiec(?:a|y|e|iego)?|[zż]e[nń]sk(?:i|a|iego|ie)?|zensk(?:i|a|iego|ie)?)';
+    const conn = '\\s*(?:and|oraz|i|&)\\s*';
+    const bothOrder = new RegExp(
+      `(\\b${femaleTerm}(?:\\s+voice)?s?\\b${conn}[\\s\\S]{0,60}?\\b${maleTerm}(?:\\s+voice)?s?\\b)|` +
+        `(\\b${maleTerm}(?:\\s+voice)?s?\\b${conn}[\\s\\S]{0,60}?\\b${femaleTerm}(?:\\s+voice)?s?\\b)`,
+      'i'
+    );
+    if (bothOrder.test(lower)) return true;
+
+    if (/\b(?:both|all)\s+genders?\b/.test(lower)) return true;
+    if (/\bshow\s+both\s+genders\b/.test(lower)) return true;
+
+    return false;
+  } catch (_) {
+    return false;
+  }
+}
+
+function wantsBothGendersCatalog(plan, userText) {
+  return plan?.__bothGendersCatalog === true || detectBothGendersIntent(userText);
+}
+
+function ensureBothGenderSearchKeywords(userText, keywords, maxTotal, plan) {
+  const max = Number.isFinite(maxTotal) && maxTotal > 0 ? maxTotal : 14;
+  const list = Array.isArray(keywords) ? keywords.slice() : [];
+  if (!wantsBothGendersCatalog(plan, userText)) return list.slice(0, max);
+
+  const hasMale = list.some((k) => /\bmale\b/.test(normalizeKw(k)));
+  const hasFemale = list.some((k) => /\bfemale\b/.test(normalizeKw(k)));
+  const front = [];
+  if (!hasFemale) front.push('female voice');
+  if (!hasMale) front.push('male voice');
+  if (!front.length) return list.slice(0, max);
+  return dedupePreserveOrder([...front, ...list]).slice(0, max);
+}
+
 function getSessionGenderAndLimit(plan, userText) {
   if (wantsOneMaleOneFemale(plan, userText)) {
     return { gender: 'any', limitPerGender: 1 };
+  }
+  if (wantsBothGendersCatalog(plan, userText)) {
+    const per = detectListAll(userText) ? 12 : 5;
+    return { gender: 'any', limitPerGender: per };
   }
   const gender =
     plan?.target_gender === 'male' || plan?.target_gender === 'female' ? plan.target_gender : 'any';
@@ -9782,6 +9880,46 @@ function runDevAsserts() {
     getSessionGenderAndLimit({ target_gender: 'female' }, 'one male one female').gender === 'any',
     'dual gender: session gender stays any'
   );
+
+  // Both-genders catalog filter (balanced male+female, not one-of-each)
+  devAssert(
+    detectBothGendersIntent('conversational female and male voices for North America'),
+    'both genders: female and male voices'
+  );
+  devAssert(detectBothGendersIntent('male and female'), 'both genders: male and female');
+  devAssert(!detectBothGendersIntent('one male one female'), 'both genders: not one-of-each');
+  devAssert(!detectBothGendersIntent('only male voices'), 'both genders: single-gender filter excluded');
+  devAssert(
+    getSessionGenderAndLimit({}, 'conversational female and male voices for North America').limitPerGender === 5,
+    'both genders: balanced limitPerGender'
+  );
+  devAssert(
+    getSessionGenderAndLimit({}, 'conversational female and male voices for North America').gender === 'any',
+    'both genders: session gender stays any'
+  );
+  {
+    const kw = ensureBothGenderSearchKeywords(
+      'conversational female and male voices',
+      ['conversational', 'american'],
+      14
+    );
+    devAssert(kw.includes('female voice') && kw.includes('male voice'), 'both genders: symmetric search keywords');
+  }
+  {
+    const plan = normalizeKeywordPlan(
+      {
+        use_case_keywords: ['conversational'],
+        style_keywords: ['cartoonish', 'warm'],
+        character_keywords: ['villain'],
+        extra_keywords: ['cartoonish', 'north america']
+      },
+      'conversational female and male voices for North America'
+    );
+    devAssert(!plan.style_keywords.includes('cartoonish'), 'use_case conflict: drop cartoonish style');
+    devAssert(!plan.character_keywords.includes('villain'), 'use_case conflict: drop villain character');
+    devAssert(!plan.extra_keywords.includes('cartoonish'), 'use_case conflict: drop cartoonish extra');
+    devAssert(plan.style_keywords.includes('warm'), 'use_case conflict: keep non-conflicting style');
+  }
 
   // Locale normalization (UI aliases -> canonical)
   devAssert(normalizeRequestedLocale('PT-EU') === 'pt-PT', 'normalize PT-EU -> pt-PT');
