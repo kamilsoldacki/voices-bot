@@ -3304,6 +3304,100 @@ function detectModelPreferenceFromText(text) {
   return null;
 }
 
+function detectNoticePeriodFromText(text) {
+  if (!text) return { preference: 'any', minDays: null };
+  const lower = text
+    .replace(/[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/g, '-')
+    .toLowerCase();
+
+  const noNotice =
+    /\b(no|without|exclude|bez|brak)\s+(notice\s+period|okresu\s+wypowiedzenia|okres\s+wypowiedzenia)\b/.test(
+      lower
+    ) ||
+    /\bbez\s+notice\s+period\b/.test(lower) ||
+    /\bbrak\s+okresu\s+wypowiedzenia\b/.test(lower);
+  if (noNotice) return { preference: 'no_notice', minDays: null };
+
+  const maxNotice =
+    /\binfinity\s+voice(s)?\b/.test(lower) ||
+    /\b(max|maximum|maksymalny|maks)\s+notice\s+period\b/.test(lower) ||
+    /\b(max|maximum|maksymalny|maks)\s+okres(u)?\s+wypowiedzenia\b/.test(lower) ||
+    /\b2\s*years?\s+(notice\s+period|okresu\s+wypowiedzenia|okres\s+wypowiedzenia)\b/.test(lower) ||
+    /\b730\s+days?\s+(notice\s+period|okresu\s+wypowiedzenia)\b/.test(lower) ||
+    /\b2\s+lata\s+(wypowiedzenia|notice\s+period)\b/.test(lower);
+  if (maxNotice) return { preference: 'min_days', minDays: MAX_NOTICE_PERIOD_DAYS };
+
+  const oneYear =
+    /\b(at\s+least\s+)?1\s+year\s+(notice\s+period|okresu\s+wypowiedzenia|okres\s+wypowiedzenia)\b/.test(
+      lower
+    ) ||
+    /\b(co\s+najmniej\s+)?(1\s+)?rok(u)?\s+(wypowiedzenia|notice\s+period)\b/.test(lower) ||
+    /\b365\s+days?\s+(notice\s+period|okresu\s+wypowiedzenia)\b/.test(lower);
+  if (oneYear) return { preference: 'min_days', minDays: 365 };
+
+  const thirtyDays =
+    /\b30\s+days?\s+(notice\s+period|okresu\s+wypowiedzenia)\b/.test(lower) ||
+    /\b30\s+dni\s+(wypowiedzenia|notice\s+period)\b/.test(lower);
+  if (thirtyDays) return { preference: 'min_days', minDays: 30 };
+
+  const minDaysMatch = lower.match(
+    /\b(?:at\s+least|min(?:imum)?|co\s+najmniej)\s+(\d{1,4})\s*(?:days?|dni)\s+(?:notice\s+period|okresu\s+wypowiedzenia|okres\s+wypowiedzenia)\b/
+  );
+  if (minDaysMatch) {
+    const n = Number(minDaysMatch[1]);
+    if (Number.isFinite(n) && n > 0) {
+      return { preference: 'min_days', minDays: Math.min(n, MAX_NOTICE_PERIOD_DAYS) };
+    }
+  }
+
+  const withNotice =
+    /\b(only\s+with|with|tylko\s+z|z)\s+notice\s+period\b/.test(lower) ||
+    /\b(only\s+with|with|tylko\s+z|z)\s+okresem\s+wypowiedzenia\b/.test(lower) ||
+    /\bvoices?\s+with\s+notice\s+period\b/.test(lower) ||
+    /\bgłos(y|ów)?\s+z\s+okresem\s+wypowiedzenia\b/.test(lower);
+  if (withNotice) return { preference: 'min_days', minDays: 1 };
+
+  return { preference: 'any', minDays: null };
+}
+
+function applyNoticePeriodToPlan(plan, userText) {
+  if (!plan || typeof plan !== 'object') return plan;
+  const detected = detectNoticePeriodFromText(userText);
+
+  let preference = plan.notice_period_preference;
+  let minDays = plan.min_notice_period_days;
+
+  if (detected.preference !== 'any') {
+    preference = detected.preference;
+    minDays = detected.minDays;
+  }
+
+  if (!['any', 'min_days', 'no_notice'].includes(preference)) {
+    preference = 'any';
+  }
+
+  if (preference === 'min_days') {
+    const n = Number(minDays);
+    plan.__min_notice_period_days =
+      Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), MAX_NOTICE_PERIOD_DAYS) : 1;
+    plan.__no_notice_period = false;
+    plan.min_notice_period_days = plan.__min_notice_period_days;
+    plan.notice_period_preference = 'min_days';
+  } else if (preference === 'no_notice') {
+    plan.__min_notice_period_days = null;
+    plan.__no_notice_period = true;
+    plan.min_notice_period_days = null;
+    plan.notice_period_preference = 'no_notice';
+  } else {
+    plan.__min_notice_period_days = null;
+    plan.__no_notice_period = false;
+    plan.min_notice_period_days = null;
+    plan.notice_period_preference = 'any';
+  }
+
+  return plan;
+}
+
 // UI labels – EN only (all user-facing base text)
 // (then translated per userLanguage before sending)
 function getLabels() {
@@ -3363,12 +3457,109 @@ async function translateNoResultsWithOwnerHint(uiLang, plan) {
   return t;
 }
 
-function formatVoiceLine(voice) {
+const MAX_NOTICE_PERIOD_DAYS = 730;
+
+function formatNoticePeriodLabel(voice, uiLang) {
+  if (!voice || !Object.prototype.hasOwnProperty.call(voice, 'notice_period')) return '';
+  const days = voice.notice_period;
+  const lang = (uiLang || 'en').toString().slice(0, 2).toLowerCase();
+  if (days == null) {
+    return lang === 'pl' ? 'brak notice period' : 'no notice period';
+  }
+  if (typeof days === 'number' && days > 0) {
+    return lang === 'pl' ? `${days} dni notice period` : `${days} days notice period`;
+  }
+  return '';
+}
+
+function formatVoiceLine(voice, uiLang) {
   const url = `https://elevenlabs.io/app/voice-library?search=${encodeURIComponent(
     voice.voice_id
   )}`;
   const name = hasCustomRateMultiplier(voice) ? `💲${voice.name}` : voice.name;
-  return `<${url}|${name}> \`${voice.voice_id}\``;
+  let line = `<${url}|${name}> \`${voice.voice_id}\``;
+  const npLabel = formatNoticePeriodLabel(voice, uiLang);
+  if (npLabel) line += ` — ${npLabel}`;
+  return line;
+}
+
+function filterVoicesByNoticePeriod(voices, filtersOrPlan) {
+  const src = Array.isArray(voices) ? voices : [];
+  if (!src.length || !filtersOrPlan) return voices;
+
+  const noNotice =
+    filtersOrPlan.noNoticePeriod === true || filtersOrPlan.__no_notice_period === true;
+  const minDaysRaw =
+    filtersOrPlan.minNoticePeriodDays != null
+      ? filtersOrPlan.minNoticePeriodDays
+      : filtersOrPlan.__min_notice_period_days;
+  const minDays = typeof minDaysRaw === 'number' ? Math.floor(minDaysRaw) : null;
+
+  const applyList = (list) => {
+    const arr = Array.isArray(list) ? list : [];
+    if (!arr.length) return arr;
+    if (noNotice) {
+      const filtered = arr.filter((v) => v && v.notice_period == null);
+      return filtered.length ? filtered : arr;
+    }
+    if (minDays > 0) {
+      const filtered = arr.filter(
+        (v) => typeof v?.notice_period === 'number' && v.notice_period >= minDays
+      );
+      return filtered.length ? filtered : arr;
+    }
+    return arr;
+  };
+
+  if (!noNotice && !(minDays > 0)) return voices;
+
+  const out = applyList(src);
+  if (Array.isArray(voices) && Array.isArray(voices.facetGroups) && voices.facetGroups.length) {
+    const copy = [...out];
+    copy.facetGroups = voices.facetGroups
+      .map((g) => ({
+        ...g,
+        voices: applyList(g?.voices)
+      }))
+      .filter((g) => Array.isArray(g.voices) && g.voices.length);
+    if (voices.facetAxis) copy.facetAxis = voices.facetAxis;
+    if (voices.facetIso2) copy.facetIso2 = voices.facetIso2;
+    if (voices.variantIntent) copy.variantIntent = voices.variantIntent;
+    return copy;
+  }
+  return out;
+}
+
+function buildSessionNoticeFilters(keywordPlan) {
+  const noNotice = keywordPlan?.__no_notice_period === true;
+  return {
+    minNoticePeriodDays:
+      noNotice || typeof keywordPlan?.__min_notice_period_days !== 'number'
+        ? null
+        : keywordPlan.__min_notice_period_days,
+    noNoticePeriod: noNotice
+  };
+}
+
+function applySessionNoticeFiltersToPlan(plan, filters) {
+  if (!plan || !filters) return plan;
+  if (filters.noNoticePeriod === true) {
+    plan.__no_notice_period = true;
+    plan.__min_notice_period_days = null;
+    plan.notice_period_preference = 'no_notice';
+    plan.min_notice_period_days = null;
+  } else if (typeof filters.minNoticePeriodDays === 'number' && filters.minNoticePeriodDays > 0) {
+    plan.__no_notice_period = false;
+    plan.__min_notice_period_days = filters.minNoticePeriodDays;
+    plan.notice_period_preference = 'min_days';
+    plan.min_notice_period_days = filters.minNoticePeriodDays;
+  } else {
+    plan.__no_notice_period = false;
+    plan.__min_notice_period_days = null;
+    plan.notice_period_preference = 'any';
+    plan.min_notice_period_days = null;
+  }
+  return plan;
 }
 
 function voiceNameDedupeKey(voice) {
@@ -3687,6 +3878,42 @@ function applyFilterChangesFromText(session, lower) {
     }
   }
 
+  // notice period
+  const noticeDetected = detectNoticePeriodFromText(lower);
+  if (noticeDetected.preference === 'no_notice') {
+    if (session.filters.noNoticePeriod !== true || session.filters.minNoticePeriodDays != null) {
+      session.filters.noNoticePeriod = true;
+      session.filters.minNoticePeriodDays = null;
+      changed = true;
+    }
+  } else if (noticeDetected.preference === 'min_days') {
+    const minDays = noticeDetected.minDays || 1;
+    if (
+      session.filters.noNoticePeriod !== false ||
+      session.filters.minNoticePeriodDays !== minDays
+    ) {
+      session.filters.noNoticePeriod = false;
+      session.filters.minNoticePeriodDays = minDays;
+      serverChanged = true;
+      changed = true;
+    }
+  }
+  if (
+    lower.includes('clear notice period') ||
+    lower.includes('remove notice period') ||
+    lower.includes('any notice period') ||
+    lower.includes('bez filtra notice period') ||
+    lower.includes('usuń filtr notice period') ||
+    lower.includes('usun filtr notice period')
+  ) {
+    if (session.filters.noNoticePeriod || session.filters.minNoticePeriodDays != null) {
+      session.filters.noNoticePeriod = false;
+      session.filters.minNoticePeriodDays = null;
+      serverChanged = true;
+      changed = true;
+    }
+  }
+
   // age (child/young/adult/old)
   const newAge = detectAgeFromText(lower);
   if (newAge && session.filters.age !== newAge) {
@@ -3811,6 +4038,8 @@ async function refineKeywordPlanFromFollowUp(existingPlan, followUpText) {
   if (oidFollow) {
     base.__owner_id = oidFollow.toLowerCase();
   }
+
+  applyNoticePeriodToPlan(base, followUpText);
 
   return typeof normalizeKeywordPlan === 'function' ? normalizeKeywordPlan(base, followUpText) : base;
 }
@@ -3998,6 +4227,8 @@ function normalizeKeywordPlan(plan, userText) {
     out.model_preference = 'any';
   }
 
+  applyNoticePeriodToPlan(out, userText);
+
   // sanitize gender
   if (out.target_gender !== 'male' && out.target_gender !== 'female' && out.target_gender !== 'neutral') {
     out.target_gender = null;
@@ -4170,6 +4401,8 @@ The JSON MUST have exactly these fields:
   "target_gender": "male" | "female" | "neutral" | null,
   "quality_preference": "any" | "high_only" | "no_high",
   "model_preference": "any" | "eleven_v3",
+  "notice_period_preference": "any" | "min_days" | "no_notice",
+  "min_notice_period_days": integer or null,
 
   "tone_keywords": string[],
   "use_case_keywords": string[],
@@ -4207,6 +4440,22 @@ RULES:
   - "eleven_v3" when the user explicitly asks for ElevenLabs V3 / eleven v3 / V3 model support
     (e.g. "with V3 model", "eleven v3 voices", "na modelu V3").
   - "any" in all other cases (including when the user only says "best" or "top" without mentioning V3).
+
+- notice_period_preference:
+  - "min_days" when the user wants voices with a minimum notice period (e.g. "infinity voice", "max notice period",
+    "2 years notice", "at least 1 year notice period", "with notice period", "only with notice period",
+    Polish: "z okresem wypowiedzenia", "maksymalny okres wypowiedzenia", "2 lata wypowiedzenia").
+  - "no_notice" when the user explicitly wants voices WITHOUT a notice period
+    (e.g. "no notice period", "without notice period", Polish: "bez okresu wypowiedzenia", "bez notice period").
+  - "any" in all other cases.
+
+- min_notice_period_days:
+  - When notice_period_preference is "min_days", set the minimum days:
+    - 730 for "infinity voice", "max notice period", "2 years notice"
+    - 365 for "1 year notice period" / "at least 1 year"
+    - 30 for "30 days notice"
+    - 1 for generic "with notice period" / "only with notice period"
+  - null when notice_period_preference is not "min_days".
 
 - tone_keywords:
   - Many short English adjectives (1–3 words) describing tone and pacing:
@@ -4394,11 +4643,13 @@ IMPORTANT:
     if (detectOneMaleOneFemale(userText)) {
       plan.target_gender = null;
       plan.__dualGenderOneEach = true;
-    } else if (detectBothGendersIntent(userText)) {
+    } else     if (detectBothGendersIntent(userText)) {
       // Both genders catalog filter: do not collapse to a single target_gender.
       plan.target_gender = null;
       plan.__bothGendersCatalog = true;
     }
+
+    applyNoticePeriodToPlan(plan, userText);
 
     return plan;
   } catch (error) {
@@ -4407,19 +4658,22 @@ IMPORTANT:
     const qp = detectQualityPreferenceFromText(userText);
     const mp = detectModelPreferenceFromText(userText);
 
-    return {
+    const fallback = {
       user_interface_language: guessUiLanguageFromText(userText),
       target_voice_language: detectVoiceLanguageFromText(userText),
       target_accent: null,
       target_gender: null,
       quality_preference: qp || 'any',
       model_preference: mp || 'any',
+      notice_period_preference: 'any',
+      min_notice_period_days: null,
       tone_keywords: [],
       use_case_keywords: [],
       character_keywords: [],
       style_keywords: [],
       extra_keywords: [userText.toLowerCase()]
     };
+    return applyNoticePeriodToPlan(fallback, userText);
   }
 }
 
@@ -5064,6 +5318,12 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
         const wantMore = detectListAll(userText) === true || plan.__listAll === true;
         const pageSize = wantMore ? 80 : 50;
         const featured = plan.__featured === true;
+        const minNoticePeriodDays =
+          plan.__no_notice_period === true
+            ? null
+            : typeof plan.__min_notice_period_days === 'number'
+              ? plan.__min_notice_period_days
+              : null;
         const sort = typeof plan.__sort === 'string' ? plan.__sort : null;
         const age = detectAgeFromText(userText);
 
@@ -5128,6 +5388,9 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             if (gender) base.set('gender', gender);
             if (qualityPref === 'high_only') base.set('category', 'high_quality');
             if (featured) base.set('featured', 'true');
+            if (typeof minNoticePeriodDays === 'number' && minNoticePeriodDays > 0) {
+              base.set('min_notice_period_days', String(minNoticePeriodDays));
+            }
             if (age) base.set('age', age);
             if (sort) base.set('sort', sort);
             // pass 1: no search
@@ -5229,6 +5492,9 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             if (gender) base.set('gender', gender);
             if (qualityPref === 'high_only') base.set('category', 'high_quality');
             if (featured) base.set('featured', 'true');
+            if (typeof minNoticePeriodDays === 'number' && minNoticePeriodDays > 0) {
+              base.set('min_notice_period_days', String(minNoticePeriodDays));
+            }
             if (age) base.set('age', age);
             if (sort) base.set('sort', sort);
 
@@ -5310,6 +5576,9 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
           allVoices.facetAxis = axis;
           allVoices.facetIso2 = language;
           allVoices.variantIntent = variantIntent;
+          if (plan.__no_notice_period === true || plan.__min_notice_period_days > 0) {
+            return filterVoicesByNoticePeriod(allVoices, plan);
+          }
           return allVoices;
         }
       }
@@ -6458,6 +6727,23 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     } catch (_) {}
   }
 
+  if (plan.__no_notice_period === true || plan.__min_notice_period_days > 0) {
+    const beforeNotice = voices.length;
+    voices = filterVoicesByNoticePeriod(voices, plan);
+    try {
+      trace({
+        stage: 'notice_period_filter',
+        params: {
+          no_notice: String(plan.__no_notice_period === true),
+          min_days: String(plan.__min_notice_period_days ?? '-'),
+          before: String(beforeNotice),
+          after: String(voices.length)
+        },
+        count: voices.length
+      });
+    } catch (_) {}
+  }
+
   // Candidate ranking prep: coverage score + diversity seeding before cap
   const chineseDialect = language === 'zh' ? detectChineseDialectFromText(userText) : null;
   const preferredZhLocales = preferredLocalesForChineseDialect(chineseDialect).map((x) => String(x).toLowerCase());
@@ -7105,6 +7391,9 @@ async function rankVoicesWithGPT(userText, keywordPlan, voices) {
         v.usage_character_count_1y || v.usage_character_count_7d || null,
       matched_keywords: Array.isArray(v._matched_keywords) ? v._matched_keywords : []
     };
+    if (Object.prototype.hasOwnProperty.call(v, 'notice_period')) {
+      entry.notice_period = v.notice_period;
+    }
     if (wantsModelInfo) {
       entry.high_quality_base_model_ids = Array.isArray(v.high_quality_base_model_ids)
         ? v.high_quality_base_model_ids.slice(0, 8)
@@ -7141,6 +7430,7 @@ You will receive:
       "category": string or null,
       "usage_character_count_1y": number or null,
       "matched_keywords": string[],
+      "notice_period": integer or null (optional; days required before cloning, null = no notice period),
       "high_quality_base_model_ids": string[] (optional; present when user asked for a specific model)
     },
     ...
@@ -7186,6 +7476,11 @@ Think like a human curator:
    - Model preference:
      - If model_preference is "eleven_v3", strongly prefer voices whose high_quality_base_model_ids includes "eleven_v3".
      - When the user asked for V3, voices without eleven_v3 support should score much lower unless nothing else fits.
+
+   - Notice period preference:
+     - If notice_period_preference is "min_days", strongly prefer voices whose notice_period meets or exceeds min_notice_period_days.
+     - If notice_period_preference is "no_notice", strongly prefer voices with notice_period null (no notice period).
+     - Higher notice_period (e.g. 730 days) is better when the user asked for "infinity voice" or max notice period.
 
    - Keyword coverage:
      - matched_keywords tells you which individual keywords brought this voice.
@@ -7323,14 +7618,15 @@ Every candidate_voices.voice_id MUST appear exactly once in "ranking".
 // -------------------------------------------------------------
 
 function buildMessageFromSession(session) {
-  const { voices, ranking, filters, originalQuery } = session;
+  const { voices, ranking, filters, originalQuery, uiLanguage } = session;
   const labels = getLabels();
+  const noticeFilteredVoices = filterVoicesByNoticePeriod(voices, filters);
 
   // Facet sections (locale/accent) – UI-like grouping
   try {
-    const facetGroups = voices && Array.isArray(voices.facetGroups) ? voices.facetGroups : null;
-    const facetAxis = voices && typeof voices.facetAxis === 'string' ? voices.facetAxis : null;
-    const variantIntent = voices && typeof voices.variantIntent === 'object' ? voices.variantIntent : null;
+    const facetGroups = noticeFilteredVoices && Array.isArray(noticeFilteredVoices.facetGroups) ? noticeFilteredVoices.facetGroups : null;
+    const facetAxis = noticeFilteredVoices && typeof noticeFilteredVoices.facetAxis === 'string' ? noticeFilteredVoices.facetAxis : null;
+    const variantIntent = noticeFilteredVoices && typeof noticeFilteredVoices.variantIntent === 'object' ? noticeFilteredVoices.variantIntent : null;
     if (facetGroups && facetGroups.length) {
       const maxPerGender =
         Number.isFinite(filters.limitPerGender) && filters.limitPerGender > 0
@@ -7380,7 +7676,7 @@ function buildMessageFromSession(session) {
           for (const v of arr) {
             const isHq = isHighQuality(v);
             const prefix = qualityFilter === 'any' && isHq ? '[HQ] ' : '';
-            out.push(`- ${prefix}${formatVoiceLine(v)}`);
+            out.push(`- ${prefix}${formatVoiceLine(v, uiLanguage)}`);
           }
           out.push('');
         }
@@ -7418,7 +7714,7 @@ function buildMessageFromSession(session) {
       ? filters.limitPerGender
       : (filters.listAll ? 50 : 6);
 
-  const sorted = [...voices].sort(
+  const sorted = [...noticeFilteredVoices].sort(
     (a, b) => (ranking[b.voice_id] || 0) - (ranking[a.voice_id] || 0)
   );
 
@@ -7492,7 +7788,7 @@ function buildMessageFromSession(session) {
       const arr = groups[key];
       lines.push(`*${label}:*`);
       arr.forEach((v) => {
-        lines.push(`- ${formatVoiceLine(v)}`);
+        lines.push(`- ${formatVoiceLine(v, uiLanguage)}`);
       });
       lines.push('');
     });
@@ -8325,6 +8621,14 @@ function shouldApplyParam(kind, plan, userText, flags = {}) {
       if (flags.featured === true || plan?.__featured === true) return true;
       return false;
     }
+    case 'min_notice_period_days': {
+      const minDays =
+        typeof flags.minNoticePeriodDays === 'number'
+          ? flags.minNoticePeriodDays
+          : plan?.__min_notice_period_days;
+      if (typeof minDays === 'number' && minDays > 0 && plan?.__no_notice_period !== true) return true;
+      return false;
+    }
     case 'sort': {
       if (typeof flags.sort === 'string' || typeof plan?.__sort === 'string') return true;
       return false;
@@ -8550,8 +8854,9 @@ async function fetchVoicesByOwner(ownerId, plan, traceCb) {
     }
     const excludeId = (plan?.__exclude_voice_id || '').toString().trim();
     if (excludeId) {
-      return out.filter((v) => v && v.voice_id !== excludeId);
+      out = out.filter((v) => v && v.voice_id !== excludeId);
     }
+    out = filterVoicesByNoticePeriod(out, plan);
     return out;
   } catch (err) {
     safeLogAxiosError('fetchVoicesByOwner', err);
@@ -8595,7 +8900,8 @@ async function handleCreatorVoicesBrowse(plan, userText, traceCb, options = {}) 
       sort: plan.__sort || null,
       strictUseCase: plan.__forceUseCases === true,
       strictDescriptives: plan.__forceDescriptives === true,
-      limitPerGender: genderLimit.limitPerGender
+      limitPerGender: genderLimit.limitPerGender,
+      ...buildSessionNoticeFilters(plan)
     },
     lastActive: Date.now()
   };
@@ -8609,6 +8915,12 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   const gender = options.gender || null;
   const qualityPref = options.qualityPref || 'any';
   const featured = options.featured === true ? true : false;
+  const minNoticePeriodDays =
+    typeof options.minNoticePeriodDays === 'number'
+      ? options.minNoticePeriodDays
+      : typeof plan?.__min_notice_period_days === 'number'
+        ? plan.__min_notice_period_days
+        : null;
   const sort = typeof options.sort === 'string' ? options.sort : null;
   const forceUseCases = options.forceUseCases === true;
   const forceDescriptives = options.forceDescriptives === true;
@@ -9033,6 +9345,14 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   } catch (_) {}
 
   if (featured && shouldApplyParam('featured', plan, userText, { featured })) params.set('featured', 'true');
+  if (
+    typeof minNoticePeriodDays === 'number' &&
+    minNoticePeriodDays > 0 &&
+    plan?.__no_notice_period !== true &&
+    shouldApplyParam('min_notice_period_days', plan, userText, { minNoticePeriodDays })
+  ) {
+    params.set('min_notice_period_days', String(minNoticePeriodDays));
+  }
   if (age && shouldApplyParam('age', plan, userText)) params.set('age', age);
   if (sort && shouldApplyParam('sort', plan, userText, { sort })) params.set('sort', sort);
 
@@ -9041,6 +9361,7 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
     descriptives,
     locale: loc,
     featured,
+    minNoticePeriodDays,
     age,
     sort,
     localeInferred: Boolean(isSpanishMexico || isSpanishLatam || isSpanishSpain || isFrenchEuropean || isFrenchCanadian || (language === 'zh' && chineseDialect)),
@@ -9534,7 +9855,7 @@ function buildSearchReport(trace, plan, mode, summary) {
       } catch (_) {}
     }
     lines.push(
-      `Plan: lang=${plan?.target_voice_language || '-'}, accent=${planAccentDisplay}, exclude_accents=${excludedAccents}, exclude_locales=${excludedLocales}, exclude_genders=${excludedGenders}, gender=${plan?.target_gender || '-'}, quality=${plan?.quality_preference || 'any'}, model=${plan?.model_preference || 'any'}`
+      `Plan: lang=${plan?.target_voice_language || '-'}, accent=${planAccentDisplay}, exclude_accents=${excludedAccents}, exclude_locales=${excludedLocales}, exclude_genders=${excludedGenders}, gender=${plan?.target_gender || '-'}, quality=${plan?.quality_preference || 'any'}, model=${plan?.model_preference || 'any'}, notice=${plan?.__no_notice_period ? 'none' : (plan?.__min_notice_period_days ?? 'any')}`
     );
     if (summary && typeof summary === 'object') {
       lines.push('');
@@ -10332,6 +10653,54 @@ function runDevAsserts() {
       'extractVoiceIdForOwnerLookup: bare id after who has'
     );
   }
+
+  // Notice period intent + query param
+  {
+    const infinity = detectNoticePeriodFromText('find an infinity voice for narration');
+    devAssert(infinity.preference === 'min_days' && infinity.minDays === MAX_NOTICE_PERIOD_DAYS, 'notice: infinity voice -> 730');
+
+    const oneYear = detectNoticePeriodFromText('polish female with at least 1 year notice period');
+    devAssert(oneYear.preference === 'min_days' && oneYear.minDays === 365, 'notice: 1 year -> 365');
+
+    const withNp = detectNoticePeriodFromText('only with notice period');
+    devAssert(withNp.preference === 'min_days' && withNp.minDays === 1, 'notice: with notice period -> 1');
+
+    const noNp = detectNoticePeriodFromText('bez okresu wypowiedzenia');
+    devAssert(noNp.preference === 'no_notice', 'notice: PL bez okresu wypowiedzenia');
+
+    const planInfinity = applyNoticePeriodToPlan({}, 'max notice period voice');
+    const pInf = new URLSearchParams();
+    appendQueryFiltersToParams(pInf, planInfinity, 'max notice period voice', {
+      language: 'en',
+      accent: null,
+      gender: null,
+      qualityPref: 'any',
+      minNoticePeriodDays: planInfinity.__min_notice_period_days
+    });
+    devAssert(
+      pInf.get('min_notice_period_days') === String(MAX_NOTICE_PERIOD_DAYS),
+      'notice: appendQueryFiltersToParams sets min_notice_period_days'
+    );
+
+    const voices = [
+      { voice_id: 'a', notice_period: 730 },
+      { voice_id: 'b', notice_period: null },
+      { voice_id: 'c', notice_period: 30 }
+    ];
+    const filteredMin = filterVoicesByNoticePeriod(voices, { __min_notice_period_days: 365 });
+    devAssert(filteredMin.length === 1 && filteredMin[0].voice_id === 'a', 'notice: client min-days filter');
+    const filteredNone = filterVoicesByNoticePeriod(voices, { __no_notice_period: true });
+    devAssert(filteredNone.length === 1 && filteredNone[0].voice_id === 'b', 'notice: client no-notice filter');
+
+    devAssert(
+      formatVoiceLine({ voice_id: 'x', name: 'Test', notice_period: 730 }, 'pl').includes('730 dni notice period'),
+      'notice: formatVoiceLine PL label'
+    );
+    devAssert(
+      formatVoiceLine({ voice_id: 'y', name: 'Test', notice_period: null }, 'pl').includes('brak notice period'),
+      'notice: formatVoiceLine PL no-notice label'
+    );
+  }
 }
 
 async function runDevPoc() {
@@ -10684,7 +11053,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
                       sort: null,
                       strictUseCase: false,
                       strictDescriptives: false,
-                      limitPerGender: genderLimit.limitPerGender
+                      limitPerGender: genderLimit.limitPerGender,
+                      ...buildSessionNoticeFilters(keywordPlan)
                     };
                   })(),
                   lastActive: Date.now()
@@ -10743,7 +11113,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
                     sort: null,
                     strictUseCase: false,
                     strictDescriptives: false,
-                    limitPerGender: genderLimit.limitPerGender
+                    limitPerGender: genderLimit.limitPerGender,
+                    ...buildSessionNoticeFilters(keywordPlan)
                   };
                 })(),
                 lastActive: Date.now()
@@ -10811,7 +11182,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
               listAll: detectListAll(partText),
               featured: false,
               sort: null,
-              limitPerGender: genderLimit.limitPerGender
+              limitPerGender: genderLimit.limitPerGender,
+              ...buildSessionNoticeFilters(subPlan)
             },
             lastActive: Date.now()
           }
@@ -10913,7 +11285,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
               listAll: detectListAll(part),
               featured: false,
               sort: null,
-              limitPerGender: genderLimit.limitPerGender
+              limitPerGender: genderLimit.limitPerGender,
+              ...buildSessionNoticeFilters(subPlan)
             },
             lastActive: Date.now()
           }
@@ -11002,7 +11375,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           sort: null,
           strictUseCase: false,
           strictDescriptives: false,
-          limitPerGender: genderLimit.limitPerGender
+          limitPerGender: genderLimit.limitPerGender,
+          ...buildSessionNoticeFilters(keywordPlan)
         },
         lastActive: Date.now()
       };
@@ -11257,7 +11631,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         sort: null,
         strictUseCase: false,
         strictDescriptives: false,
-        limitPerGender: genderLimit.limitPerGender
+        limitPerGender: genderLimit.limitPerGender,
+        ...buildSessionNoticeFilters(keywordPlan)
       },
       lastActive: Date.now()
     };
@@ -11442,6 +11817,7 @@ if (!DEV_ASSERTS_ENABLED && !isDevPocEnabled()) {
         plan.__listAll = existing.filters.listAll === true;
         plan.__forceUseCases = existing.filters.strictUseCase === true;
         plan.__forceDescriptives = existing.filters.strictDescriptives === true;
+        applySessionNoticeFiltersToPlan(plan, existing.filters);
 
         const searchTrace = [];
         const traceCb = (entry) => { try { searchTrace.push(entry); } catch (_) {} };
@@ -11527,6 +11903,7 @@ if (!DEV_ASSERTS_ENABLED && !isDevPocEnabled()) {
         plan.__listAll = existing.filters.listAll === true;
         plan.__forceUseCases = existing.filters.strictUseCase === true;
         plan.__forceDescriptives = existing.filters.strictDescriptives === true;
+        applySessionNoticeFiltersToPlan(plan, existing.filters);
 
         const voices = await fetchVoicesByKeywords(plan, existing.originalQuery, traceCb);
         if (!voices.length) {
@@ -11570,6 +11947,7 @@ if (!DEV_ASSERTS_ENABLED && !isDevPocEnabled()) {
       refinedPlan.__sort = existing.filters.sort || null;
       refinedPlan.__listAll = existing.filters.listAll === true;
       refinedPlan.__forceUseCases = existing.filters.strictUseCase === true;
+      applySessionNoticeFiltersToPlan(refinedPlan, existing.filters);
       const combinedQuery = [existing.originalQuery || '', cleaned].join(' ').trim();
       const searchTrace = [];
       const traceCb = (entry) => {
@@ -11709,6 +12087,7 @@ app.action('toggle_featured', async ({ ack, body, client }) => {
     plan.__featured = session.filters.featured === true;
     plan.__sort = session.filters.sort || null;
     plan.__listAll = session.filters.listAll === true;
+    applySessionNoticeFiltersToPlan(plan, session.filters);
 
     const searchTrace = [];
     const traceCb = (e) => { try { searchTrace.push(e); } catch (_) {} };
@@ -11755,6 +12134,7 @@ app.action('show_more', async ({ ack, body, client }) => {
     plan.__featured = session.filters.featured === true;
     plan.__sort = session.filters.sort || null;
     plan.__listAll = true;
+    applySessionNoticeFiltersToPlan(plan, session.filters);
 
     const searchTrace = [];
     const traceCb = (e) => { try { searchTrace.push(e); } catch (_) {} };
