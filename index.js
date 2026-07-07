@@ -1271,6 +1271,8 @@ const ACCENT_ALIASES = new Map([
   ['general_american', 'american'],
   ['us', 'american'],
   ['usa', 'american'],
+  ['north america', 'american'],
+  ['north american', 'american'],
   ['american', 'american'],
   ['texan', 'american'],
   ['southern', 'american'],
@@ -1385,6 +1387,8 @@ function detectGccArabicVoiceIntent(userText) {
 
 function hasRegionalKeywordFocus(lowerOrText) {
   const lower = (lowerOrText || '').toString().toLowerCase();
+  if (/\bnorth\s+america(n)?\b/.test(lower)) return true;
+  if (/\b(usa|u\.s\.a\.|united states)\b/.test(lower)) return true;
   if (
     /\b(texan|southern|american|british|australian|mexican|irish|scottish|canadian|castilian|brazilian)\b/i.test(
       lower
@@ -1459,6 +1463,12 @@ function parseUserLanguageHints(userText) {
   }
 
   // 4b) accent terms that imply a language
+  if (/\bnorth\s+america(n)?\b/.test(lower)) {
+    return { iso2: 'en', locale: null, explicit: true, reason: 'north_america_region' };
+  }
+  if (/\b(usa|u\.s\.a\.|united states)\b/.test(lower)) {
+    return { iso2: 'en', locale: null, explicit: true, reason: 'us_region' };
+  }
   const ACCENT_IMPLIES_LANGUAGE = new Map([
     ['texan', 'en'],
     ['southern', 'en'],
@@ -2262,6 +2272,8 @@ function hasExplicitAccentMention(userText) {
   const implicit = [
     'general american',
     'standard american',
+    'north america',
+    'north american',
     'texan',
     'southern',
     'american',
@@ -4319,10 +4331,11 @@ IMPORTANT:
       plan.__excludedGenders = Array.isArray(plan.__excludedGenders) ? plan.__excludedGenders : [];
     }
 
-    // Accent as soft preference unless explicitly mentioned by user (or GCC regional intent)
+    // Accent as soft preference unless explicitly mentioned by user (or GCC / regional intent)
     const gccIntent = detectGccArabicVoiceIntent(userText);
+    const regionalHint = hasRegionalKeywordFocus(userText);
     const explicitAccent = hasExplicitAccentMention(userText);
-    if (!explicitAccent && !gccIntent) {
+    if (!explicitAccent && !gccIntent && !regionalHint) {
       plan.target_accent = null;
     } else if (gccIntent && (!plan.target_accent || !String(plan.target_accent).trim())) {
       plan.target_accent = gccIntent.accent;
@@ -4330,7 +4343,7 @@ IMPORTANT:
 
     // If user didn't explicitly mention a language, don't constrain by language
     const explicitLanguage = hasExplicitLanguageMention(userText);
-    if (!explicitLanguage && !gccIntent) {
+    if (!explicitLanguage && !gccIntent && !regionalHint) {
       plan.target_voice_language = null;
     } else if (gccIntent && (!plan.target_voice_language || String(plan.target_voice_language).toLowerCase().slice(0, 2) === 'ar')) {
       plan.target_voice_language = 'ar';
@@ -7572,7 +7585,6 @@ function detectOneMaleOneFemale(userText) {
     const femaleTerm =
       '(?:female|woman|women|kobiec(?:a|y|e|iego)?|[zż]e[nń]sk(?:i|a|iego|ie)?|zensk(?:i|a|iego|ie)?)';
     const qty = '(?:one|1|a|an|jedn(?:a|y|e|ego)?|po\\s+jedn(?:ym|ej)?)';
-    const connector = '(?:and|&|oraz|,|\\bi\\b)';
 
     const oneEach = new RegExp(
       `\\b${qty}\\s+${maleTerm}\\b[\\s\\S]{0,40}?\\b${qty}\\s+${femaleTerm}\\b|` +
@@ -7583,13 +7595,8 @@ function detectOneMaleOneFemale(userText) {
 
     if (/\b(?:one|1)\s+male\s+(?:one|1)\s+female\b/i.test(lower)) return true;
     if (/\b(?:one|1)\s+female\s+(?:one|1)\s+male\b/i.test(lower)) return true;
-
-    const pairPattern = new RegExp(
-      `${maleTerm}[\\s\\S]{0,40}?\\b${connector}\\b[\\s\\S]{0,40}?${femaleTerm}|` +
-        `${femaleTerm}[\\s\\S]{0,40}?\\b${connector}\\b[\\s\\S]{0,40}?${maleTerm}`,
-      'i'
-    );
-    if (pairPattern.test(lower)) return true;
+    if (/\bone\s+of\s+each\b/i.test(lower)) return true;
+    if (/\bpo\s+jedn\w*\s+z\s+ka[żz]de[jw]\b/i.test(lower)) return true;
 
     // Polish shorthand without ASCII word boundaries (JS \\b breaks on ę/ż).
     if (/\bm[eę]sk\w*\s+(?:i|oraz)\s+[zż]e[nń]sk\w*/i.test(lower)) return true;
@@ -9426,9 +9433,10 @@ function buildSearchReport(trace, plan, mode, summary) {
       }
       if (Array.isArray(summary.top_coverage) && summary.top_coverage.length) {
         const top = summary.top_coverage.slice(0, 10);
-        lines.push('Top coverage (voice_id : matched_keywords_count):');
+        lines.push('Top coverage (voice_id | name | accent | gender : matched_keywords_count):');
         top.forEach((t) => {
-          lines.push(`• ${t.voice_id}: ${t.matchedCount}`);
+          const meta = [t.name, t.accent, t.gender].filter(Boolean).join(' | ') || '-';
+          lines.push(`• ${t.voice_id} | ${meta}: ${t.matchedCount}`);
         });
       }
     }
@@ -9706,6 +9714,10 @@ function runDevAsserts() {
   const hGccQa = parseUserLanguageHints('best Qatari voice');
   devAssert(hGccQa.iso2 === 'ar' && hGccQa.reason === 'gcc_region', 'GCC: Qatari -> ar');
 
+  const hNa = parseUserLanguageHints('conversational female and male voices for North America');
+  devAssert(hNa.iso2 === 'en' && hNa.reason === 'north_america_region', 'North America -> en');
+  devAssert(hasExplicitAccentMention('voices for North America'), 'North America is explicit accent');
+
   // Bilingual EN+ES: explicit word, en/es, and language-pair connectors (+, and, comma)
   devAssert(
     detectBilingualEnEs('high quality native English + Latin American Spanish, one male one female'),
@@ -9749,7 +9761,11 @@ function runDevAsserts() {
   // One male + one female voice recommendations
   devAssert(detectOneMaleOneFemale('one male one female'), 'dual gender: one male one female');
   devAssert(detectOneMaleOneFemale('one male, one female voice'), 'dual gender: comma separated');
-  devAssert(detectOneMaleOneFemale('male and female'), 'dual gender: male and female');
+  devAssert(!detectOneMaleOneFemale('male and female'), 'dual gender: male and female is catalog filter only');
+  devAssert(
+    !detectOneMaleOneFemale('conversational female and male voices for North America'),
+    'dual gender: both-gender catalog filter'
+  );
   devAssert(detectOneMaleOneFemale('męski i żeński'), 'dual gender: Polish męski i żeński');
   devAssert(
     detectOneMaleOneFemale('high quality native English + Latin American Spanish, one male one female'),
@@ -11141,6 +11157,9 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
       const coverage = Array.isArray(voices)
         ? voices.map((v) => ({
             voice_id: v.voice_id,
+            name: v.name || null,
+            accent: v.accent || null,
+            gender: v.gender || null,
             matchedCount: Array.isArray(v._matched_keywords) ? v._matched_keywords.length : 0
           }))
         : [];
@@ -11455,6 +11474,9 @@ if (!DEV_ASSERTS_ENABLED && !isDevPocEnabled()) {
         const coverage = Array.isArray(voices)
           ? voices.map((v) => ({
               voice_id: v.voice_id,
+              name: v.name || null,
+              accent: v.accent || null,
+              gender: v.gender || null,
               matchedCount: Array.isArray(v._matched_keywords) ? v._matched_keywords.length : 0
             }))
           : [];
