@@ -3199,10 +3199,7 @@ function buildVerifiedFallbackMessage(voices, ranking, iso2, requestedLocale, li
   const header = `\`\`\`ALSO VERIFIED FOR ${String(iso2 || '').toUpperCase()}${locSuffix} (may not sound primary)\`\`\``;
 
   const lines = [header];
-  if (max === 0) {
-    lines.push(labels.noVoices);
-    return lines.join('\n');
-  }
+  if (max === 0) return '';
   for (let i = 0; i < max; i++) {
     lines.push(`- ${formatVoiceLine(sorted[i])}`);
   }
@@ -3223,10 +3220,7 @@ function buildVerifiedFallbackMessageSoft(voices, ranking, iso2, requestedLocale
   const header = `\`\`\`ALSO VERIFIED FOR ${String(iso2 || '').toUpperCase()}${locSuffix}${accSuffix} (missing/unknown or non-exact locale/accent)\`\`\``;
 
   const lines = [header];
-  if (max === 0) {
-    lines.push(labels.noVoices);
-    return lines.join('\n');
-  }
+  if (max === 0) return '';
   for (let i = 0; i < max; i++) {
     lines.push(`- ${formatVoiceLine(sorted[i])}`);
   }
@@ -3243,10 +3237,7 @@ function buildSimilarNotVerifiedMessage(voices, ranking, iso2, requestedLocale, 
   const locSuffix = requestedLocale ? ` (${requestedLocale})` : '';
   const header = `\`\`\`ALSO SIMILAR (NOT VERIFIED FOR ${String(iso2 || '').toUpperCase()}${locSuffix})\`\`\``;
   const lines = [header];
-  if (max === 0) {
-    lines.push(labels.noVoices);
-    return lines.join('\n');
-  }
+  if (max === 0) return '';
   for (let i = 0; i < max; i++) {
     lines.push(`- ${formatVoiceLine(sorted[i])}`);
   }
@@ -3378,6 +3369,18 @@ function formatVoiceLine(voice) {
   )}`;
   const name = hasCustomRateMultiplier(voice) ? `💲${voice.name}` : voice.name;
   return `<${url}|${name}> \`${voice.voice_id}\``;
+}
+
+function voiceNameDedupeKey(voice) {
+  const raw = (voice?.name || '').toString().replace(/^💲/, '').trim().toLowerCase();
+  if (!raw) return '';
+  return raw.split(/\s+/)[0] || raw;
+}
+
+function getGenderRenderOrder(genderFilter, originalQuery) {
+  if (genderFilter !== 'any') return [genderFilter];
+  if (wantsBothGendersCatalog(null, originalQuery)) return ['female', 'male'];
+  return ['female', 'male', 'other'];
 }
 
 function detectListAll(text) {
@@ -7357,16 +7360,18 @@ function buildMessageFromSession(session) {
         }
 
         const buckets = { female: [], male: [], other: [] };
+        const bothGendersCatalog = wantsBothGendersCatalog(null, originalQuery);
         for (const v of uniq) {
           const isHq = isHighQuality(v);
           if (qualityFilter === 'high_only' && !isHq) continue;
           if (qualityFilter === 'no_high' && isHq) continue;
           const g = getGenderGroup(v);
+          if (bothGendersCatalog && g === 'other') continue;
           if (genderFilter !== 'any' && g !== genderFilter) continue;
           if (buckets[g].length < maxPerGender) buckets[g].push(v);
         }
 
-        const order = genderFilter !== 'any' ? [genderFilter] : ['female', 'male', 'other'];
+        const order = getGenderRenderOrder(genderFilter, originalQuery);
         const genderLabels = { female: labels.female, male: labels.male, other: labels.other };
         for (const k of order) {
           const arr = buckets[k] || [];
@@ -7437,6 +7442,9 @@ function buildMessageFromSession(session) {
     }
   }
 
+  const bothGendersCatalog = wantsBothGendersCatalog(null, originalQuery);
+  const seenHighNameKeys = new Set();
+
   sortedUnique.forEach((v) => {
     const isHq = isHighQuality(v);
 
@@ -7444,13 +7452,18 @@ function buildMessageFromSession(session) {
     if (qualityFilter === 'no_high' && isHq) return;
 
     const group = isHq ? 'high' : 'standard';
+    const nameKey = voiceNameDedupeKey(v);
+    if (group === 'standard' && nameKey && seenHighNameKeys.has(nameKey)) return;
+
     const genderGroup = getGenderGroup(v);
+    if (bothGendersCatalog && genderGroup === 'other') return;
 
     if (genderFilter !== 'any' && genderGroup !== genderFilter) return;
 
     const arr = sections[group][genderGroup];
     if (arr.length < maxPerGender) {
       arr.push(v);
+      if (group === 'high' && nameKey) seenHighNameKeys.add(nameKey);
     }
   });
 
@@ -7461,7 +7474,7 @@ function buildMessageFromSession(session) {
 
   function appendSection(title, sectionKey) {
     const groups = sections[sectionKey];
-    const order = genderFilter !== 'any' ? [genderFilter] : ['female', 'male', 'other'];
+    const order = getGenderRenderOrder(genderFilter, originalQuery);
     const genderLabels = {
       female: labels.female,
       male: labels.male,
@@ -9905,6 +9918,43 @@ function runDevAsserts() {
     );
     devAssert(kw.includes('female voice') && kw.includes('male voice'), 'both genders: symmetric search keywords');
   }
+  devAssert(
+    buildVerifiedFallbackMessageSoft([], {}, 'en', null, 'american', 20) === '',
+    'verified soft fallback: empty voices yield no section'
+  );
+  devAssert(
+    getGenderRenderOrder('any', 'conversational female and male voices for North America').join(',') ===
+      'female,male',
+    'both genders: hide other/unspecified bucket'
+  );
+  devAssert(
+    getGenderRenderOrder('any', 'female voice for audiobook').join(',') === 'female,male,other',
+    'single-gender query keeps other bucket'
+  );
+  {
+    const bothMsg = buildMessageFromSession({
+      voices: [
+        { voice_id: 'f1', name: 'Alice', gender: 'female' },
+        { voice_id: 'u1', name: 'Aaron', gender: '' }
+      ],
+      ranking: { f1: 1, u1: 0.5 },
+      filters: { quality: 'any', gender: 'any' },
+      originalQuery: 'conversational female and male voices for North America'
+    });
+    devAssert(bothMsg.includes('Alice') && !bothMsg.includes('u1'), 'both genders: exclude unknown-gender voices');
+  }
+  {
+    const dedupeMsg = buildMessageFromSession({
+      voices: [
+        { voice_id: 'hq1', name: 'Eryn', gender: 'female', category: 'high_quality' },
+        { voice_id: 'std1', name: 'Eryn', gender: 'female', category: 'premade' }
+      ],
+      ranking: { hq1: 1, std1: 0.9 },
+      filters: { quality: 'any', gender: 'any' },
+      originalQuery: 'test'
+    });
+    devAssert(dedupeMsg.includes('hq1') && !dedupeMsg.includes('std1'), 'tier dedupe: same first name hidden in STANDARD');
+  }
   {
     const plan = normalizeKeywordPlan(
       {
@@ -11260,14 +11310,16 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           requestedAccent,
           20
         );
-        fallbackMsg = await translateForUserLanguage(fallbackMsg, session.uiLanguage);
-        const fbBlocks = buildBlocksFromText(fallbackMsg);
-        await client.chat.postMessage({
-          channel: event.channel,
-          thread_ts: threadTs,
-          text: fallbackMsg,
-          blocks: fbBlocks || undefined
-        });
+        if (fallbackMsg && String(fallbackMsg).trim()) {
+          fallbackMsg = await translateForUserLanguage(fallbackMsg, session.uiLanguage);
+          const fbBlocks = buildBlocksFromText(fallbackMsg);
+          await client.chat.postMessage({
+            channel: event.channel,
+            thread_ts: threadTs,
+            text: fallbackMsg,
+            blocks: fbBlocks || undefined
+          });
+        }
       } else {
         // Single unified result message
         let message = buildMessageFromSession(session);
