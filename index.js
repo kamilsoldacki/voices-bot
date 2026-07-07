@@ -1032,32 +1032,51 @@ class FacetKB {
         .map((t) => t.trim())
         .filter(Boolean)
     );
+    const skipTokens = getLanguageNameSkipTokens(k);
+    const matchTokens = tokens.filter((t) => !skipTokens.has(t));
+    if (!matchTokens.length) {
+      return top
+        .slice(0, Math.max(2, Math.min(6, limit)))
+        .map((x) => ({ ...x, matchKind: 'popularity' }));
+    }
 
-    // 1) direct contains match for any token (e.g., "standard" -> ["standard", "modern standard"])
-    const direct = [];
-    const seen = new Set();
-    for (const t of tokens) {
+    // 1) direct match: exact token first, then substring contains
+    const exact = [];
+    const partial = [];
+    const seenExact = new Set();
+    const seenPartial = new Set();
+    for (const t of matchTokens) {
       if (t.length < 4) continue;
+      const tNorm = normalizeCatalogToken(t);
       for (const cand of top) {
         if (!cand?.accent) continue;
-        if (cand.accent.includes(t)) {
-          const key = cand.norm;
-          if (!seen.has(key)) {
-            seen.add(key);
-            direct.push({ ...cand, matchKind: 'direct' });
+        const candNorm = cand.norm || normalizeCatalogToken(cand.accent);
+        if (skipTokens.has(candNorm) || skipTokens.has(cand.accent)) continue;
+        const isExact = cand.accent === t || candNorm === tNorm;
+        if (isExact) {
+          if (!seenExact.has(candNorm)) {
+            seenExact.add(candNorm);
+            exact.push({ ...cand, matchKind: 'direct' });
+          }
+        } else if (cand.accent.includes(t)) {
+          if (!seenPartial.has(candNorm)) {
+            seenPartial.add(candNorm);
+            partial.push({ ...cand, matchKind: 'direct' });
           }
         }
       }
-      if (direct.length >= 12) break;
+      if (exact.length >= 12) break;
     }
+    const direct = exact.length ? exact : partial;
     direct.sort((a, b) => (b.count || 0) - (a.count || 0));
+    if (exact.length >= 1) return exact.slice(0, Math.max(1, Math.min(6, limit)));
     if (direct.length >= 2) return direct.slice(0, Math.max(2, Math.min(6, limit)));
 
     // 2) fuzzy: try closest among candidate strings for longer tokens
     try {
       const candidates = top.map((x) => x.accent).filter(Boolean);
       let best = [];
-      for (const tok of tokens) {
+      for (const tok of matchTokens) {
         if (tok.length < 5) continue;
         const maxDist = maxTypoDistanceForToken(tok);
         const sugg = suggestClosest(tok, candidates, { maxDist, maxSuggestions: 3 });
@@ -1222,6 +1241,54 @@ const FALLBACK_ISO2_ALLOWLIST = new Set([
   'en','pl','es','de','fr','it','pt','nl','sv','no','da','fi','cs','sk','hu','ro','bg','el','tr',
   'ar','he','hi','ja','ko','zh','id','ms','th','vi','uk','ru'
 ]);
+
+// Tokens that name the target language (not a regional accent) – skip in accent matching.
+function getLanguageNameSkipTokens(iso2) {
+  const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+  if (!k) return new Set();
+  const skip = new Set([k]);
+  try {
+    for (const [name, code] of STATIC_LANGUAGE_ALIASES.entries()) {
+      if (code === k) skip.add(normalizeLangName(name));
+    }
+    for (const [name, code] of languageIndex.byName.entries()) {
+      if (code === k) skip.add(normalizeLangName(name));
+    }
+  } catch (_) {}
+  return skip;
+}
+
+const ACCENT_FALLBACK_PRESETS = new Map([
+  ['de', ['standard', 'central', 'southern', 'bavarian', 'swabian', 'saxon']],
+  ['es', ['mexican', 'colombian', 'argentine', 'peruvian', 'chilean', 'venezuelan']],
+  ['fr', ['standard', 'parisian', 'central', 'southern', 'northern']],
+  ['zh', ['standard']]
+]);
+
+function buildAccentFallbackKeys(iso2, kb, excludeKeys = []) {
+  const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+  if (!k) return [];
+  const exclude = new Set((excludeKeys || []).map((x) => normalizeCatalogToken(x)).filter(Boolean));
+  const skipAccents = getLanguageNameSkipTokens(k);
+  const isAllowed = (key) => {
+    if (!key || exclude.has(key) || skipAccents.has(key)) return false;
+    try {
+      if (kb && kb.checkAccentAllowed) {
+        const r = kb.checkAccentAllowed(k, key);
+        if (r && r.known && !r.allowed) return false;
+      }
+    } catch (_) {}
+    return true;
+  };
+  const preset = (ACCENT_FALLBACK_PRESETS.get(k) || [])
+    .map((x) => normalizeCatalogToken(x))
+    .filter(isAllowed);
+  const top =
+    kb && kb._getTopAccents
+      ? (kb._getTopAccents(k) || []).map((x) => x.norm).filter(isAllowed)
+      : [];
+  return dedupePreserveOrder([...preset, ...top]).slice(0, 6);
+}
 
 // -------------------------------------------------------------
 // Locale/accent normalization (UI aliases -> canonical tags)
@@ -2399,7 +2466,7 @@ function detectVariantIntent(userText, iso2, kb) {
           out.isSpecific = true;
           out.axis = 'accent';
           out.requestedFacetKeys = [String(best.norm)];
-          out.fallbackFacetKeys = [];
+          out.fallbackFacetKeys = buildAccentFallbackKeys(lang, kb, [best.norm]);
           return out;
         }
       }
@@ -2525,7 +2592,7 @@ function detectVariantIntent(userText, iso2, kb) {
         out.isSpecific = true;
         out.axis = 'accent';
         out.requestedFacetKeys = [key];
-        out.fallbackFacetKeys = [];
+        out.fallbackFacetKeys = buildAccentFallbackKeys(lang, kb, [key]);
         return out;
       }
     }
@@ -3319,7 +3386,7 @@ function detectNoticePeriodFromText(text) {
   if (noNotice) return { preference: 'no_notice', minDays: null };
 
   const maxNotice =
-    /\binfinity\s+voice(s)?\b/.test(lower) ||
+    /\binfinity\b/.test(lower) ||
     /\b(max|maximum|maksymalny|maks)\s+notice\s+period\b/.test(lower) ||
     /\b(max|maximum|maksymalny|maks)\s+okres(u)?\s+wypowiedzenia\b/.test(lower) ||
     /\b2\s*years?\s+(notice\s+period|okresu\s+wypowiedzenia|okres\s+wypowiedzenia)\b/.test(lower) ||
@@ -3328,6 +3395,7 @@ function detectNoticePeriodFromText(text) {
   if (maxNotice) return { preference: 'min_days', minDays: MAX_NOTICE_PERIOD_DAYS };
 
   const oneYear =
+    /\bat\s+least\s+(?:a\s+)?year\b/.test(lower) ||
     /\b(at\s+least\s+)?1\s+year\s+(notice\s+period|okresu\s+wypowiedzenia|okres\s+wypowiedzenia)\b/.test(
       lower
     ) ||
@@ -5537,6 +5605,11 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
               const seenInGroup = new Set();
               for (const voice of fetched || []) {
                 if (!voice || !voice.voice_id) continue;
+                try {
+                  const tag = `other:__other__`;
+                  if (!Array.isArray(voice._matched_keywords)) voice._matched_keywords = [];
+                  if (!voice._matched_keywords.includes(tag)) voice._matched_keywords.push(tag);
+                } catch (_) {}
                 if (!seenInGroup.has(voice.voice_id)) {
                   seenInGroup.add(voice.voice_id);
                   group.voices.push(voice);
@@ -8094,7 +8167,7 @@ function extractNegativeTokens(userText) {
     { pat: /\b(?:not|no|without)\s+(?:an?\s+)?cartoons?\b/, tok: 'cartoon' },
 
     // Dutch-ish
-    { pat: /\b(?:geen|zonder)\s+(?:een\s+)?(?:luisterboeken?|audioboek(?:en)?)\b/, tok: 'audiobook' },
+    { pat: /\b(?:geen|zonder)\s+(?:een\s+)?(?:luisterboek(?:en)?|audioboek(?:en)?)\b/, tok: 'audiobook' },
 
     // Polish-ish
     { pat: /\bbez\s+audiobook(?:a|u|ów)?\b/, tok: 'audiobook' },
@@ -10328,6 +10401,20 @@ function runDevAsserts() {
     const suggIt = facetKB.suggestAccents('it', 'sicilian voice', { limit: 3 }) || [];
     const bestIt = suggIt.find((x) => x && x.matchKind && x.matchKind !== 'popularity') || null;
     devAssert(!!bestIt && String(bestIt.accent).includes('sicilian'), 'FacetKB suggests sicilian accent (direct/fuzzy)');
+
+    const suggDe = facetKB.suggestAccents('de', 'german voice', { limit: 3 }) || [];
+    const bestDe = suggDe.find((x) => x && x.matchKind && x.matchKind !== 'popularity') || null;
+    devAssert(!bestDe, 'FacetKB: plain "german voice" is not accent-specific');
+
+    const viDe = detectVariantIntent('german voice', 'de', facetKB);
+    devAssert(viDe.isSpecific === false, 'variant intent: plain German -> general mode');
+
+    const viDeBav = detectVariantIntent('bavarian german voice', 'de', facetKB);
+    devAssert(viDeBav.isSpecific === true && viDeBav.axis === 'accent', 'variant intent: Bavarian German -> accent');
+    devAssert(
+      Array.isArray(viDeBav.fallbackFacetKeys) && viDeBav.fallbackFacetKeys.length >= 2,
+      'variant intent: Bavarian German has accent fallbacks'
+    );
 
     const p = { target_voice_language: 'it' };
     devAssert(shouldApplyParam('accent', p, 'sicilian voice') === true, 'shouldApplyParam(accent) uses catalog match');
