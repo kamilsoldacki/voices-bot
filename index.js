@@ -3466,6 +3466,63 @@ function applyNoticePeriodToPlan(plan, userText) {
   return plan;
 }
 
+function detectCustomRatesFromText(text) {
+  if (!text) return { preference: 'any' };
+  const lower = text
+    .replace(/[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/g, '-')
+    .toLowerCase();
+
+  const exclude =
+    /\b(no|without|exclude|bez|brak)\s+custom\s+rates?\b/.test(lower) ||
+    /\bstandard\s+rates?\s+only\b/.test(lower);
+  if (exclude) return { preference: 'exclude' };
+
+  const includeAny =
+    /\b(include|with|allow)\s+custom\s+rates?\b/.test(lower) ||
+    /\b(clear|remove)\s+custom\s+rates?\s*(filter)?\b/.test(lower) ||
+    /\bany\s+custom\s+rates?\b/.test(lower);
+  if (includeAny) return { preference: 'any' };
+
+  return { preference: 'any' };
+}
+
+function applyCustomRatesToPlan(plan, userText) {
+  if (!plan || typeof plan !== 'object') return plan;
+  const detected = detectCustomRatesFromText(userText);
+
+  let preference = plan.custom_rates_preference;
+  if (detected.preference === 'exclude') {
+    preference = 'exclude';
+  } else if (detected.preference === 'any' && preference === 'exclude') {
+    const lower = (userText || '').toLowerCase();
+    if (
+      /\b(include|with|allow|clear|remove|any)\s+custom\s+rates?\b/.test(lower)
+    ) {
+      preference = 'any';
+    }
+  }
+
+  if (!['any', 'exclude'].includes(preference)) {
+    preference = 'any';
+  }
+
+  if (preference === 'exclude') {
+    plan.__no_custom_rates = true;
+    plan.custom_rates_preference = 'exclude';
+  } else {
+    plan.__no_custom_rates = false;
+    plan.custom_rates_preference = 'any';
+  }
+
+  return plan;
+}
+
+function maybeSetIncludeCustomRatesParam(params, plan) {
+  if (plan?.__no_custom_rates === true) {
+    params.set('include_custom_rates', 'false');
+  }
+}
+
 // UI labels – EN only (all user-facing base text)
 // (then translated per userLanguage before sending)
 function getLabels() {
@@ -3598,6 +3655,41 @@ function filterVoicesByNoticePeriod(voices, filtersOrPlan) {
   return out;
 }
 
+function filterVoicesByCustomRates(voices, filtersOrPlan) {
+  const src = Array.isArray(voices) ? voices : [];
+  const exclude =
+    filtersOrPlan?.noCustomRates === true || filtersOrPlan?.__no_custom_rates === true;
+  if (!exclude || !src.length) return voices;
+
+  const applyList = (list) => {
+    const arr = Array.isArray(list) ? list : [];
+    if (!arr.length) return arr;
+    return arr.filter((v) => v && !hasCustomRateMultiplier(v));
+  };
+
+  const out = applyList(src);
+  if (Array.isArray(voices) && Array.isArray(voices.facetGroups) && voices.facetGroups.length) {
+    const copy = [...out];
+    copy.facetGroups = voices.facetGroups
+      .map((g) => ({
+        ...g,
+        voices: applyList(g?.voices)
+      }))
+      .filter((g) => Array.isArray(g.voices) && g.voices.length);
+    if (voices.facetAxis) copy.facetAxis = voices.facetAxis;
+    if (voices.facetIso2) copy.facetIso2 = voices.facetIso2;
+    if (voices.variantIntent) copy.variantIntent = voices.variantIntent;
+    return copy;
+  }
+  return out;
+}
+
+function applyVoiceLibraryFilters(voices, filtersOrPlan) {
+  let out = filterVoicesByNoticePeriod(voices, filtersOrPlan);
+  out = filterVoicesByCustomRates(out, filtersOrPlan);
+  return out;
+}
+
 function buildSessionNoticeFilters(keywordPlan) {
   const noNotice = keywordPlan?.__no_notice_period === true;
   return {
@@ -3626,6 +3718,24 @@ function applySessionNoticeFiltersToPlan(plan, filters) {
     plan.__min_notice_period_days = null;
     plan.notice_period_preference = 'any';
     plan.min_notice_period_days = null;
+  }
+  return plan;
+}
+
+function buildSessionCustomRatesFilters(keywordPlan) {
+  return {
+    noCustomRates: keywordPlan?.__no_custom_rates === true
+  };
+}
+
+function applySessionCustomRatesFiltersToPlan(plan, filters) {
+  if (!plan || !filters) return plan;
+  if (filters.noCustomRates === true) {
+    plan.__no_custom_rates = true;
+    plan.custom_rates_preference = 'exclude';
+  } else {
+    plan.__no_custom_rates = false;
+    plan.custom_rates_preference = 'any';
   }
   return plan;
 }
@@ -3982,6 +4092,31 @@ function applyFilterChangesFromText(session, lower) {
     }
   }
 
+  // custom rates
+  const customRatesDetected = detectCustomRatesFromText(lower);
+  if (customRatesDetected.preference === 'exclude') {
+    if (session.filters.noCustomRates !== true) {
+      session.filters.noCustomRates = true;
+      changed = true;
+    }
+  }
+  if (
+    lower.includes('clear custom rates') ||
+    lower.includes('remove custom rates') ||
+    lower.includes('include custom rates') ||
+    lower.includes('with custom rates') ||
+    lower.includes('any custom rates') ||
+    lower.includes('bez filtra custom rates') ||
+    lower.includes('usuń filtr custom rates') ||
+    lower.includes('usun filtr custom rates')
+  ) {
+    if (session.filters.noCustomRates) {
+      session.filters.noCustomRates = false;
+      serverChanged = true;
+      changed = true;
+    }
+  }
+
   // age (child/young/adult/old)
   const newAge = detectAgeFromText(lower);
   if (newAge && session.filters.age !== newAge) {
@@ -4108,6 +4243,7 @@ async function refineKeywordPlanFromFollowUp(existingPlan, followUpText) {
   }
 
   applyNoticePeriodToPlan(base, followUpText);
+  applyCustomRatesToPlan(base, followUpText);
 
   return typeof normalizeKeywordPlan === 'function' ? normalizeKeywordPlan(base, followUpText) : base;
 }
@@ -4296,6 +4432,7 @@ function normalizeKeywordPlan(plan, userText) {
   }
 
   applyNoticePeriodToPlan(out, userText);
+  applyCustomRatesToPlan(out, userText);
 
   // sanitize gender
   if (out.target_gender !== 'male' && out.target_gender !== 'female' && out.target_gender !== 'neutral') {
@@ -4471,6 +4608,7 @@ The JSON MUST have exactly these fields:
   "model_preference": "any" | "eleven_v3",
   "notice_period_preference": "any" | "min_days" | "no_notice",
   "min_notice_period_days": integer or null,
+  "custom_rates_preference": "any" | "exclude",
 
   "tone_keywords": string[],
   "use_case_keywords": string[],
@@ -4524,6 +4662,11 @@ RULES:
     - 30 for "30 days notice"
     - 1 for generic "with notice period" / "only with notice period"
   - null when notice_period_preference is not "min_days".
+
+- custom_rates_preference:
+  - "exclude" when the user explicitly wants voices WITHOUT custom rates
+    (e.g. "without custom rates", "no custom rates", Polish: "bez custom rates", "standard rates only").
+  - "any" in all other cases.
 
 - tone_keywords:
   - Many short English adjectives (1–3 words) describing tone and pacing:
@@ -4718,6 +4861,7 @@ IMPORTANT:
     }
 
     applyNoticePeriodToPlan(plan, userText);
+    applyCustomRatesToPlan(plan, userText);
 
     return plan;
   } catch (error) {
@@ -4735,13 +4879,14 @@ IMPORTANT:
       model_preference: mp || 'any',
       notice_period_preference: 'any',
       min_notice_period_days: null,
+      custom_rates_preference: 'any',
       tone_keywords: [],
       use_case_keywords: [],
       character_keywords: [],
       style_keywords: [],
       extra_keywords: [userText.toLowerCase()]
     };
-    return applyNoticePeriodToPlan(fallback, userText);
+    return applyCustomRatesToPlan(applyNoticePeriodToPlan(fallback, userText), userText);
   }
 }
 
@@ -5459,6 +5604,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             if (typeof minNoticePeriodDays === 'number' && minNoticePeriodDays > 0) {
               base.set('min_notice_period_days', String(minNoticePeriodDays));
             }
+            maybeSetIncludeCustomRatesParam(base, plan);
             if (age) base.set('age', age);
             if (sort) base.set('sort', sort);
             // pass 1: no search
@@ -5563,6 +5709,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             if (typeof minNoticePeriodDays === 'number' && minNoticePeriodDays > 0) {
               base.set('min_notice_period_days', String(minNoticePeriodDays));
             }
+            maybeSetIncludeCustomRatesParam(base, plan);
             if (age) base.set('age', age);
             if (sort) base.set('sort', sort);
 
@@ -5649,8 +5796,8 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
           allVoices.facetAxis = axis;
           allVoices.facetIso2 = language;
           allVoices.variantIntent = variantIntent;
-          if (plan.__no_notice_period === true || plan.__min_notice_period_days > 0) {
-            return filterVoicesByNoticePeriod(allVoices, plan);
+          if (plan.__no_notice_period === true || plan.__min_notice_period_days > 0 || plan.__no_custom_rates === true) {
+            return applyVoiceLibraryFilters(allVoices, plan);
           }
           return allVoices;
         }
@@ -6248,6 +6395,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
         params.set('accent', slug);
         if (gender) params.set('gender', gender);
         if (qualityPref === 'high_only') params.set('category', 'high_quality');
+        maybeSetIncludeCustomRatesParam(params, plan);
 
         let voicesSlug = [];
         try {
@@ -6364,6 +6512,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     if (qualityPref === 'high_only') {
       params.set('category', 'high_quality');
     }
+    maybeSetIncludeCustomRatesParam(params, plan);
 
     try {
       const broadVoices = await callSharedVoices(params);
@@ -6402,6 +6551,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     if (qualityPref === 'high_only') {
       params.set('category', 'high_quality');
     }
+    maybeSetIncludeCustomRatesParam(params, plan);
     try {
       const noLangVoices = await callSharedVoices(params);
       try {
@@ -6430,6 +6580,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     if (language) params.set('language', language);
     if (accent) params.set('accent', accent);
     if (gender) params.set('gender', gender);
+    maybeSetIncludeCustomRatesParam(params, plan);
     try {
       const hqLocal = await callSharedVoices(params);
       try {
@@ -6800,16 +6951,17 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     } catch (_) {}
   }
 
-  if (plan.__no_notice_period === true || plan.__min_notice_period_days > 0) {
-    const beforeNotice = voices.length;
-    voices = filterVoicesByNoticePeriod(voices, plan);
+  if (plan.__no_notice_period === true || plan.__min_notice_period_days > 0 || plan.__no_custom_rates === true) {
+    const beforeLibraryFilters = voices.length;
+    voices = applyVoiceLibraryFilters(voices, plan);
     try {
       trace({
-        stage: 'notice_period_filter',
+        stage: 'voice_library_filters',
         params: {
           no_notice: String(plan.__no_notice_period === true),
           min_days: String(plan.__min_notice_period_days ?? '-'),
-          before: String(beforeNotice),
+          no_custom_rates: String(plan.__no_custom_rates === true),
+          before: String(beforeLibraryFilters),
           after: String(voices.length)
         },
         count: voices.length
@@ -7424,6 +7576,8 @@ async function fetchTopVoicesByLanguage(languageCode, qualityPreference, plan, u
       } catch (_) {}
     }
 
+    voices = applyVoiceLibraryFilters(voices, plan || {});
+
     return voices.slice(0, 80);
   } catch (err) {
     console.error('Error in fetchTopVoicesByLanguage:', err.message || err);
@@ -7693,7 +7847,7 @@ Every candidate_voices.voice_id MUST appear exactly once in "ranking".
 function buildMessageFromSession(session) {
   const { voices, ranking, filters, originalQuery, uiLanguage } = session;
   const labels = getLabels();
-  const noticeFilteredVoices = filterVoicesByNoticePeriod(voices, filters);
+  const noticeFilteredVoices = applyVoiceLibraryFilters(voices, filters);
 
   // Facet sections (locale/accent) – UI-like grouping
   try {
@@ -8702,6 +8856,10 @@ function shouldApplyParam(kind, plan, userText, flags = {}) {
       if (typeof minDays === 'number' && minDays > 0 && plan?.__no_notice_period !== true) return true;
       return false;
     }
+    case 'include_custom_rates': {
+      if (flags.noCustomRates === true || plan?.__no_custom_rates === true) return true;
+      return false;
+    }
     case 'sort': {
       if (typeof flags.sort === 'string' || typeof plan?.__sort === 'string') return true;
       return false;
@@ -8912,6 +9070,7 @@ async function fetchVoicesByOwner(ownerId, plan, traceCb) {
   params.set('page_size', '100');
   params.set('owner_id', oid);
   if (qualityPref === 'high_only') params.set('category', 'high_quality');
+  maybeSetIncludeCustomRatesParam(params, plan);
   try {
     const voices = await callSharedVoicesAllPages(params, { maxPages: 5, cap: 500 });
     try {
@@ -8929,7 +9088,7 @@ async function fetchVoicesByOwner(ownerId, plan, traceCb) {
     if (excludeId) {
       out = out.filter((v) => v && v.voice_id !== excludeId);
     }
-    out = filterVoicesByNoticePeriod(out, plan);
+    out = applyVoiceLibraryFilters(out, plan);
     return out;
   } catch (err) {
     safeLogAxiosError('fetchVoicesByOwner', err);
@@ -8974,7 +9133,8 @@ async function handleCreatorVoicesBrowse(plan, userText, traceCb, options = {}) 
       strictUseCase: plan.__forceUseCases === true,
       strictDescriptives: plan.__forceDescriptives === true,
       limitPerGender: genderLimit.limitPerGender,
-      ...buildSessionNoticeFilters(plan)
+      ...buildSessionNoticeFilters(plan),
+      ...buildSessionCustomRatesFilters(plan)
     },
     lastActive: Date.now()
   };
@@ -9425,6 +9585,12 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
     shouldApplyParam('min_notice_period_days', plan, userText, { minNoticePeriodDays })
   ) {
     params.set('min_notice_period_days', String(minNoticePeriodDays));
+  }
+  if (
+    plan?.__no_custom_rates === true &&
+    shouldApplyParam('include_custom_rates', plan, userText, { noCustomRates: true })
+  ) {
+    params.set('include_custom_rates', 'false');
   }
   if (age && shouldApplyParam('age', plan, userText)) params.set('age', age);
   if (sort && shouldApplyParam('sort', plan, userText, { sort })) params.set('sort', sort);
@@ -10046,7 +10212,7 @@ function buildSearchReport(trace, plan, mode, summary) {
       } catch (_) {}
     }
     lines.push(
-      `Plan: lang=${plan?.target_voice_language || '-'}, accent=${planAccentDisplay}, exclude_accents=${excludedAccents}, exclude_locales=${excludedLocales}, exclude_genders=${excludedGenders}, gender=${plan?.target_gender || '-'}, quality=${plan?.quality_preference || 'any'}, model=${plan?.model_preference || 'any'}, notice=${plan?.__no_notice_period ? 'none' : (plan?.__min_notice_period_days ?? 'any')}`
+      `Plan: lang=${plan?.target_voice_language || '-'}, accent=${planAccentDisplay}, exclude_accents=${excludedAccents}, exclude_locales=${excludedLocales}, exclude_genders=${excludedGenders}, gender=${plan?.target_gender || '-'}, quality=${plan?.quality_preference || 'any'}, model=${plan?.model_preference || 'any'}, notice=${plan?.__no_notice_period ? 'none' : (plan?.__min_notice_period_days ?? 'any')}, custom_rates=${plan?.__no_custom_rates ? 'exclude' : 'any'}`
     );
     if (summary && typeof summary === 'object') {
       lines.push('');
@@ -10907,6 +11073,41 @@ function runDevAsserts() {
     );
   }
 
+  // Custom rates intent + query param
+  {
+    const noCr = detectCustomRatesFromText('spanish voices without custom rates');
+    devAssert(noCr.preference === 'exclude', 'custom rates: without custom rates -> exclude');
+
+    const withCr = detectCustomRatesFromText('include custom rates');
+    devAssert(withCr.preference === 'any', 'custom rates: include custom rates -> any');
+
+    const planNoCr = applyCustomRatesToPlan({}, 'without custom rates');
+    devAssert(planNoCr.__no_custom_rates === true, 'custom rates: plan sets __no_custom_rates');
+
+    const pNoCr = new URLSearchParams();
+    appendQueryFiltersToParams(pNoCr, planNoCr, 'without custom rates', {
+      language: 'es',
+      accent: null,
+      gender: null,
+      qualityPref: 'any'
+    });
+    devAssert(
+      pNoCr.get('include_custom_rates') === 'false',
+      'custom rates: appendQueryFiltersToParams sets include_custom_rates=false'
+    );
+
+    const voicesCr = [
+      { voice_id: 'a', name: 'Standard', rate: 1 },
+      { voice_id: 'b', name: 'Premium', rate: 2 },
+      { voice_id: 'c', name: 'Default' }
+    ];
+    const filteredCr = filterVoicesByCustomRates(voicesCr, { __no_custom_rates: true });
+    devAssert(
+      filteredCr.length === 2 && filteredCr.every((v) => !hasCustomRateMultiplier(v)),
+      'custom rates: client exclude filter'
+    );
+  }
+
   // Notice period lookup: specific voice_id list should not fall through to search or language compat
   {
     const noticeQ = `can you check the notice period for these voices?
@@ -11308,7 +11509,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
                       strictUseCase: false,
                       strictDescriptives: false,
                       limitPerGender: genderLimit.limitPerGender,
-                      ...buildSessionNoticeFilters(keywordPlan)
+                      ...buildSessionNoticeFilters(keywordPlan),
+                      ...buildSessionCustomRatesFilters(keywordPlan)
                     };
                   })(),
                   lastActive: Date.now()
@@ -11368,7 +11570,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
                     strictUseCase: false,
                     strictDescriptives: false,
                     limitPerGender: genderLimit.limitPerGender,
-                    ...buildSessionNoticeFilters(keywordPlan)
+                    ...buildSessionNoticeFilters(keywordPlan),
+                    ...buildSessionCustomRatesFilters(keywordPlan)
                   };
                 })(),
                 lastActive: Date.now()
@@ -11437,7 +11640,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
               featured: false,
               sort: null,
               limitPerGender: genderLimit.limitPerGender,
-              ...buildSessionNoticeFilters(subPlan)
+              ...buildSessionNoticeFilters(subPlan),
+              ...buildSessionCustomRatesFilters(subPlan)
             },
             lastActive: Date.now()
           }
@@ -11540,7 +11744,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
               featured: false,
               sort: null,
               limitPerGender: genderLimit.limitPerGender,
-              ...buildSessionNoticeFilters(subPlan)
+              ...buildSessionNoticeFilters(subPlan),
+              ...buildSessionCustomRatesFilters(subPlan)
             },
             lastActive: Date.now()
           }
@@ -11630,7 +11835,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           strictUseCase: false,
           strictDescriptives: false,
           limitPerGender: genderLimit.limitPerGender,
-          ...buildSessionNoticeFilters(keywordPlan)
+          ...buildSessionNoticeFilters(keywordPlan),
+          ...buildSessionCustomRatesFilters(keywordPlan)
         },
         lastActive: Date.now()
       };
@@ -11886,7 +12092,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         strictUseCase: false,
         strictDescriptives: false,
         limitPerGender: genderLimit.limitPerGender,
-        ...buildSessionNoticeFilters(keywordPlan)
+        ...buildSessionNoticeFilters(keywordPlan),
+        ...buildSessionCustomRatesFilters(keywordPlan)
       },
       lastActive: Date.now()
     };
@@ -12072,6 +12279,7 @@ if (!DEV_ASSERTS_ENABLED && !isDevPocEnabled()) {
         plan.__forceUseCases = existing.filters.strictUseCase === true;
         plan.__forceDescriptives = existing.filters.strictDescriptives === true;
         applySessionNoticeFiltersToPlan(plan, existing.filters);
+        applySessionCustomRatesFiltersToPlan(plan, existing.filters);
 
         const searchTrace = [];
         const traceCb = (entry) => { try { searchTrace.push(entry); } catch (_) {} };
@@ -12162,6 +12370,7 @@ if (!DEV_ASSERTS_ENABLED && !isDevPocEnabled()) {
         plan.__forceUseCases = existing.filters.strictUseCase === true;
         plan.__forceDescriptives = existing.filters.strictDescriptives === true;
         applySessionNoticeFiltersToPlan(plan, existing.filters);
+        applySessionCustomRatesFiltersToPlan(plan, existing.filters);
 
         const voices = await fetchVoicesByKeywords(plan, existing.originalQuery, traceCb);
         if (!voices.length) {
@@ -12206,6 +12415,7 @@ if (!DEV_ASSERTS_ENABLED && !isDevPocEnabled()) {
       refinedPlan.__listAll = existing.filters.listAll === true;
       refinedPlan.__forceUseCases = existing.filters.strictUseCase === true;
       applySessionNoticeFiltersToPlan(refinedPlan, existing.filters);
+      applySessionCustomRatesFiltersToPlan(refinedPlan, existing.filters);
       const combinedQuery = [existing.originalQuery || '', cleaned].join(' ').trim();
       const searchTrace = [];
       const traceCb = (entry) => {
@@ -12346,6 +12556,7 @@ app.action('toggle_featured', async ({ ack, body, client }) => {
     plan.__sort = session.filters.sort || null;
     plan.__listAll = session.filters.listAll === true;
     applySessionNoticeFiltersToPlan(plan, session.filters);
+    applySessionCustomRatesFiltersToPlan(plan, session.filters);
 
     const searchTrace = [];
     const traceCb = (e) => { try { searchTrace.push(e); } catch (_) {} };
@@ -12393,6 +12604,7 @@ app.action('show_more', async ({ ack, body, client }) => {
     plan.__sort = session.filters.sort || null;
     plan.__listAll = true;
     applySessionNoticeFiltersToPlan(plan, session.filters);
+    applySessionCustomRatesFiltersToPlan(plan, session.filters);
 
     const searchTrace = [];
     const traceCb = (e) => { try { searchTrace.push(e); } catch (_) {} };
