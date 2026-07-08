@@ -9605,6 +9605,7 @@ function buildVoiceLookupMessage(voice, userText) {
 
 function detectVoiceLanguageCompatibilityIntent(text) {
   const raw = (text || '').toString();
+  if (detectVoiceNoticePeriodIntent(raw)) return null;
   const lower = raw.toLowerCase();
   const hint = parseUserLanguageHints(raw);
   const iso2 = hint?.iso2 ? hint.iso2.toLowerCase().slice(0, 2) : null;
@@ -10906,14 +10907,27 @@ function runDevAsserts() {
     );
   }
 
-  // Notice period lookup: specific voice_id list should not fall through to search
+  // Notice period lookup: specific voice_id list should not fall through to search or language compat
   {
     const noticeQ = `can you check the notice period for these voices?
-- 80lPKtzJMPh1vjYMUgwe Benjamin - Deep, Smooth and Rich
-- dlGxemPxFMTY7iXagmOj Fernando Martínez - Rapid, Persuasive`;
+
+80lPKtzJMPh1vjYMUgwe	Benjamin - Deep, Smooth and Rich
+dlGxemPxFMTY7iXagmOj	Fernando Martínez - Rapid, Persuasive
+l1zE9xgNpUTaQCZzpNJa	Alberto Rodríguez - Serious, Narrative
+2rigMbVWLdqtBSCahJFX	Tatiana Martin - Wise-speaking, calm
+qHkrJuifPpn95wK3rm2A	Andrea - Polite, Cheerful and Calm
+sKgg4MPUDBy69X7iv3fA	Alejandro Duràn - Warm, Deep and Hoarse
+Nh2zY9kknu6z4pZy6FhD	David Martin - Confident and Balanced
+kcQkGnn0HAT2JRDQ4Ljp	Norah - Warm, Friendly and Clear
+CaJslL1xziwefCeTNzHv	Cristina Campos - Friendly and Soft
+9F4C8ztpNUmXkdDDbz3J	Dan - Upbeat, Dynamic and Friendly`;
     const ids = extractAllVoiceIds(noticeQ);
-    devAssert(ids.length === 2, 'notice lookup: extract multiple voice ids');
+    devAssert(ids.length === 10, 'notice lookup: extract all 10 voice ids from slack paste');
     devAssert(detectVoiceNoticePeriodIntent(noticeQ), 'notice lookup: intent with voice id list');
+    devAssert(
+      !detectVoiceLanguageCompatibilityIntent(noticeQ),
+      'notice lookup: must not trigger language compatibility'
+    );
     devAssert(
       !detectVoiceNoticePeriodIntent('find polish female voices with notice period'),
       'notice lookup: generic search excluded'
@@ -10923,7 +10937,7 @@ function runDevAsserts() {
       'notice lookup: language meta excluded'
     );
     const resolved = resolveVoicesForNoticePeriodQuestion(noticeQ, null);
-    devAssert(resolved.length === 2 && resolved.every((v) => v.__needsLookup), 'notice lookup: resolve pasted ids');
+    devAssert(resolved.length === 10 && resolved.every((v) => v.__needsLookup), 'notice lookup: resolve all pasted ids');
     const session = {
       voices: [
         { voice_id: 'a', name: 'A', notice_period: 30 },
@@ -11109,11 +11123,11 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
     }
 
     const compatUiLang = (guessUiLanguageFromText(cleaned) || 'en').toString().slice(0, 2).toLowerCase();
-    if (await respondVoiceLanguageCompatibility(event, cleaned, threadTs, client, null, compatUiLang)) {
+    if (await respondVoiceNoticePeriodLookup(event, cleaned, threadTs, client, null, uiLang)) {
       return;
     }
 
-    if (await respondVoiceNoticePeriodLookup(event, cleaned, threadTs, client, null, uiLang)) {
+    if (await respondVoiceLanguageCompatibility(event, cleaned, threadTs, client, null, compatUiLang)) {
       return;
     }
 
@@ -12096,11 +12110,11 @@ if (!DEV_ASSERTS_ENABLED && !isDevPocEnabled()) {
       }
     }
 
-    if (await respondVoiceLanguageCompatibility(event, cleaned, threadTs, client, existing, existing.uiLanguage)) {
+    if (await respondVoiceNoticePeriodLookup(event, cleaned, threadTs, client, existing, existing.uiLanguage)) {
       return;
     }
 
-    if (await respondVoiceNoticePeriodLookup(event, cleaned, threadTs, client, existing, existing.uiLanguage)) {
+    if (await respondVoiceLanguageCompatibility(event, cleaned, threadTs, client, existing, existing.uiLanguage)) {
       return;
     }
 
