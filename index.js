@@ -9510,21 +9510,33 @@ function extractVoiceIdCandidate(text) {
   return candidate || null;
 }
 
+function isLikelyVoiceId(id) {
+  if (!id) return false;
+  if (PUBLIC_OWNER_UUID_RE.test(id)) return false;
+  if (/[A-Z]/.test(id) && /[a-z]/.test(id) && id.length >= 15) return true;
+  if (id.length >= 18) return true;
+  return /^[A-Za-z0-9]{10,32}$/.test(id) && !/^[a-z]+$/.test(id);
+}
+
+/** All standalone ElevenLabs voice_id tokens in text (10–32 alphanumeric), excluding owner UUIDs. */
+function extractAllVoiceIds(text) {
+  if (!text) return [];
+  const matches = String(text).match(/\b([A-Za-z0-9]{10,32})\b/g);
+  if (!matches) return [];
+  const seen = new Set();
+  const out = [];
+  for (const id of matches) {
+    if (!isLikelyVoiceId(id) || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
 /** Standalone ElevenLabs voice_id token (10–32 alphanumeric), excluding owner UUIDs. */
 function extractBareVoiceId(text) {
-  if (!text) return null;
-  const matches = String(text).match(/\b([A-Za-z0-9]{10,32})\b/g);
-  if (!matches) return null;
-  for (const id of matches) {
-    if (PUBLIC_OWNER_UUID_RE.test(id)) continue;
-    if (/[A-Z]/.test(id) && /[a-z]/.test(id) && id.length >= 15) return id;
-    if (id.length >= 18) return id;
-  }
-  for (const id of matches) {
-    if (PUBLIC_OWNER_UUID_RE.test(id)) continue;
-    if (/^[A-Za-z0-9]{10,32}$/.test(id) && !/^[a-z]+$/.test(id)) return id;
-  }
-  return null;
+  const all = extractAllVoiceIds(text);
+  return all.length ? all[0] : null;
 }
 
 function detectVoiceIdQualityQuestion(text) {
@@ -9643,6 +9655,74 @@ function resolveVoiceForCompatibilityQuestion(text, session) {
   return null;
 }
 
+function detectVoiceNoticePeriodIntent(text) {
+  const raw = (text || '').toString();
+  const lower = raw.toLowerCase();
+  const noticeMention =
+    /\bnotice\s*period\b/.test(lower) ||
+    /\bokres(u)?\s+wypowiedzenia\b/.test(lower) ||
+    /\bwypowiedzeni[ae]\b/.test(lower);
+  if (!noticeMention) return false;
+
+  const voiceIds = extractAllVoiceIds(raw);
+  const refersToListedVoices =
+    /\b(these|those|following|poniższe|ponizsze|tych|te)\s+(voices?|głos(y|ów)?|glos(y|ow)?)\b/i.test(lower) ||
+    /\b(for|dla)\s+(these|those|them|nich|tych)\b/i.test(lower);
+
+  const lookupSignals = [
+    /\b(check|verify|what(?:'s| is| are)|tell me|show|lookup|look\s*up|get)\b/i,
+    /\b(sprawdź|sprawdz|jaki|jaka|jakie|ile)\b/i,
+    /\b(do|does|have|has)\s+(these|those|they|the)\b/i
+  ];
+  const isLookup = lookupSignals.some((re) => re.test(lower));
+
+  const isSearchBrief =
+    /\b(find|search|show me|list|recommend|suggest|szukam|znajdź|znajdz|pokaż|pokaz)\b/i.test(lower) &&
+    /\bvoices?\b/i.test(lower) &&
+    !refersToListedVoices &&
+    voiceIds.length === 0;
+  if (isSearchBrief) return false;
+
+  if (voiceIds.length > 0) return true;
+  if (refersToListedVoices && isLookup) return true;
+  return false;
+}
+
+function resolveVoicesForNoticePeriodQuestion(text, session) {
+  const raw = (text || '').toString();
+  const voiceIds = extractAllVoiceIds(raw);
+  if (voiceIds.length) {
+    return voiceIds.map((id) => {
+      const inSession = session?.voices?.find((v) => v?.voice_id === id);
+      if (inSession) return inSession;
+      return { voice_id: id, __needsLookup: true };
+    });
+  }
+
+  const lower = raw.toLowerCase();
+  if (
+    /\b(these|those|following|them|nich|tych)\s+(voices?|głos(y|ów)?|glos(y|ow)?)\b/i.test(lower) &&
+    Array.isArray(session?.voices) &&
+    session.voices.length
+  ) {
+    return [...session.voices];
+  }
+  return [];
+}
+
+function buildVoiceNoticePeriodMessage(voices, uiLang) {
+  if (!Array.isArray(voices) || !voices.length) return '';
+  const lines = ['*Notice period*'];
+  for (const voice of voices) {
+    if (voice?.__notFound) {
+      lines.push(`\`${voice.voice_id}\` — not found in the Voice Library or your workspace.`);
+      continue;
+    }
+    lines.push(formatVoiceLine(voice, uiLang));
+  }
+  return lines.join('\n');
+}
+
 function formatVerifiedLanguageEntry(entry) {
   if (!entry) return null;
   const parts = [];
@@ -9708,6 +9788,42 @@ async function respondVoiceLanguageCompatibility(event, cleaned, threadTs, clien
   }
 
   let message = buildVoiceLanguageCompatibilityMessage(voice, intent.iso2);
+  message = await translateForUserLanguage(message, uiLang);
+  await safePostMessage(client, { channel: event.channel, thread_ts: threadTs, text: message });
+  return true;
+}
+
+async function respondVoiceNoticePeriodLookup(event, cleaned, threadTs, client, session, uiLang) {
+  if (!detectVoiceNoticePeriodIntent(cleaned)) return false;
+
+  const resolved = resolveVoicesForNoticePeriodQuestion(cleaned, session);
+  if (!resolved.length) {
+    const msg = await translateForUserLanguage(
+      'To check notice period, paste one or more voice_ids, or ask in a thread that already has search results.',
+      uiLang
+    );
+    await safePostMessage(client, { channel: event.channel, thread_ts: threadTs, text: msg });
+    return true;
+  }
+
+  const voices = [];
+  for (const item of resolved) {
+    if (item?.__needsLookup) {
+      const fresh = await lookupVoiceById(item.voice_id, () => {});
+      if (fresh?.voice_id) {
+        voices.push(fresh);
+      } else {
+        voices.push({ voice_id: item.voice_id, __notFound: true });
+      }
+    } else if (!Object.prototype.hasOwnProperty.call(item, 'notice_period')) {
+      const fresh = await lookupVoiceById(item.voice_id, () => {});
+      voices.push(fresh?.voice_id ? fresh : item);
+    } else {
+      voices.push(item);
+    }
+  }
+
+  let message = buildVoiceNoticePeriodMessage(voices, uiLang);
   message = await translateForUserLanguage(message, uiLang);
   await safePostMessage(client, { channel: event.channel, thread_ts: threadTs, text: message });
   return true;
@@ -10788,6 +10904,38 @@ function runDevAsserts() {
       'notice: formatVoiceLine PL no-notice label'
     );
   }
+
+  // Notice period lookup: specific voice_id list should not fall through to search
+  {
+    const noticeQ = `can you check the notice period for these voices?
+- 80lPKtzJMPh1vjYMUgwe Benjamin - Deep, Smooth and Rich
+- dlGxemPxFMTY7iXagmOj Fernando Martínez - Rapid, Persuasive`;
+    const ids = extractAllVoiceIds(noticeQ);
+    devAssert(ids.length === 2, 'notice lookup: extract multiple voice ids');
+    devAssert(detectVoiceNoticePeriodIntent(noticeQ), 'notice lookup: intent with voice id list');
+    devAssert(
+      !detectVoiceNoticePeriodIntent('find polish female voices with notice period'),
+      'notice lookup: generic search excluded'
+    );
+    devAssert(
+      !detectVoiceNoticePeriodIntent('what languages do these voices support?'),
+      'notice lookup: language meta excluded'
+    );
+    const resolved = resolveVoicesForNoticePeriodQuestion(noticeQ, null);
+    devAssert(resolved.length === 2 && resolved.every((v) => v.__needsLookup), 'notice lookup: resolve pasted ids');
+    const session = {
+      voices: [
+        { voice_id: 'a', name: 'A', notice_period: 30 },
+        { voice_id: 'b', name: 'B', notice_period: null }
+      ]
+    };
+    const fromSession = resolveVoicesForNoticePeriodQuestion('check notice period for these voices', session);
+    devAssert(fromSession.length === 2, 'notice lookup: resolve from session shortlist');
+    devAssert(
+      buildVoiceNoticePeriodMessage(session.voices, 'en').includes('30 days notice period'),
+      'notice lookup: message includes notice period label'
+    );
+  }
 }
 
 async function runDevPoc() {
@@ -10961,6 +11109,10 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
 
     const compatUiLang = (guessUiLanguageFromText(cleaned) || 'en').toString().slice(0, 2).toLowerCase();
     if (await respondVoiceLanguageCompatibility(event, cleaned, threadTs, client, null, compatUiLang)) {
+      return;
+    }
+
+    if (await respondVoiceNoticePeriodLookup(event, cleaned, threadTs, client, null, uiLang)) {
       return;
     }
 
@@ -11944,6 +12096,10 @@ if (!DEV_ASSERTS_ENABLED && !isDevPocEnabled()) {
     }
 
     if (await respondVoiceLanguageCompatibility(event, cleaned, threadTs, client, existing, existing.uiLanguage)) {
+      return;
+    }
+
+    if (await respondVoiceNoticePeriodLookup(event, cleaned, threadTs, client, existing, existing.uiLanguage)) {
       return;
     }
 
