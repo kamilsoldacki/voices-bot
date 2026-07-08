@@ -9513,6 +9513,7 @@ function extractVoiceIdCandidate(text) {
 function isLikelyVoiceId(id) {
   if (!id) return false;
   if (PUBLIC_OWNER_UUID_RE.test(id)) return false;
+  if (!/\d/.test(id)) return false;
   if (/[A-Z]/.test(id) && /[a-z]/.test(id) && id.length >= 15) return true;
   if (id.length >= 18) return true;
   return /^[A-Za-z0-9]{10,32}$/.test(id) && !/^[a-z]+$/.test(id);
