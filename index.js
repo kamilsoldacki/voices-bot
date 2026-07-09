@@ -3204,6 +3204,51 @@ function buildSoftStrictBuckets(voices, ranking, iso2, requestedLocale, requeste
   return { exact, verifiedOnly, reqLocale, reqAccent };
 }
 
+function filterVoicesForSpecificVariant(voices, iso2, resolved, plan) {
+  if (!resolved || resolved.variantMode !== 'specific' || !Array.isArray(voices) || !voices.length) {
+    return voices;
+  }
+  const target = (iso2 || resolved.targetIso2 || '').toString().toLowerCase().slice(0, 2);
+  if (!target) return voices;
+
+  const reqLocale =
+    resolved.variantAxis === 'locale' && Array.isArray(resolved.variantCandidates) && resolved.variantCandidates.length
+      ? normalizeRequestedLocale(resolved.variantCandidates[0])
+      : typeof plan?.target_locale === 'string' && plan.target_locale.trim()
+        ? normalizeRequestedLocale(plan.target_locale)
+        : null;
+  const reqAccent =
+    resolved.variantAxis === 'accent' && Array.isArray(resolved.variantCandidates) && resolved.variantCandidates.length
+      ? normalizeRequestedAccent(resolved.variantCandidates[0])
+      : typeof plan?.target_accent === 'string' && plan.target_accent.trim()
+        ? normalizeRequestedAccent(plan.target_accent)
+        : null;
+
+  if (!reqLocale && !reqAccent) return voices;
+
+  const buckets = buildSoftStrictBuckets(voices, {}, target, reqLocale, reqAccent);
+  if (buckets.exact.length) return buckets.exact;
+
+  const strict = voices.filter((v) => {
+    if (!voiceHasVerifiedIso2(v, target)) return false;
+    if (!voicePrimaryLooksLikeIso2(v, target, reqLocale)) return false;
+    if (reqLocale) {
+      const locs = voiceVerifiedLocales(v, target);
+      if (locs.length && !locs.includes(reqLocale)) return false;
+    }
+    if (reqAccent) {
+      const accs = voiceVerifiedAccents(v, target);
+      const want = normalizeCatalogToken(reqAccent) || String(reqAccent).toLowerCase().trim();
+      if (accs.length) {
+        const ok = accs.some((a) => (normalizeCatalogToken(a) || String(a).toLowerCase().trim()) === want);
+        if (!ok) return false;
+      }
+    }
+    return true;
+  });
+  return strict;
+}
+
 function voiceMatchesRequestedLocale(voice, requestedLocale) {
   const req = extractLocaleFromField(requestedLocale);
   if (!voice || !req) return false;
@@ -5457,18 +5502,26 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   // fetching per-variant candidate pools (bounded number of requests) and returning
   // facetGroups alongside the combined candidate list.
   try {
-    const canFacetBrowse =
+    const hasExplicitPlanVariant = Boolean(
+      (plan.target_accent && typeof plan.target_accent === 'string' && plan.target_accent.trim()) ||
+      (plan.target_locale && typeof plan.target_locale === 'string' && plan.target_locale.trim())
+    );
+    const facetKbReady =
       language &&
       !detectBilingualEnEs(userText) &&
       facetKB &&
       facetKB.isLoaded &&
       facetKB.isLoaded() &&
       facetKB.hasIso2 &&
-      facetKB.hasIso2(language) &&
-      !(
-        (plan.target_accent && typeof plan.target_accent === 'string' && plan.target_accent.trim()) ||
-        (plan.target_locale && typeof plan.target_locale === 'string' && plan.target_locale.trim())
-      );
+      facetKB.hasIso2(language);
+    const canFacetBrowseSpecific =
+      facetKbReady &&
+      hasExplicitPlanVariant &&
+      resolved?.variantMode === 'specific' &&
+      (resolved.variantAxis === 'locale' || resolved.variantAxis === 'accent') &&
+      Array.isArray(resolved.variantCandidates) &&
+      resolved.variantCandidates.length >= 1;
+    const canFacetBrowse = facetKbReady && (!hasExplicitPlanVariant || canFacetBrowseSpecific);
 
     if (canFacetBrowse) {
       const zhDialect = language === 'zh' ? detectChineseDialectFromText(userText) : null;
@@ -5476,11 +5529,13 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
       const gccBrowse = language === 'ar' && detectGccArabicVoiceIntent(userText);
       const axis = variantIntent?.isSpecific
         ? (variantIntent.axis || 'accent')
-        : (language === 'zh' && zhDialect
-          ? 'accent'
-          : gccBrowse
+        : (canFacetBrowseSpecific
+          ? resolved.variantAxis
+          : (language === 'zh' && zhDialect
             ? 'accent'
-            : (facetKB.getAxisForIso2 ? facetKB.getAxisForIso2(language) : null));
+            : gccBrowse
+              ? 'accent'
+              : (facetKB.getAxisForIso2 ? facetKB.getAxisForIso2(language) : null)));
       const maxVariants = 4;
       let variants = [];
       if (variantIntent && variantIntent.isSpecific) {
@@ -5490,6 +5545,19 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
         const built = [];
         for (const k of queryKeys) {
           const v = facetKB.getVariantForFacetKey ? facetKB.getVariantForFacetKey(language, axis, k) : null;
+          if (v) built.push(v);
+        }
+        variants = built;
+      } else if (canFacetBrowseSpecific && resolved) {
+        const ax = resolved.variantAxis;
+        const built = [];
+        for (const k of resolved.variantCandidates.slice(0, maxVariants)) {
+          const key =
+            ax === 'locale'
+              ? normalizeLocaleToken(k) || String(k).toLowerCase().trim()
+              : normalizeCatalogToken(k) || String(k).toLowerCase().trim();
+          if (!key) continue;
+          const v = facetKB.getVariantForFacetKey ? facetKB.getVariantForFacetKey(language, ax, key) : null;
           if (v) built.push(v);
         }
         variants = built;
@@ -5526,7 +5594,8 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
         });
       } catch (_) {}
 
-      const minVariants = variantIntent && variantIntent.isSpecific ? 1 : 2;
+      const isSpecificBrowse = (variantIntent && variantIntent.isSpecific) || canFacetBrowseSpecific;
+      const minVariants = isSpecificBrowse ? 1 : 2;
       if (axis && Array.isArray(variants) && variants.length >= minVariants) {
         const wantMore = detectListAll(userText) === true || plan.__listAll === true;
         const pageSize = wantMore ? 80 : 50;
@@ -5802,6 +5871,114 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
           return allVoices;
         }
       }
+    }
+  } catch (_) {}
+
+  // Specific variant pool seed: when user asked for a concrete locale/accent, fetch that
+  // variant's catalog pool before keyword search (avoids polluting with generic language matches).
+  try {
+    if (
+      language &&
+      resolved?.variantMode === 'specific' &&
+      (resolved.variantAxis === 'locale' || resolved.variantAxis === 'accent') &&
+      Array.isArray(resolved.variantCandidates) &&
+      resolved.variantCandidates.length &&
+      seen.size < 10
+    ) {
+      const wantMore = detectListAll(userText) === true || plan.__listAll === true;
+      const pageSize = wantMore ? 80 : 50;
+      const featured = plan.__featured === true;
+      const minNoticePeriodDays =
+        plan.__no_notice_period === true
+          ? null
+          : typeof plan.__min_notice_period_days === 'number'
+            ? plan.__min_notice_period_days
+            : null;
+      const sort = typeof plan.__sort === 'string' ? plan.__sort : null;
+      const age = detectAgeFromText(userText);
+      const combinedSearch = (selectedKeywords || []).slice(0, 6).join(' ').trim();
+      const ax = resolved.variantAxis;
+      const cand = String(resolved.variantCandidates[0] || '').trim();
+      const facetKey =
+        ax === 'locale'
+          ? normalizeLocaleToken(cand) || cand.toLowerCase()
+          : normalizeCatalogToken(cand) || cand.toLowerCase();
+      const variant =
+        facetKB && facetKB.getVariantForFacetKey
+          ? facetKB.getVariantForFacetKey(language, ax, facetKey)
+          : null;
+
+      const base = new URLSearchParams();
+      base.set('page_size', String(pageSize));
+      base.set('language', String(language));
+      if (gender) base.set('gender', gender);
+      if (qualityPref === 'high_only') base.set('category', 'high_quality');
+      if (featured) base.set('featured', 'true');
+      if (typeof minNoticePeriodDays === 'number' && minNoticePeriodDays > 0) {
+        base.set('min_notice_period_days', String(minNoticePeriodDays));
+      }
+      maybeSetIncludeCustomRatesParam(base, plan);
+      if (age) base.set('age', age);
+      if (sort) base.set('sort', sort);
+
+      let fetched = [];
+      if (ax === 'locale') {
+        const locVal = normalizeRequestedLocale(cand) || cand;
+        const p = new URLSearchParams(base.toString());
+        p.set('locale', String(locVal));
+        fetched = await callSharedVoices(p);
+        if ((!fetched || fetched.length < 3) && combinedSearch) {
+          const p2 = new URLSearchParams(p.toString());
+          p2.set('search', combinedSearch);
+          const v2 = await callSharedVoices(p2);
+          if (Array.isArray(v2) && v2.length > (fetched?.length || 0)) fetched = v2;
+        }
+      } else if (ax === 'accent') {
+        const nameVal = String(variant?.facetValue || variant?.facetLabel || cand).trim();
+        if (nameVal) {
+          const p1 = new URLSearchParams(base.toString());
+          p1.set('accent', nameVal);
+          fetched = await callSharedVoices(p1);
+          if ((!fetched || fetched.length < 3) && combinedSearch) {
+            const p1s = new URLSearchParams(p1.toString());
+            p1s.set('search', combinedSearch);
+            const v1s = await callSharedVoices(p1s);
+            if (Array.isArray(v1s) && v1s.length > (fetched?.length || 0)) fetched = v1s;
+          }
+        }
+        if ((!fetched || fetched.length === 0) && variant?.slug) {
+          const p2 = new URLSearchParams(base.toString());
+          p2.set('accent', String(variant.slug));
+          fetched = await callSharedVoices(p2);
+        }
+      }
+
+      let added = 0;
+      for (const voice of fetched || []) {
+        if (!voice || !voice.voice_id) continue;
+        const tag = `specific_${ax}:${facetKey}`;
+        let entry = seen.get(voice.voice_id);
+        if (!entry) {
+          entry = { voice, matchedKeywords: new Set() };
+          added++;
+        }
+        try { entry.matchedKeywords.add(tag); } catch (_) {}
+        seen.set(voice.voice_id, entry);
+      }
+
+      try {
+        trace({
+          stage: 'specific_variant_seed',
+          params: {
+            iso2: language,
+            axis: ax,
+            facet: facetKey,
+            page_size: String(pageSize),
+            search: combinedSearch ? 'yes' : 'no'
+          },
+          count: added
+        });
+      } catch (_) {}
     }
   } catch (_) {}
 
@@ -6276,18 +6453,21 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             didAltAccentFlip = true;
           }
         }
-        // Quick relax (after triage): if still empty, retry without use_cases/accent/locale/age
+        // Quick relax (after triage): if still empty, retry without use_cases/accent/locale/age.
+        // When the user asked for a specific locale/accent variant, never drop those filters.
         if (Array.isArray(voicesForKeyword) && voicesForKeyword.length === 0) {
+          const preserveVariantFilters = resolved?.variantMode === 'specific';
           const pQuick = new URLSearchParams(params.toString());
           const keysQuick = Array.from(pQuick.keys());
           keysQuick.forEach((k) => {
-            if (k === 'use_cases' || k === 'accent' || k === 'locale' || k === 'age') pQuick.delete(k);
+            if (k === 'use_cases' || k === 'age') pQuick.delete(k);
+            if (!preserveVariantFilters && (k === 'accent' || k === 'locale')) pQuick.delete(k);
           });
           try {
             const vQuick = await callSharedVoices(pQuick);
             try {
               trace({
-                stage: 'per_keyword_quick_relax',
+                stage: preserveVariantFilters ? 'per_keyword_quick_relax_keep_variant' : 'per_keyword_quick_relax',
                 keyword: kwUsed,
                 variant,
                 kw_original: kwOriginal,
@@ -6889,6 +7069,24 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     if (verifiedBoth.length > 0) {
       voices = verifiedBoth;
     }
+  }
+
+  // Specific variant: drop keyword-polluted candidates that don't match the requested locale/accent.
+  if (resolved?.variantMode === 'specific' && language && voices.length) {
+    const beforeVariant = voices.length;
+    voices = filterVoicesForSpecificVariant(voices, language, resolved, plan);
+    try {
+      trace({
+        stage: 'specific_variant_filter',
+        params: {
+          iso2: language,
+          axis: resolved.variantAxis || '-',
+          candidates: (resolved.variantCandidates || []).slice(0, 3).join(',') || '-',
+          before: String(beforeVariant)
+        },
+        count: voices.length
+      });
+    } catch (_) {}
   }
 
   // Post-filter: prefer candidates matching at least one non-generic keyword
@@ -10787,6 +10985,34 @@ function runDevAsserts() {
     const b = buildSoftStrictBuckets([v3], ranking, 'ko', null, null);
     devAssert(Array.isArray(b.exact) && b.exact.length === 0, 'primary mismatch should not be exact');
     devAssert(Array.isArray(b.verifiedOnly) && b.verifiedOnly.some((x) => x.voice_id === 'v3'), 'primary mismatch goes to verified-only');
+  }
+
+  // Specific variant filter: reject generic pt voices when user asked for pt-PT
+  {
+    const ptPt = {
+      voice_id: 'ptpt1',
+      name: 'Maria',
+      language: 'pt',
+      locale: 'pt-PT',
+      accent: 'european',
+      verified_languages: [{ language: 'pt', locale: 'pt-PT', accent: 'european' }]
+    };
+    const ptGeneric = {
+      voice_id: 'ptgen1',
+      name: 'Tripti',
+      language: 'pt',
+      accent: 'indian',
+      verified_languages: [{ language: 'pt', accent: 'indian' }]
+    };
+    const resolved = {
+      variantMode: 'specific',
+      variantAxis: 'locale',
+      variantCandidates: ['pt-PT'],
+      targetIso2: 'pt'
+    };
+    const plan = { target_locale: 'pt-PT', target_accent: 'european' };
+    const out = filterVoicesForSpecificVariant([ptPt, ptGeneric], 'pt', resolved, plan);
+    devAssert(out.length === 1 && out[0].voice_id === 'ptpt1', 'specific variant filter keeps pt-PT only');
   }
 
   // Negatives: "not audiobook" should be recognized and pruned
