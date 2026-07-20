@@ -2296,15 +2296,36 @@ function voiceMetadataBlob(voice) {
  * Soft on-brief / off-brief score from voice metadata vs brief family.
  * Critical when facet-browse returns the same language pool for every use case.
  */
-function scoreVoiceUseCaseFit(voice, family) {
+function scoreVoiceUseCaseFit(voice, family, userText) {
   if (!family || !voice) return 0;
   const blob = voiceMetadataBlob(voice);
   if (!blob.trim()) return 0;
+  const lowerQ = (userText || '').toLowerCase();
   const has = (...tokens) => tokens.some((t) => t && blob.includes(t));
+  const queryAsks = (...tokens) => tokens.some((t) => t && lowerQ.includes(t));
   let score = 0;
 
   const isProNarration =
     family === 'narrative' || family === 'articles' || family === 'educational';
+  const hasNarratorSignal =
+    has('narrat') || has('storytell') || has('audiobook') || has('voiceover') || has('voice over');
+  const isSeasonalCharacter =
+    has('santa') ||
+    has('christmas') ||
+    has('xmas') ||
+    has('claus') ||
+    has('elf') ||
+    has('halloween') ||
+    has('easter bunny') ||
+    has('krampus');
+  const isRomanceNiche =
+    has('romantic') ||
+    has('romance') ||
+    has('seductive') ||
+    has('sensual') ||
+    has('intimate') ||
+    has('sexy') ||
+    (has('soft') && has('romantic'));
 
   if (isProNarration) {
     // Hard off-brief niches for articles / audiobooks / educational
@@ -2326,11 +2347,21 @@ function scoreVoiceUseCaseFit(voice, family) {
     if (has('theatrical') && (family === 'articles' || family === 'educational')) score -= 1.3;
     if (has('gritty') && family === 'articles') score -= 0.9;
 
-    // On-brief positives
+    // On-brief positives (shared)
     if (has('narrat') || has('storytell') || has('storytelling')) score += 1.6;
     if (has('audiobook')) score += family === 'narrative' ? 2.2 : 0.4;
     if (has('deep') || has('resonant') || has('authoritative') || has('confident')) score += 1.1;
-    if (has('calm') || has('warm') || has('clear') || has('professional') || has('neutral')) {
+    // Warm/calm/clear: prefer with narrator signals; avoid boosting soft-romantic/seasonal alone
+    if (has('clear') || has('professional') || has('neutral')) {
+      score += 0.9;
+    } else if (
+      (has('calm') || has('warm')) &&
+      hasNarratorSignal &&
+      !isSeasonalCharacter &&
+      !isRomanceNiche
+    ) {
+      score += 0.9;
+    } else if ((has('calm') || has('warm')) && family !== 'narrative') {
       score += 0.9;
     }
   }
@@ -2351,10 +2382,30 @@ function scoreVoiceUseCaseFit(voice, family) {
     if (family === 'educational' && (has('teacher') || has('tutor') || has('lesson') || has('learning'))) {
       score += 0.8;
     }
+    // Mild: seasonal / pure romance less ideal for articles/edu (don't over-penalize)
+    if (isSeasonalCharacter && !queryAsks('santa', 'christmas', 'holiday')) score -= 1.2;
+    if (isRomanceNiche && !queryAsks('romantic', 'romance', 'sensual')) score -= 0.8;
   }
 
   if (family === 'narrative') {
-    if (has('story') || has('fiction') || has('novel') || has('dramatic')) score += 0.7;
+    // Generic audiobook brief: prefer clear narrators, not seasonal/character or soft-romance niches
+    if (isSeasonalCharacter && !queryAsks('santa', 'christmas', 'xmas', 'holiday', 'claus')) {
+      score -= 2.8;
+    }
+    if (isRomanceNiche && !queryAsks('romantic', 'romance', 'sensual', 'intimate', 'seductive')) {
+      score -= 2.2;
+    }
+    // Soft-only / gentle-without-narrator is weak for generic "best audiobooks"
+    if (
+      (has('soft') || has('gentle') || has('soothing')) &&
+      !hasNarratorSignal &&
+      !queryAsks('soft', 'gentle', 'soothing', 'romantic')
+    ) {
+      score -= 1.2;
+    }
+    // Prefer explicit audiobook / narrator framing over vague "story"
+    if (has('audiobook') || has('narrat')) score += 0.6;
+    if (/\bfiction\b/.test(blob) || /\bnovel\b/.test(blob) || has('dramatic')) score += 0.5;
   }
 
   if (family === 'conversational') {
@@ -5002,12 +5053,18 @@ function ensureKeywordFloor(userText, plan) {
     (out.character_keywords?.length || 0) +
     (out.style_keywords?.length || 0) +
     (out.extra_keywords?.length || 0);
-  if (countAll >= 8) return out;
+  if (countAll >= 8) {
+    out.__briefFamily = inferBriefUseCaseFamily(userText, out);
+    return out;
+  }
 
   // If user specified a clear regional/accent term and has at least a few keywords,
   // don't pad with generic support/call-center terms
   const hasRegionalFocus = hasRegionalKeywordFocus(lower);
-  if (hasRegionalFocus && countAll >= 3) return out;
+  if (hasRegionalFocus && countAll >= 3) {
+    out.__briefFamily = inferBriefUseCaseFamily(userText, out);
+    return out;
+  }
 
   const addUnique = (arr, items, cap) => {
     const base = Array.isArray(arr) ? arr : [];
@@ -6392,8 +6449,8 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
               plan.__briefFamily || inferBriefUseCaseFamily(userText, plan);
             if (briefFamily) {
               allVoices.sort((a, b) => {
-                const fa = scoreVoiceUseCaseFit(a, briefFamily);
-                const fb = scoreVoiceUseCaseFit(b, briefFamily);
+                const fa = scoreVoiceUseCaseFit(a, briefFamily, userText);
+                const fb = scoreVoiceUseCaseFit(b, briefFamily, userText);
                 if (fb !== fa) return fb - fa;
                 const ua = a.usage_character_count_1y || a.usage_character_count_7d || 0;
                 const ub = b.usage_character_count_1y || b.usage_character_count_7d || 0;
@@ -6401,7 +6458,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
               });
               for (const v of allVoices) {
                 try {
-                  v._brief_fit = scoreVoiceUseCaseFit(v, briefFamily);
+                  v._brief_fit = scoreVoiceUseCaseFit(v, briefFamily, userText);
                   v._coverageScore = v._brief_fit;
                 } catch (_) {}
               }
@@ -7818,7 +7875,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     let coverage = 3 * useCase + 3 * style + 2 * character + 1 * tone;
     // Metadata fit vs brief use-case (ASMR/chipmunk/support vs articles/audiobooks/edu)
     try {
-      const fit = scoreVoiceUseCaseFit(v, briefFamily);
+      const fit = scoreVoiceUseCaseFit(v, briefFamily, userText);
       coverage += fit;
       v._brief_fit = fit;
     } catch (_) {}
@@ -9658,6 +9715,19 @@ function pickQueryUseCases(plan, userText) {
     set.delete('conversational');
   }
 
+  // Keep API use_cases exclusive to the brief family.
+  // GPT plans often add "narration/storytelling" onto articles/educational, which wrongly
+  // OR'd narrative_story into facet browse (report showed use_cases=narrative_story).
+  if (briefFamily === 'articles' || briefFamily === 'educational') {
+    set.delete('narrative_story');
+    set.delete('characters_animation');
+    set.add('informative_educational');
+  } else if (briefFamily === 'narrative') {
+    set.delete('informative_educational');
+    set.delete('characters_animation');
+    set.add('narrative_story');
+  }
+
   // Deterministic priority: prefer conversational for support/call-center intents,
   // but prefer narrative/edu when that is the brief family.
   let priority = [
@@ -9692,6 +9762,10 @@ function pickQueryUseCases(plan, userText) {
   }
 
   const ordered = priority.filter((p) => set.has(p));
+  // For clear brief families, send a single exclusive use_cases value.
+  if (briefFamily === 'articles' || briefFamily === 'educational' || briefFamily === 'narrative') {
+    return ordered.slice(0, 1);
+  }
   return ordered.slice(0, 2);
 }
 
@@ -12182,12 +12256,30 @@ function runDevAsserts() {
     const rAud = pickQueryUseCases(polluted, 'best german voices for audiobooks, high quality');
     devAssert(rAud.includes('narrative_story'), 'use_case: audiobook brief prefers narrative_story');
     devAssert(!rAud.includes('conversational'), 'use_case: audiobook brief drops floor conversational');
+    devAssert(
+      rAud.length === 1 && rAud[0] === 'narrative_story',
+      'use_case: audiobooks exclusive narrative_story'
+    );
     const rArt = pickQueryUseCases(
-      { use_case_keywords: ['conversational', 'support', 'article'] },
+      { use_case_keywords: ['conversational', 'support', 'article', 'narration', 'storytelling'] },
       'best german voices for articles, high quality'
     );
     devAssert(rArt.includes('informative_educational'), 'use_case: articles -> informative_educational');
     devAssert(!rArt.includes('conversational'), 'use_case: articles drops floor conversational');
+    devAssert(!rArt.includes('narrative_story'), 'use_case: articles must not send narrative_story');
+    devAssert(
+      rArt.length === 1 && rArt[0] === 'informative_educational',
+      'use_case: articles exclusive informative_educational'
+    );
+    const rEdu = pickQueryUseCases(
+      { use_case_keywords: ['educational', 'narration', 'storytelling'] },
+      'best german voices for educational, high quality'
+    );
+    devAssert(
+      rEdu.length === 1 && rEdu[0] === 'informative_educational',
+      'use_case: educational exclusive informative_educational'
+    );
+    devAssert(!rEdu.includes('narrative_story'), 'use_case: educational must not send narrative_story');
   }
   {
     const floorAud = ensureKeywordFloor('best german voices for audiobooks, high quality', {
@@ -12242,20 +12334,24 @@ function runDevAsserts() {
       description: 'Deep resonant German narrator for audiobooks',
       descriptive: 'deep, resonant, narration, calm'
     };
-    const fitNarr = 'narrative';
-    const fitArt = 'articles';
-    const fitEdu = 'educational';
-    for (const fam of [fitNarr, fitArt, fitEdu]) {
+    const qArt = 'best german voices for articles, high quality';
+    const qAud = 'best german voices for audiobooks, high quality';
+    const qEdu = 'best german voices for educational, high quality';
+    for (const [fam, q] of [
+      ['narrative', qAud],
+      ['articles', qArt],
+      ['educational', qEdu]
+    ]) {
       devAssert(
-        scoreVoiceUseCaseFit(narrator, fam) > scoreVoiceUseCaseFit(asmr, fam),
+        scoreVoiceUseCaseFit(narrator, fam, q) > scoreVoiceUseCaseFit(asmr, fam, q),
         `brief fit: narrator beats ASMR for ${fam}`
       );
       devAssert(
-        scoreVoiceUseCaseFit(narrator, fam) > scoreVoiceUseCaseFit(chipmunk, fam),
+        scoreVoiceUseCaseFit(narrator, fam, q) > scoreVoiceUseCaseFit(chipmunk, fam, q),
         `brief fit: narrator beats chipmunk for ${fam}`
       );
       devAssert(
-        scoreVoiceUseCaseFit(narrator, fam) > scoreVoiceUseCaseFit(support, fam),
+        scoreVoiceUseCaseFit(narrator, fam, q) > scoreVoiceUseCaseFit(support, fam, q),
         `brief fit: narrator beats customer support for ${fam}`
       );
     }
@@ -12265,16 +12361,52 @@ function runDevAsserts() {
       descriptive: 'clear, professional, informative, educational'
     };
     devAssert(
-      scoreVoiceUseCaseFit(eduVoice, 'educational') > scoreVoiceUseCaseFit(asmr, 'educational'),
+      scoreVoiceUseCaseFit(eduVoice, 'educational', qEdu) > scoreVoiceUseCaseFit(asmr, 'educational', qEdu),
       'brief fit: educational explainer beats ASMR'
     );
     devAssert(
-      scoreVoiceUseCaseFit(eduVoice, 'articles') > scoreVoiceUseCaseFit(chipmunk, 'articles'),
+      scoreVoiceUseCaseFit(eduVoice, 'articles', qArt) > scoreVoiceUseCaseFit(chipmunk, 'articles', qArt),
       'brief fit: articles prefers educational over chipmunk'
+    );
+    const santa = {
+      name: 'Nicholas - Gentle Santa Claus',
+      description: 'Gentle Santa Claus for holiday stories',
+      descriptive: 'gentle, warm, santa, christmas'
+    };
+    const softRomantic = {
+      name: 'Irene soft and romantic',
+      description: 'Soft romantic intimate voice',
+      descriptive: 'soft, romantic, warm'
+    };
+    const marcus = {
+      name: 'Marcus Deep & Calm German',
+      description: 'Deep and calm German audiobook narrator',
+      descriptive: 'deep, calm, narration, audiobook, professional'
+    };
+    const tristan = {
+      name: 'Tristan',
+      description: 'Warm audiobook storytelling narrator',
+      descriptive: 'audiobook, storytelling, warm, clear'
+    };
+    devAssert(
+      scoreVoiceUseCaseFit(marcus, 'narrative', qAud) > scoreVoiceUseCaseFit(santa, 'narrative', qAud),
+      'brief fit: deep calm narrator beats Santa on generic audiobooks'
+    );
+    devAssert(
+      scoreVoiceUseCaseFit(tristan, 'narrative', qAud) > scoreVoiceUseCaseFit(santa, 'narrative', qAud),
+      'brief fit: audiobook storyteller beats Santa on generic audiobooks'
+    );
+    devAssert(
+      scoreVoiceUseCaseFit(marcus, 'narrative', qAud) > scoreVoiceUseCaseFit(softRomantic, 'narrative', qAud),
+      'brief fit: deep calm narrator beats soft-romantic on generic audiobooks'
+    );
+    devAssert(
+      scoreVoiceUseCaseFit(tristan, 'narrative', qAud) > scoreVoiceUseCaseFit(softRomantic, 'narrative', qAud),
+      'brief fit: audiobook storyteller beats soft-romantic on generic audiobooks'
     );
   }
   {
-    const rArticle = pickQueryUseCases({ use_case_keywords: ['article'] });
+    const rArticle = pickQueryUseCases({ use_case_keywords: ['article'] }, 'voices for articles');
     devAssert(
       Array.isArray(rArticle) && rArticle.includes('informative_educational'),
       'use_case: article maps to informative_educational'
