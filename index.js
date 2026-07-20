@@ -2418,6 +2418,83 @@ function scoreVoiceUseCaseFit(voice, family, userText) {
   return score;
 }
 
+/** German-compatible accents from FacetKB / common DE labels (incl. regional). */
+function isGermanCompatibleAccent(accent) {
+  const a = normalizeCatalogToken(accent);
+  if (!a) return false;
+  if (a === 'american german' || a === 'american-german') return true;
+  return /\b(standard|german|deutsch|bavarian|swabian|berlinerisch|berlin|saxon|austrian|swiss|viennese|de-standard|southern|central|rhine|franconian|hamburg|cologne|koeln|köln)\b/.test(
+    a
+  );
+}
+
+/** Accents that are clearly non-German when the brief is lang=de. */
+function isForeignAccentVsGerman(accent) {
+  const a = normalizeCatalogToken(accent);
+  if (!a || isGermanCompatibleAccent(a)) return false;
+  return /\b(american|british|english|latin american|australian|irish|scottish|canadian|indian|mexican|spanish|french|italian|portuguese|brazilian|castilian|received pronunciation)\b/.test(
+    a
+  );
+}
+
+/**
+ * When target language is de and the user did not ask for a foreign accent,
+ * strongly demote american/british/latam/etc. voices that leak into German HQ pools.
+ */
+function scoreLanguageAccentFit(voice, plan, userText) {
+  const iso2 = (plan?.target_voice_language || '')
+    .toString()
+    .toLowerCase()
+    .slice(0, 2);
+  if (iso2 !== 'de') return 0;
+
+  const accent = normalizeCatalogToken(voice?.accent || '');
+  if (!accent) return 0;
+
+  const lowerQ = (userText || '').toLowerCase();
+  const planAcc = normalizeCatalogToken(plan?.target_accent || '');
+
+  // Explicit accent request (plan or text): do not demote matching foreign accents.
+  const explicitForeignTokens = [
+    'american',
+    'british',
+    'latin american',
+    'australian',
+    'irish',
+    'scottish',
+    'canadian',
+    'indian'
+  ].filter((t) => {
+    if (planAcc && (planAcc === t || planAcc.includes(t))) return true;
+    // Require accent/with context OR clear "X accent" so "American German" brand names in unrelated queries don't count.
+    // "german with american accent" / "american accent" / plan.target_accent=american
+    if (!lowerQ.includes(t)) return false;
+    if (t === 'american' && /\bamerican\s+german\b/.test(lowerQ)) return false;
+    return (
+      /\baccent\b/.test(lowerQ) ||
+      new RegExp(`\\bwith\\s+${t.replace(/\s+/g, '\\s+')}\\b`).test(lowerQ) ||
+      new RegExp(`\\b${t.replace(/\s+/g, '\\s+')}\\s+accent\\b`).test(lowerQ)
+    );
+  });
+
+  if (explicitForeignTokens.length) {
+    if (explicitForeignTokens.some((t) => accent === t || accent.includes(t))) return 1.2;
+    // User asked for a foreign accent; don't apply the German-native demotion path.
+    return 0;
+  }
+
+  if (isGermanCompatibleAccent(accent)) return 0.8;
+  if (isForeignAccentVsGerman(accent)) return -3.5;
+  return 0;
+}
+
+/** Combined brief rank score used by facet-browse ordering and coverage. */
+function scoreVoiceBriefRank(voice, family, userText, plan) {
+  return (
+    scoreVoiceUseCaseFit(voice, family, userText) + scoreLanguageAccentFit(voice, plan, userText)
+  );
+}
+
 function filterKeywordsGlobally(userText, keywords) {
   const out = [];
   const seen = new Set();
@@ -6449,8 +6526,8 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
               plan.__briefFamily || inferBriefUseCaseFamily(userText, plan);
             if (briefFamily) {
               allVoices.sort((a, b) => {
-                const fa = scoreVoiceUseCaseFit(a, briefFamily, userText);
-                const fb = scoreVoiceUseCaseFit(b, briefFamily, userText);
+                const fa = scoreVoiceBriefRank(a, briefFamily, userText, plan);
+                const fb = scoreVoiceBriefRank(b, briefFamily, userText, plan);
                 if (fb !== fa) return fb - fa;
                 const ua = a.usage_character_count_1y || a.usage_character_count_7d || 0;
                 const ub = b.usage_character_count_1y || b.usage_character_count_7d || 0;
@@ -6458,7 +6535,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
               });
               for (const v of allVoices) {
                 try {
-                  v._brief_fit = scoreVoiceUseCaseFit(v, briefFamily, userText);
+                  v._brief_fit = scoreVoiceBriefRank(v, briefFamily, userText, plan);
                   v._coverageScore = v._brief_fit;
                 } catch (_) {}
               }
@@ -7874,8 +7951,9 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     const tone = (plan.tone_keywords || []).filter((k) => set.has(k)).length;
     let coverage = 3 * useCase + 3 * style + 2 * character + 1 * tone;
     // Metadata fit vs brief use-case (ASMR/chipmunk/support vs articles/audiobooks/edu)
+    // + language-accent fit (e.g. demote american/british on lang=de briefs)
     try {
-      const fit = scoreVoiceUseCaseFit(v, briefFamily, userText);
+      const fit = scoreVoiceBriefRank(v, briefFamily, userText, plan);
       coverage += fit;
       v._brief_fit = fit;
     } catch (_) {}
@@ -12403,6 +12481,65 @@ function runDevAsserts() {
     devAssert(
       scoreVoiceUseCaseFit(tristan, 'narrative', qAud) > scoreVoiceUseCaseFit(softRomantic, 'narrative', qAud),
       'brief fit: audiobook storyteller beats soft-romantic on generic audiobooks'
+    );
+  }
+  // lang=de: foreign accents must not beat German-compatible accents on articles/educational
+  {
+    const planDe = { target_voice_language: 'de' };
+    const qArt = 'best german voices for articles, high quality';
+    const qEdu = 'best german voices for educational, high quality';
+    const deNarrator = {
+      name: 'Arthur Narrative & Educational',
+      accent: 'standard',
+      description: 'Clear German educational narrator',
+      descriptive: 'informative, educational, clear, professional'
+    };
+    const american = {
+      name: 'Nichalia Schwartz - Bright and Friendly',
+      accent: 'american',
+      description: 'Bright and friendly',
+      descriptive: 'friendly, clear, professional'
+    };
+    const british = {
+      name: 'Casey - Clean, Crisp and Friendly',
+      accent: 'british',
+      description: 'Clean crisp friendly',
+      descriptive: 'clear, friendly, professional'
+    };
+    const latam = {
+      name: 'Mía García - Business Asesor',
+      accent: 'latin american',
+      description: 'Business advisor',
+      descriptive: 'professional, clear, informative'
+    };
+    for (const [fam, q] of [
+      ['articles', qArt],
+      ['educational', qEdu]
+    ]) {
+      const deScore = scoreVoiceBriefRank(deNarrator, fam, q, planDe);
+      devAssert(
+        deScore > scoreVoiceBriefRank(american, fam, q, planDe),
+        `lang=de: german accent beats american on ${fam}`
+      );
+      devAssert(
+        deScore > scoreVoiceBriefRank(british, fam, q, planDe),
+        `lang=de: german accent beats british on ${fam}`
+      );
+      devAssert(
+        deScore > scoreVoiceBriefRank(latam, fam, q, planDe),
+        `lang=de: german accent beats latin american on ${fam}`
+      );
+      devAssert(
+        scoreLanguageAccentFit(american, planDe, q) < 0,
+        `lang=de: american accent demoted on ${fam}`
+      );
+    }
+    // Intentional foreign accent request must not demote matching voices
+    const qAm = 'best german voices with american accent for articles';
+    const planAm = { target_voice_language: 'de', target_accent: 'american' };
+    devAssert(
+      scoreLanguageAccentFit(american, planAm, qAm) >= 0,
+      'lang=de: explicit american accent request does not demote american'
     );
   }
   {
