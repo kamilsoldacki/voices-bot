@@ -37,6 +37,20 @@ const SHARED_VOICES_CACHE_TTL_MS = 7 * 60 * 1000; // 7 minutes
 const sharedVoicesAccentFormCache = new Map();
 const SHARED_VOICES_ACCENT_FORM_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
 
+const SHARED_VOICES_SORT_MAP = Object.freeze({
+  usage_desc: 'usage_character_count_1y',
+  date_desc: 'created_date',
+  created_date: 'created_date',
+  usage_character_count_1y: 'usage_character_count_1y',
+  trending: 'trending',
+  cloned_by_count: 'cloned_by_count'
+});
+
+const officialVoiceAccentsCache = new Map(); // language -> { at:number, accents:string[] }
+const OFFICIAL_VOICE_ACCENTS_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const voiceModelMetadataCache = new Map(); // voice_id -> { at:number, modelIds:string[]|null }
+const VOICE_MODEL_METADATA_TTL_MS = 15 * 60 * 1000; // 15 minutes
+
 // Keyword translation/expansion cache (LLM) for non-English search terms
 const keywordTranslateCache = new Map(); // key -> { at:number, iso2:string, src:string, out:string[] }
 const KEYWORD_TRANSLATE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -66,6 +80,127 @@ function normalizeCatalogToken(s) {
     .toLowerCase()
     .replace(/\s+/g, ' ')
     .replace(/_/g, '-');
+}
+
+function mapSharedVoicesSortValue(sort) {
+  const key = (sort || '').toString().trim().toLowerCase();
+  return SHARED_VOICES_SORT_MAP[key] || null;
+}
+
+function normalizeVoiceAccentsLanguage(language) {
+  const value = (language || '').toString().trim().toLowerCase();
+  return /^[a-z]{2}$/.test(value) ? value : null;
+}
+
+function parseOfficialVoiceAccentsResponse(data) {
+  const rows = Array.isArray(data) ? data : (Array.isArray(data?.accents) ? data.accents : []);
+  const seen = new Set();
+  const accents = [];
+  for (const row of rows) {
+    const value = typeof row === 'string' ? row : row?.accent;
+    const accent = (value || '').toString().trim();
+    const key = normalizeCatalogToken(accent);
+    if (!accent || !key || seen.has(key)) continue;
+    seen.add(key);
+    accents.push(accent);
+  }
+  return accents;
+}
+
+function getCachedOfficialVoiceAccents(language) {
+  const code = normalizeVoiceAccentsLanguage(language);
+  if (!code) return null;
+  const hit = officialVoiceAccentsCache.get(code);
+  if (!hit || Date.now() - hit.at > OFFICIAL_VOICE_ACCENTS_TTL_MS) {
+    if (hit) officialVoiceAccentsCache.delete(code);
+    return null;
+  }
+  return Array.isArray(hit.accents) ? hit.accents : [];
+}
+
+function resolveOfficialAccentForApiParam(language, accent) {
+  const accents = getCachedOfficialVoiceAccents(language);
+  if (!Array.isArray(accents) || !accents.length) return null;
+  const want = normalizeCatalogToken(accent);
+  const wantLoose = want.replace(/-/g, ' ');
+  return accents.find((candidate) => {
+    const key = normalizeCatalogToken(candidate);
+    return key === want || key.replace(/-/g, ' ') === wantLoose;
+  }) || null;
+}
+
+async function fetchOfficialVoiceAccents(language) {
+  const code = normalizeVoiceAccentsLanguage(language);
+  if (!code || !process.env.ELEVENLABS_API_KEY || !axios) return [];
+  const cached = getCachedOfficialVoiceAccents(code);
+  if (cached !== null) return cached;
+  try {
+    const params = new URLSearchParams();
+    params.set('language', code);
+    const res = await httpGetWithRetry(
+      `https://api.elevenlabs.io/v1/voices/accents?${params.toString()}`,
+      {
+        headers: {
+          'xi-api-key': process.env.ELEVENLABS_API_KEY,
+          'Content-Type': 'application/json'
+        },
+        timeout: 10000
+      }
+    );
+    const accents = parseOfficialVoiceAccentsResponse(res?.data);
+    officialVoiceAccentsCache.set(code, { at: Date.now(), accents });
+    return accents;
+  } catch (_) {
+    return [];
+  }
+}
+
+function sanitizeSharedVoicesParams(params) {
+  const safe = new URLSearchParams(params?.toString?.() || '');
+  if (safe.has('sort')) {
+    const mapped = mapSharedVoicesSortValue(safe.get('sort'));
+    if (mapped) safe.set('sort', mapped);
+    else safe.delete('sort');
+  }
+
+  const language = normalizeVoiceAccentsLanguage(safe.get('language'));
+  const accent = (safe.get('accent') || '').toString().trim();
+  const officialAccents = language ? getCachedOfficialVoiceAccents(language) : null;
+  if (accent && Array.isArray(officialAccents) && officialAccents.length) {
+    const official = resolveOfficialAccentForApiParam(language, accent);
+    if (official) safe.set('accent', official);
+    else safe.delete('accent');
+  } else if (accent && language) {
+    // Official endpoint unavailable/empty: enforce the existing FacetKB allowlist when it knows this language.
+    try {
+      const verdict =
+        facetKB && facetKB.isLoaded?.() && facetKB.checkAccentAllowed
+          ? facetKB.checkAccentAllowed(language, accent)
+          : null;
+      if (verdict?.known && verdict.allowed !== true) safe.delete('accent');
+    } catch (_) {}
+  }
+  return safe;
+}
+
+function parseSharedVoicesResponse(data) {
+  const total = Number(data?.total_count);
+  const lastSortId = data?.last_sort_id;
+  return {
+    voices: Array.isArray(data?.voices) ? data.voices : [],
+    has_more: data?.has_more === true,
+    total_count: Number.isFinite(total) && total >= 0 ? total : null,
+    last_sort_id:
+      typeof lastSortId === 'string' || typeof lastSortId === 'number'
+        ? String(lastSortId)
+        : null
+  };
+}
+
+function normalizeSimilarVoicesTopK(value, fallback = 20) {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1 || n > 100) return fallback;
+  return n;
 }
 
 function escapeRegExp(s) {
@@ -172,6 +307,8 @@ function normalizeAccentForApiParam(iso2, accent) {
   const raw = (accent || '').toString().toLowerCase().trim();
   if (!raw) return null;
   const lang = (iso2 || '').toString().toLowerCase().slice(0, 2);
+  const official = resolveOfficialAccentForApiParam(lang, raw);
+  if (official) return official;
   const hasSpaces = /\s/.test(raw);
   const forceSlugs = readEnvBoolean('FORCE_ACCENT_SLUGS', false);
 
@@ -428,7 +565,19 @@ class AccentCatalog {
     const XI_KEY = process.env.ELEVENLABS_API_KEY;
     if (!XI_KEY) return false;
 
-    // Fetch a bounded sample of shared voices for the language and extract accent/locale-ish metadata.
+    // Prefer the official accents catalog. It maps 1:1 to shared-voices `accent=`.
+    const officialAccents = await fetchOfficialVoiceAccents(code);
+    if (officialAccents.length) {
+      const bucket = this._ensureBucket(code);
+      if (!bucket) return false;
+      bucket.accents = new Set(officialAccents.map(normalizeCatalogToken).filter(Boolean));
+      if (code === 'zh') {
+        this.zhAccentSlugs = officialAccents.map(slugifyAccentName).filter(Boolean);
+      }
+      return true;
+    }
+
+    // Fallback: fetch a bounded shared-voices sample for locale-ish metadata.
     const baseParams = new URLSearchParams();
     baseParams.set('page_size', String(this.refreshPageSize));
     baseParams.set('sort', 'created_date');
@@ -437,22 +586,10 @@ class AccentCatalog {
     let voices = [];
     try {
       const p = new URLSearchParams(baseParams.toString());
-      p.set('required_languages', code);
+      p.set('language', code);
       voices = await callSharedVoicesAllPages(p, { maxPages: this.refreshMaxPages, cap: this.refreshCap });
-    } catch (e) {
-      const status = e?.response?.status;
-      // Fallback to `language=` if `required_languages=` isn't accepted by this endpoint/account
-      if (status === 400) {
-        try {
-          const p2 = new URLSearchParams(baseParams.toString());
-          p2.set('language', code);
-          voices = await callSharedVoicesAllPages(p2, { maxPages: this.refreshMaxPages, cap: this.refreshCap });
-        } catch (_) {
-          voices = [];
-        }
-      } else {
-        voices = [];
-      }
+    } catch (_) {
+      voices = [];
     }
 
     const buckets = this._extractBucketsFromVoices(voices || []);
@@ -1975,6 +2112,266 @@ async function httpPostWithRetry(url, data, config, retryOptions = null) {
     },
     retryOptions || undefined
   );
+}
+
+const ISO3_TO_ISO2 = {
+  ara: 'ar',
+  bul: 'bg',
+  ces: 'cs',
+  cmn: 'zh',
+  dan: 'da',
+  deu: 'de',
+  ell: 'el',
+  eng: 'en',
+  fil: 'tl',
+  fin: 'fi',
+  fra: 'fr',
+  hin: 'hi',
+  hrv: 'hr',
+  hun: 'hu',
+  ind: 'id',
+  ita: 'it',
+  jpn: 'ja',
+  kor: 'ko',
+  msa: 'ms',
+  nld: 'nl',
+  nor: 'no',
+  pol: 'pl',
+  por: 'pt',
+  ron: 'ro',
+  rus: 'ru',
+  slk: 'sk',
+  spa: 'es',
+  swe: 'sv',
+  tam: 'ta',
+  tur: 'tr',
+  ukr: 'uk',
+  vie: 'vi'
+};
+
+function parseCsvRows(text) {
+  const rows = [];
+  let row = [];
+  let cell = '';
+  let inQuotes = false;
+  const s = String(text || '').replace(/^\uFEFF/, '');
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (s[i + 1] === '"') {
+          cell += '"';
+          i += 1;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        cell += c;
+      }
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ',') {
+      row.push(cell);
+      cell = '';
+    } else if (c === '\n') {
+      if (cell.endsWith('\r')) cell = cell.slice(0, -1);
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = '';
+    } else {
+      cell += c;
+    }
+  }
+  if (cell.length || row.length) {
+    row.push(cell);
+    rows.push(row);
+  }
+  return rows;
+}
+
+function v3ArenaCsvPath() {
+  const fromEnv = String(process.env.V3_RANKINGS_CSV_PATH || '').trim();
+  if (fromEnv) return path.resolve(fromEnv);
+  return path.resolve(__dirname, './voice_arena_final_rankings.csv');
+}
+
+let v3ArenaRowsCache = null;
+
+function loadV3ArenaRankings() {
+  if (Array.isArray(v3ArenaRowsCache)) return v3ArenaRowsCache;
+  try {
+    const csvPath = v3ArenaCsvPath();
+    if (!fs.existsSync(csvPath)) {
+      v3ArenaRowsCache = [];
+      return v3ArenaRowsCache;
+    }
+    const rows = parseCsvRows(fs.readFileSync(csvPath, 'utf8'));
+    if (!rows.length) {
+      v3ArenaRowsCache = [];
+      return v3ArenaRowsCache;
+    }
+    const header = (rows[0] || []).map((h) =>
+      String(h || '')
+        .toLowerCase()
+        .replace(/^\uFEFF/, '')
+        .replace(/[^a-z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+    );
+    const idx = (name) => header.indexOf(name);
+    const iModel = idx('model');
+    const iLang3 = idx('language_code');
+    const iLang = idx('language');
+    const iRank = idx('final_rank');
+    const iId = idx('voice_id');
+    const iName = idx('voice_name');
+    const out = [];
+    for (let r = 1; r < rows.length; r++) {
+      const cells = rows[r] || [];
+      const voiceId = String(cells[iId] || '').trim();
+      const model = String(cells[iModel] || '').trim();
+      if (!voiceId || !model) continue;
+      const rank = Number(cells[iRank]);
+      out.push({
+        model,
+        language_code: String(cells[iLang3] || '').trim().toLowerCase(),
+        language: String(cells[iLang] || '').trim(),
+        final_rank: Number.isFinite(rank) ? rank : 999,
+        voice_id: voiceId,
+        voice_name: String(cells[iName] || '').trim()
+      });
+    }
+    v3ArenaRowsCache = out;
+    return out;
+  } catch (err) {
+    console.warn('Failed to load V3 arena rankings CSV:', String(err?.message || err).slice(0, 160));
+    v3ArenaRowsCache = [];
+    return v3ArenaRowsCache;
+  }
+}
+
+function iso2ToArenaLangCodes(iso2) {
+  const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+  if (!k) return [];
+  if (k === 'zh') return ['cmn'];
+  if (k === 'tl' || k === 'fl') return ['fil'];
+  return Object.keys(ISO3_TO_ISO2).filter((iso3) => ISO3_TO_ISO2[iso3] === k);
+}
+
+function detectBestV3CuratedIntent(text) {
+  if (!text) return false;
+  const lower = String(text)
+    .replace(/[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/g, '-')
+    .toLowerCase();
+  const mp = detectModelPreferenceFromText(text);
+  const wantsV3 =
+    mp === 'eleven_v3' ||
+    (Array.isArray(mp) && mp.includes('eleven_v3')) ||
+    /\bv3\b/.test(lower);
+  if (!wantsV3) return false;
+  return (
+    /\b(best|top|curated|recommended|ranking)\b/.test(lower) ||
+    /najlepsz/.test(lower) ||
+    /polecan/.test(lower)
+  );
+}
+
+function selectV3ArenaRows(plan, userText) {
+  const all = loadV3ArenaRankings().filter((r) => r.model === 'eleven_v3');
+  if (!all.length) return [];
+  let iso2 = (plan?.target_voice_language || '').toString().slice(0, 2).toLowerCase();
+  if (!iso2 && typeof detectVoiceLanguageFromText === 'function') {
+    iso2 = (detectVoiceLanguageFromText(userText) || '').toString().slice(0, 2).toLowerCase();
+  }
+  if (!iso2) {
+    iso2 = guessUiLanguageFromText(userText) === 'pl' ? 'pl' : 'en';
+  }
+  const codes = iso2ToArenaLangCodes(iso2);
+  const matched = codes.length ? all.filter((r) => codes.includes(r.language_code)) : [];
+  const rows = matched.length
+    ? matched.slice()
+    : iso2 === 'en'
+      ? all.filter((r) => r.language_code === 'eng')
+      : [];
+  if (!rows.length) return [];
+  rows.sort((a, b) => a.final_rank - b.final_rank);
+  return rows.slice(0, 10);
+}
+
+async function hydrateV3ArenaVoices(rows, traceCb) {
+  const list = Array.isArray(rows) ? rows.slice(0, 10) : [];
+  const out = [];
+  let i = 0;
+  async function worker() {
+    while (i < list.length) {
+      const rec = list[i++];
+      if (!rec?.voice_id) continue;
+      const voice = await fetchSharedVoiceByIdOrSearch(rec.voice_id, traceCb);
+      if (!voice?.voice_id) continue;
+      voice._v3_curated = {
+        sheet_rank: rec.final_rank,
+        sheet_name: rec.voice_name || '',
+        language: rec.language || ''
+      };
+      if (!Array.isArray(voice._matched_keywords)) voice._matched_keywords = [];
+      voice._matched_keywords.push('v3_arena_ranking');
+      out.push(voice);
+    }
+  }
+  const n = Math.min(KEYWORD_SEARCH_CONCURRENCY, Math.max(1, list.length));
+  await Promise.all(Array.from({ length: n }, () => worker()));
+  out.sort((a, b) => (a._v3_curated?.sheet_rank || 999) - (b._v3_curated?.sheet_rank || 999));
+  return out;
+}
+
+function mergeVoicesWithCuratedV3(existing, curatedVoices) {
+  const map = new Map();
+  for (const v of curatedVoices || []) {
+    if (!v?.voice_id) continue;
+    map.set(v.voice_id, v);
+  }
+  for (const v of existing || []) {
+    if (!v?.voice_id) continue;
+    const prev = map.get(v.voice_id);
+    if (prev) {
+      if (prev._v3_curated && !v._v3_curated) v._v3_curated = prev._v3_curated;
+      map.set(v.voice_id, v);
+    } else {
+      map.set(v.voice_id, v);
+    }
+  }
+  const curatedFirst = [];
+  const rest = [];
+  for (const v of map.values()) {
+    if (v._v3_curated) curatedFirst.push(v);
+    else rest.push(v);
+  }
+  curatedFirst.sort((a, b) => (a._v3_curated?.sheet_rank || 999) - (b._v3_curated?.sheet_rank || 999));
+  return curatedFirst.concat(rest);
+}
+
+async function maybeAugmentVoicesWithCuratedV3(userText, plan, voices, traceCb) {
+  const src = Array.isArray(voices) ? voices : [];
+  if (!detectBestV3CuratedIntent(userText)) return src;
+  if (plan?.__owner_id) return src;
+  if (src.some((v) => v && v._v3_curated)) return src;
+  try {
+    const rows = selectV3ArenaRows(plan, userText);
+    if (!rows.length) return src;
+    const hydrated = await hydrateV3ArenaVoices(rows, traceCb);
+    if (!hydrated.length) return src;
+    const merged = mergeVoicesWithCuratedV3(src, hydrated);
+    if (Array.isArray(voices)) {
+      voices.splice(0, voices.length, ...merged);
+      return voices;
+    }
+    return merged;
+  } catch (err) {
+    try {
+      console.warn('V3 arena augment skipped:', String(err?.message || err).slice(0, 160));
+    } catch (_) {}
+    return src;
+  }
 }
 
 function isDuplicateRequest(threadTs, cleaned) {
@@ -3967,7 +4364,9 @@ function detectModelPreferenceFromText(text) {
     /\bmodel\s+v3\b/.test(lower) ||
     /\bwith\s+v3\b/.test(lower) ||
     /\bna\s+v3\b/.test(lower) ||
-    /\bw\s+model(u|em)?\s+v3\b/.test(lower);
+    /\bw\s+model(u|em)?\s+v3\b/.test(lower) ||
+    /\b(głos(?:y|ów)?|glos(?:y|ow)?|voices?)\s+v3\b/.test(lower) ||
+    /\bv3\s+(głos(?:y|ów)?|glos(?:y|ow)?|voices?)\b/.test(lower);
 
   const wantsFlash =
     /\beleven[\s_-]?flash[\s_-]?v?2\.?5\b/.test(lower) ||
@@ -4221,7 +4620,10 @@ function formatVoiceLine(voice, uiLang) {
     voice.voice_id
   )}`;
   const name = hasCustomRateMultiplier(voice) ? `💲${voice.name}` : voice.name;
-  let line = `<${url}|${name}> \`${voice.voice_id}\``;
+  const curatedRank = voice && voice._v3_curated ? voice._v3_curated.sheet_rank : null;
+  const curated =
+    typeof curatedRank === 'number' && curatedRank > 0 ? `[v3 #${curatedRank}] ` : '';
+  let line = `<${url}|${curated}${name}> \`${voice.voice_id}\``;
   const npLabel = formatNoticePeriodLabel(voice, uiLang);
   if (npLabel) line += ` — ${npLabel}`;
   return line;
@@ -4745,6 +5147,29 @@ function applyFilterChangesFromText(session, lower) {
   }
 
   // sort (best-effort)
+  if (
+    lower.includes('sort by trending') ||
+    lower.includes('trending voices') ||
+    lower.includes('currently trending')
+  ) {
+    if (session.filters.sort !== 'trending') {
+      session.filters.sort = 'trending';
+      serverChanged = true;
+      changed = true;
+    }
+  }
+  if (
+    lower.includes('most cloned') ||
+    lower.includes('most-cloned') ||
+    lower.includes('sort by clones') ||
+    lower.includes('cloned the most')
+  ) {
+    if (session.filters.sort !== 'cloned_by_count') {
+      session.filters.sort = 'cloned_by_count';
+      serverChanged = true;
+      changed = true;
+    }
+  }
   if (
     lower.includes('sort by popularity') ||
     lower.includes('most used') ||
@@ -5626,7 +6051,8 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   } catch (_) {}
 
   async function callSharedVoices(params) {
-    const url = `https://api.elevenlabs.io/v1/shared-voices?${params.toString()}`;
+    const safeParams = sanitizeSharedVoicesParams(params);
+    const url = `https://api.elevenlabs.io/v1/shared-voices?${safeParams.toString()}`;
     const res = await httpGetWithRetry(url, {
       headers: {
         'xi-api-key': XI_KEY,
@@ -5693,6 +6119,14 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     language = resolved.targetIso2;
   }
 
+  // Prefer the official catalog's exact accent values. Empty/error keeps legacy normalization/probing.
+  if (language) {
+    const officialAccents = await fetchOfficialVoiceAccents(language);
+    if (officialAccents.length && accent) {
+      accent = resolveOfficialAccentForApiParam(language, accent) || accent;
+    }
+  }
+
   // -------------------------------------------------------------
   // Accent form probe (name vs slug) for /v1/shared-voices
   // -------------------------------------------------------------
@@ -5715,7 +6149,17 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
       return false;
     })();
 
-    if (hasIso2 && wantsAccent && facetKB && facetKB.isLoaded && facetKB.isLoaded() && facetKB.hasIso2 && facetKB.hasIso2(iso2)) {
+    const officialAccents = hasIso2 ? getCachedOfficialVoiceAccents(iso2) : null;
+    if (
+      hasIso2 &&
+      wantsAccent &&
+      (!Array.isArray(officialAccents) || officialAccents.length === 0) &&
+      facetKB &&
+      facetKB.isLoaded &&
+      facetKB.isLoaded() &&
+      facetKB.hasIso2 &&
+      facetKB.hasIso2(iso2)
+    ) {
       const computeAccentPair = () => {
         const out = { accentNorm: null, name: null, slug: null };
         let base = null;
@@ -7886,6 +8330,10 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   }
 
   if (isSpecificModelPreference(modelPref)) {
+    voices = await hydrateVoiceModelMetadataShortlist(voices, modelPref, trace, {
+      limit: 30,
+      concurrency: 3
+    });
     const beforeModel = voices.length;
     voices = filterVoicesByModelPreference(voices, modelPref);
     try {
@@ -8509,7 +8957,8 @@ async function fetchTopVoicesByLanguage(languageCode, qualityPreference, plan, u
       traceCb: trace
     });
 
-    const url = `https://api.elevenlabs.io/v1/shared-voices?${params.toString()}`;
+    const safeParams = sanitizeSharedVoicesParams(params);
+    const url = `https://api.elevenlabs.io/v1/shared-voices?${safeParams.toString()}`;
 
     const res = await httpGetWithRetry(url, {
       headers: {
@@ -8523,7 +8972,7 @@ async function fetchTopVoicesByLanguage(languageCode, qualityPreference, plan, u
     try {
       trace({
         stage: 'top_by_language',
-        params: paramsToObject(params),
+        params: paramsToObject(safeParams),
         count: Array.isArray(voices) ? voices.length : 0
       });
     } catch (_) {}
@@ -8537,6 +8986,10 @@ async function fetchTopVoicesByLanguage(languageCode, qualityPreference, plan, u
 
     const modelPref = plan?.model_preference || 'any';
     if (isSpecificModelPreference(modelPref)) {
+      voices = await hydrateVoiceModelMetadataShortlist(voices, modelPref, trace, {
+        limit: 30,
+        concurrency: 3
+      });
       const beforeModel = voices.length;
       voices = filterVoicesByModelPreference(voices, modelPref);
       try {
@@ -8565,14 +9018,22 @@ async function fetchTopVoicesByLanguage(languageCode, qualityPreference, plan, u
 // GPT: curator – rank voices for this specific brief
 // -------------------------------------------------------------
 
-async function rankVoicesWithGPT(userText, keywordPlan, voices) {
+async function rankVoicesWithGPT(userText, keywordPlan, voices, traceCb) {
   const MAX_VOICES = 50;
   const truncate = (val, max) => {
     if (val == null) return null;
     const s = String(val);
     return s.length > max ? s.slice(0, max) : s;
   };
-  const wantsModelInfo = isSpecificModelPreference(keywordPlan?.model_preference);
+  voices = await maybeAugmentVoicesWithCuratedV3(userText, keywordPlan, voices, traceCb);
+  const wantsModelInfo =
+    isSpecificModelPreference(keywordPlan?.model_preference) || detectBestV3CuratedIntent(userText);
+  voices = await hydrateVoiceModelMetadataShortlist(
+    voices,
+    keywordPlan?.model_preference,
+    traceCb,
+    { limit: 30, concurrency: 3, force: wantsModelInfo }
+  );
   const candidates = voices.slice(0, MAX_VOICES).map((v) => {
     const entry = {
       voice_id: v.voice_id,
@@ -8603,6 +9064,11 @@ async function rankVoicesWithGPT(userText, keywordPlan, voices) {
       entry.high_quality_base_model_ids = Array.isArray(v.high_quality_base_model_ids)
         ? v.high_quality_base_model_ids.slice(0, 8)
         : [];
+    }
+    if (v._v3_curated) {
+      entry.v3_curated = true;
+      entry.v3_curated_rank = v._v3_curated.sheet_rank || null;
+      entry.v3_curated_notes = truncate(v._v3_curated.sheet_name || v._v3_curated.language, 180);
     }
     return entry;
   });
@@ -8636,7 +9102,10 @@ You will receive:
       "usage_character_count_1y": number or null,
       "matched_keywords": string[],
       "notice_period": integer or null (optional; days required before cloning, null = no notice period),
-      "high_quality_base_model_ids": string[] (optional; present when user asked for a specific model)
+      "high_quality_base_model_ids": string[] (optional; present when user asked for a specific model),
+      "v3_curated": boolean (optional; true if this voice is in the Voice Arena V3 rankings),
+      "v3_curated_rank": number or null (optional; 1 = best for that language),
+      "v3_curated_notes": string or null (optional)
     },
     ...
   ]
@@ -8689,6 +9158,8 @@ Think like a human curator:
      - If model_preference includes "eleven_flash_v2_5", prefer voices that support flash 2.5.
      - When BOTH are requested, prefer voices that support either (do not drop one model family).
      - Voices without the requested model support should score lower unless nothing else fits.
+     - If the user asks for the best / top V3 voices, strongly prefer candidates with v3_curated=true
+       and a lower v3_curated_rank (1 is best for that language). Still respect language/gender/use-case.
 
    - Notice period preference:
      - If notice_period_preference is "min_days", strongly prefer voices whose notice_period meets or exceeds min_notice_period_days.
@@ -10175,6 +10646,10 @@ async function fetchVoicesByOwner(ownerId, plan, traceCb) {
     let out = voices || [];
     const modelPref = plan?.model_preference || 'any';
     if (isSpecificModelPreference(modelPref)) {
+      out = await hydrateVoiceModelMetadataShortlist(out, modelPref, trace, {
+        limit: 30,
+        concurrency: 3
+      });
       out = filterVoicesByModelPreference(out, modelPref);
       try {
         trace({
@@ -10216,7 +10691,7 @@ async function handleCreatorVoicesBrowse(plan, userText, traceCb, options = {}) 
     return { ok: false, reason: 'no_voices', ownerId, plan };
   }
 
-  const ranked = await rankVoicesWithGPT(userText, plan, voices);
+  const ranked = await rankVoicesWithGPT(userText, plan, voices, traceCb);
   const genderLimit = getSessionGenderAndLimit(plan, userText);
   const session = {
     originalQuery,
@@ -10304,6 +10779,10 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   };
   const isAccentAllowedByCatalog = (iso2, acc) => {
     try {
+      const officialAccents = getCachedOfficialVoiceAccents(iso2);
+      if (Array.isArray(officialAccents) && officialAccents.length) {
+        return Boolean(resolveOfficialAccentForApiParam(iso2, acc));
+      }
       if (!hasCatalogForLang(iso2)) return true; // graceful fallback if no catalog data
       // FacetKB: if it knows the language, trust it
       try {
@@ -10339,6 +10818,8 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
       if (!aRaw) return null;
 
       const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+      const official = resolveOfficialAccentForApiParam(k, aRaw);
+      if (official) return official;
       const isZh = k === 'zh';
       const norm = normalizeCatalogToken(aRaw);
       const nameForm = norm.includes('-') ? norm.replace(/-+/g, ' ').trim() : norm;
@@ -10717,7 +11198,8 @@ function cacheKeyFromParams(params) {
 }
 
 async function callSharedVoicesRaw(params) {
-  const url = `https://api.elevenlabs.io/v1/shared-voices?${params.toString()}`;
+  const safeParams = sanitizeSharedVoicesParams(params);
+  const url = `https://api.elevenlabs.io/v1/shared-voices?${safeParams.toString()}`;
   const res = await httpGetWithRetry(url, {
     headers: {
       'xi-api-key': process.env.ELEVENLABS_API_KEY,
@@ -10725,10 +11207,7 @@ async function callSharedVoicesRaw(params) {
     },
     timeout: 10000
   });
-  return {
-    voices: Array.isArray(res.data?.voices) ? res.data.voices : [],
-    has_more: !!res.data?.has_more
-  };
+  return parseSharedVoicesResponse(res?.data);
 }
 
 async function callSharedVoicesCached(params, callFn) {
@@ -10752,13 +11231,22 @@ async function callSharedVoicesAllPages(baseParams, options = {}) {
   const maxPages = options.maxPages ?? 3;
   const cap = options.cap ?? 200;
   const out = [];
+  let totalCount = null;
+  let lastSortId = null;
   for (let page = 0; page < maxPages && out.length < cap; page++) {
     const p = new URLSearchParams(baseParams.toString());
     p.set('page', String(page));
-    const { voices, has_more } = await callSharedVoicesRaw(p);
+    const { voices, has_more, total_count, last_sort_id } = await callSharedVoicesRaw(p);
+    if (totalCount === null && total_count !== null) totalCount = total_count;
+    if (last_sort_id !== null) lastSortId = last_sort_id;
     out.push(...voices);
     if (!has_more || voices.length < pageSize) break;
   }
+  // Snapshot metadata is informational only; has_more + page remain the pagination controls.
+  Object.defineProperties(out, {
+    total_count: { value: totalCount, enumerable: false, configurable: true },
+    last_sort_id: { value: lastSortId, enumerable: false, configurable: true }
+  });
   return out;
 }
 
@@ -10956,7 +11444,8 @@ async function lookupVoicesByName(names, { gender = null, language = null, trace
       if (gender === 'male' || gender === 'female') params.set('gender', gender);
       if (language) params.set('language', language);
 
-      const url = `https://api.elevenlabs.io/v1/shared-voices?${params.toString()}`;
+      const safeParams = sanitizeSharedVoicesParams(params);
+      const url = `https://api.elevenlabs.io/v1/shared-voices?${safeParams.toString()}`;
       const res = await httpGetWithRetry(url, {
         headers: { 'xi-api-key': XI_KEY, 'Content-Type': 'application/json' },
         timeout: 10000
@@ -10965,7 +11454,7 @@ async function lookupVoicesByName(names, { gender = null, language = null, trace
       try {
         trace({
           stage: 'named_voice_lookup',
-          params: { search: name, ...paramsToObject(params) },
+          params: { search: name, ...paramsToObject(safeParams) },
           count: voices.length
         });
       } catch (_) {}
@@ -11287,7 +11776,8 @@ async function fetchSharedVoiceByIdOrSearch(voiceId, traceCb) {
     params.set('page_size', '10');
     params.set('search', voiceId);
 
-    const url = `https://api.elevenlabs.io/v1/shared-voices?${params.toString()}`;
+    const safeParams = sanitizeSharedVoicesParams(params);
+    const url = `https://api.elevenlabs.io/v1/shared-voices?${safeParams.toString()}`;
     const res = await httpGetWithRetry(url, {
       headers: { 'xi-api-key': XI_KEY, 'Content-Type': 'application/json' },
       timeout: 10000
@@ -11336,6 +11826,73 @@ async function fetchPrivateVoiceById(voiceId, traceCb) {
     } catch (_) {}
     return null;
   }
+}
+
+// Curated-V3 ranking asks GPT for model ids while the shared plan stays 'any',
+// so callers can force hydration without a specific model preference.
+function shouldHydrateVoiceModelMetadata(modelPref, options = {}) {
+  return isSpecificModelPreference(modelPref) || options?.force === true;
+}
+
+async function hydrateVoiceModelMetadataShortlist(voices, modelPref, traceCb, options = {}) {
+  const src = Array.isArray(voices) ? voices : [];
+  if (!src.length || !shouldHydrateVoiceModelMetadata(modelPref, options)) return src;
+  const limit = Math.max(1, Math.min(50, Number(options.limit) || 30));
+  const concurrency = Math.max(1, Math.min(4, Number(options.concurrency) || 3));
+  const candidates = src
+    .filter(
+      (voice) =>
+        voice &&
+        voice.voice_id &&
+        (!Array.isArray(voice.high_quality_base_model_ids) ||
+          voice.high_quality_base_model_ids.length === 0)
+    )
+    .slice(0, limit);
+  let nextIndex = 0;
+  let hydratedCount = 0;
+
+  const hydrateOne = async (voice) => {
+    const voiceId = String(voice.voice_id);
+    const cached = voiceModelMetadataCache.get(voiceId);
+    if (cached && Date.now() - cached.at <= VOICE_MODEL_METADATA_TTL_MS) {
+      if (Array.isArray(cached.modelIds)) {
+        voice.high_quality_base_model_ids = [...cached.modelIds];
+      }
+      return;
+    }
+
+    const detailed = await fetchPrivateVoiceById(voiceId);
+    const modelIds = Array.isArray(detailed?.high_quality_base_model_ids)
+      ? detailed.high_quality_base_model_ids.map(String).filter(Boolean)
+      : null;
+    voiceModelMetadataCache.set(voiceId, { at: Date.now(), modelIds });
+    if (modelIds) {
+      voice.high_quality_base_model_ids = [...modelIds];
+      hydratedCount += 1;
+    }
+  };
+
+  const worker = async () => {
+    while (nextIndex < candidates.length) {
+      const voice = candidates[nextIndex++];
+      try {
+        await hydrateOne(voice);
+      } catch (_) {}
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, candidates.length) }, worker));
+  try {
+    traceCb?.({
+      stage: 'model_metadata_hydration',
+      params: {
+        requested: String(candidates.length),
+        limit: String(limit),
+        concurrency: String(concurrency)
+      },
+      count: hydratedCount
+    });
+  } catch (_) {}
+  return src;
 }
 
 async function downloadToBuffer(url) {
@@ -11427,7 +11984,9 @@ async function findSimilarVoicesByVoiceId(voiceId, traceCb) {
     } catch (_) {}
 
     const form = new FormData();
+    const topK = normalizeSimilarVoicesTopK(20);
     form.append('audio_file', audioBuf, { filename: `${voiceId}.mp3`, contentType: 'audio/mpeg' });
+    form.append('top_k', String(topK));
     const res = await axios.post('https://api.elevenlabs.io/v1/similar-voices', form, {
       headers: {
         ...form.getHeaders(),
@@ -11439,7 +11998,7 @@ async function findSimilarVoicesByVoiceId(voiceId, traceCb) {
     try {
       traceCb?.({
         stage: 'similar_voices',
-        params: { top_k: 'default', source: audioSource || '-' },
+        params: { top_k: String(topK), source: audioSource || '-' },
         count: out.length
       });
     } catch (_) {}
@@ -11738,6 +12297,59 @@ function isDevPocEnabled() {
 function runDevAsserts() {
   if (!isDevAssertsEnabled()) return;
 
+  // Shared Voice Library API enums and response metadata.
+  devAssert(
+    mapSharedVoicesSortValue('usage_desc') === 'usage_character_count_1y',
+    'shared voices sort: usage alias maps to official enum'
+  );
+  devAssert(
+    mapSharedVoicesSortValue('date_desc') === 'created_date',
+    'shared voices sort: date alias maps to official enum'
+  );
+  devAssert(mapSharedVoicesSortValue('unknown_sort') === null, 'shared voices sort: unknown rejected');
+  const safeSortParams = sanitizeSharedVoicesParams(
+    new URLSearchParams('sort=usage_desc&page_size=10')
+  );
+  devAssert(
+    safeSortParams.get('sort') === 'usage_character_count_1y',
+    'shared voices params: API boundary maps sort'
+  );
+  const unknownSortParams = sanitizeSharedVoicesParams(
+    new URLSearchParams('sort=unknown_sort&page_size=10')
+  );
+  devAssert(!unknownSortParams.has('sort'), 'shared voices params: unknown sort omitted');
+
+  const parsedAccents = parseOfficialVoiceAccentsResponse({
+    accents: [{ accent: 'Latin American' }, { accent: 'British' }, { accent: 'british' }]
+  });
+  devAssert(parsedAccents.length === 2, 'official accents: parse and dedupe');
+  officialVoiceAccentsCache.set('es', { at: Date.now(), accents: ['Latin American', 'Mexican'] });
+  devAssert(
+    resolveOfficialAccentForApiParam('es', 'latin-american') === 'Latin American',
+    'official accents: resolve exact API value'
+  );
+  const rejectedAccentParams = sanitizeSharedVoicesParams(
+    new URLSearchParams('language=es&accent=made-up')
+  );
+  devAssert(!rejectedAccentParams.has('accent'), 'official accents: unknown API param rejected');
+  officialVoiceAccentsCache.delete('es');
+
+  const parsedShared = parseSharedVoicesResponse({
+    voices: [{ voice_id: 'v1' }],
+    has_more: true,
+    total_count: 42,
+    last_sort_id: 'cursor-42'
+  });
+  devAssert(
+    parsedShared.voices.length === 1 &&
+      parsedShared.has_more === true &&
+      parsedShared.total_count === 42 &&
+      parsedShared.last_sort_id === 'cursor-42',
+    'shared voices response: pagination metadata parsed'
+  );
+  devAssert(normalizeSimilarVoicesTopK(20) === 20, 'similar voices: top_k accepts documented value');
+  devAssert(normalizeSimilarVoicesTopK(0) === 20, 'similar voices: invalid top_k falls back');
+
   // Multi-intent should NOT split on conjunctions
   devAssert(splitMultiIntents('expressive and engaging and fast-paced').length === 0, 'no split on "and"');
 
@@ -11890,6 +12502,70 @@ function runDevAsserts() {
     'gender quota: session limitPerGender is 3'
   );
   devAssert(detectModelPreferenceFromText('voices with eleven v3') === 'eleven_v3', 'model pref: v3');
+  devAssert(detectModelPreferenceFromText('najlepszy głos v3') === 'eleven_v3', 'model pref: głos v3');
+  devAssert(detectBestV3CuratedIntent('najlepszy głos v3') === true, 'best v3 intent: polish');
+  devAssert(detectBestV3CuratedIntent('best v3 voices in polish') === true, 'best v3 intent: en');
+  devAssert(detectBestV3CuratedIntent('find a warm v3 narrator') === false, 'best v3 intent: not mere v3');
+  {
+    // "best v3 narrator" hits the curated intent without the planner asking for v3,
+    // so ranking may request model ids but must never rewrite the shared plan.
+    const plan = { model_preference: 'any' };
+    devAssert(
+      detectModelPreferenceFromText('best v3 narrator') === null,
+      'best v3: planner leaves loose v3 phrasing as any'
+    );
+    devAssert(detectBestV3CuratedIntent('best v3 narrator') === true, 'best v3 intent: loose phrasing');
+    devAssert(
+      (isSpecificModelPreference(plan.model_preference) ||
+        detectBestV3CuratedIntent('best v3 narrator')) === true,
+      'best v3: ranking can request model ids without a specific model preference'
+    );
+    devAssert(
+      shouldHydrateVoiceModelMetadata(plan.model_preference, { force: true }) === true,
+      'best v3: forced hydration runs for loose v3 intent on an any plan'
+    );
+    devAssert(plan.model_preference === 'any', 'best v3: plan model_preference unchanged');
+  }
+  devAssert(
+    shouldHydrateVoiceModelMetadata('eleven_v3') === true,
+    'hydrate gate: specific model preference'
+  );
+  devAssert(
+    shouldHydrateVoiceModelMetadata('any') === false,
+    'hydrate gate: any preference without force'
+  );
+  devAssert(
+    shouldHydrateVoiceModelMetadata('any', { force: false }) === false,
+    'hydrate gate: explicit force false'
+  );
+  {
+    const pl = selectV3ArenaRows({ target_voice_language: 'pl' }, 'najlepszy głos v3');
+    devAssert(Array.isArray(pl) && pl.length === 10, 'v3 arena: 10 polish rows');
+    devAssert(pl[0].final_rank === 1 && pl[0].language_code === 'pol', 'v3 arena: polish rank 1');
+    const missingLang = selectV3ArenaRows({ target_voice_language: 'xx' }, 'best v3 voices');
+    devAssert(Array.isArray(missingLang) && missingLang.length === 0, 'v3 arena: unknown lang yields no rows');
+    const curated = {
+      voice_id: 'merge-id',
+      name: 'curated',
+      _v3_curated: { sheet_rank: 2, sheet_name: 'Arena', language: 'Polish' }
+    };
+    const live = { voice_id: 'merge-id', name: 'live', high_quality_base_model_ids: ['eleven_v3'] };
+    const mergedLiveWins = mergeVoicesWithCuratedV3([live], [curated]);
+    devAssert(
+      mergedLiveWins.length === 1 &&
+        mergedLiveWins[0].name === 'live' &&
+        mergedLiveWins[0]._v3_curated &&
+        mergedLiveWins[0]._v3_curated.sheet_rank === 2,
+      'v3 merge: existing-over-curated keeps _v3_curated'
+    );
+    const mergedCuratedWins = mergeVoicesWithCuratedV3([curated], [live]);
+    devAssert(
+      mergedCuratedWins.length === 1 &&
+        mergedCuratedWins[0]._v3_curated &&
+        mergedCuratedWins[0]._v3_curated.sheet_rank === 2,
+      'v3 merge: curated-over-existing keeps _v3_curated'
+    );
+  }
   devAssert(detectModelPreferenceFromText('flash 2.5 voices') === 'eleven_flash_v2_5', 'model pref: flash 2.5');
   {
     const both = detectModelPreferenceFromText('flash 2.5 and eleven v3 voices');
@@ -13340,7 +14016,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         }
         let voices = await fetchVoicesByKeywords(subPlan, partText, traceCb);
         if (!voices.length) continue;
-        const ranked = await rankVoicesWithGPT(partText, subPlan, voices);
+        const ranked = await rankVoicesWithGPT(partText, subPlan, voices, traceCb);
         const genderLimit = getSessionGenderAndLimit(subPlan, cleaned);
         subSessions.push({
           title: li.title || li.iso2.toUpperCase(),
@@ -13443,7 +14119,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           if (!voices.length) {
             continue;
           }
-          ranked = await rankVoicesWithGPT(part, subPlan, voices);
+          ranked = await rankVoicesWithGPT(part, subPlan, voices, traceCb);
         }
         const genderLimit = getSessionGenderAndLimit(subPlan, cleaned);
         subSessions.push({
@@ -13534,7 +14210,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         );
         return;
       }
-      const ranked = await rankVoicesWithGPT(cleaned, keywordPlan, voices);
+      const ranked = await rankVoicesWithGPT(cleaned, keywordPlan, voices, traceCb);
       let softQualityNote = '';
       const genderLimit = getSessionGenderAndLimit(keywordPlan, cleaned);
       const session = {
@@ -13726,6 +14402,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         cleaned,
         traceCb
       );
+      voices = await maybeAugmentVoicesWithCuratedV3(cleaned, keywordPlan, voices || [], traceCb);
 
       if (!voices.length) {
         const noResText = await translateNoResultsWithOwnerHint(uiLang, keywordPlan);
@@ -13754,6 +14431,12 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
             (voices.length - idx) / Math.max(voices.length, 1);
         });
       }
+      voices.forEach((v) => {
+        if (!v?._v3_curated) return;
+        const rank = Number(v._v3_curated.sheet_rank) || 20;
+        const boost = Math.max(0.12, 0.35 - rank * 0.01);
+        rankingMap[v.voice_id] = Math.min(1, (rankingMap[v.voice_id] || 0) + boost);
+      });
     } else {
       if (special.mode === 'top_then_rank' && special.languageCode) {
         voices = await fetchTopVoicesByLanguage(
@@ -13763,6 +14446,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           cleaned,
           traceCb
         );
+        voices = await maybeAugmentVoicesWithCuratedV3(cleaned, keywordPlan, voices || [], traceCb);
         if (!voices.length) {
           const noResText = await translateNoResultsWithOwnerHint(uiLang, keywordPlan);
           await client.chat.postMessage({
@@ -13772,11 +14456,12 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           });
           return;
         }
-        const ranked = await rankVoicesWithGPT(cleaned, keywordPlan, voices);
+        const ranked = await rankVoicesWithGPT(cleaned, keywordPlan, voices, traceCb);
         rankingMap = ranked.scoreMap;
       } else {
         // normal mode – keyword-based search + GPT curator ranking
         voices = await fetchVoicesByKeywords(keywordPlan, cleaned, traceCb);
+        voices = await maybeAugmentVoicesWithCuratedV3(cleaned, keywordPlan, voices || [], traceCb);
 
         if (!voices.length) {
           const noResText = await translateNoResultsWithOwnerHint(uiLang, keywordPlan);
@@ -13788,7 +14473,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           return;
         }
 
-        const ranked = await rankVoicesWithGPT(cleaned, keywordPlan, voices);
+        const ranked = await rankVoicesWithGPT(cleaned, keywordPlan, voices, traceCb);
         rankingMap = ranked.scoreMap;
       }
     }
@@ -14024,7 +14709,7 @@ if (!DEV_ASSERTS_ENABLED && !isDevPocEnabled()) {
           existing.ranking = {};
           return;
         }
-        const ranked = await rankVoicesWithGPT(existing.originalQuery, plan, voices);
+        const ranked = await rankVoicesWithGPT(existing.originalQuery, plan, voices, traceCb);
         existing.keywordPlan = plan;
         existing.voices = voices;
         existing.ranking = ranked.scoreMap;
@@ -14111,7 +14796,7 @@ if (!DEV_ASSERTS_ENABLED && !isDevPocEnabled()) {
           existing._serverFiltersChanged = false;
           return;
         }
-        const ranked = await rankVoicesWithGPT(existing.originalQuery, plan, voices);
+        const ranked = await rankVoicesWithGPT(existing.originalQuery, plan, voices, traceCb);
         existing.keywordPlan = plan;
         existing.voices = voices;
         existing.ranking = ranked.scoreMap;
@@ -14216,7 +14901,7 @@ if (!DEV_ASSERTS_ENABLED && !isDevPocEnabled()) {
         });
         return;
       }
-      const ranked = await rankVoicesWithGPT(combinedQuery, refinedPlan, voices);
+      const ranked = await rankVoicesWithGPT(combinedQuery, refinedPlan, voices, traceCb);
       existing.keywordPlan = refinedPlan;
       existing.originalQuery = combinedQuery;
       existing.voices = voices;
@@ -14305,7 +14990,7 @@ app.action('toggle_featured', async ({ ack, body, client }) => {
       session._serverFiltersChanged = false;
       return;
     }
-    const ranked = await rankVoicesWithGPT(session.originalQuery, plan, voices);
+    const ranked = await rankVoicesWithGPT(session.originalQuery, plan, voices, traceCb);
     session.keywordPlan = plan;
     session.voices = voices;
     session.ranking = ranked.scoreMap;
@@ -14352,7 +15037,7 @@ app.action('show_more', async ({ ack, body, client }) => {
       await client.chat.postMessage({ channel, thread_ts: threadTs, text: noResText });
       return;
     }
-    const ranked = await rankVoicesWithGPT(session.originalQuery, plan, voices);
+    const ranked = await rankVoicesWithGPT(session.originalQuery, plan, voices, traceCb);
     session.keywordPlan = plan;
     session.voices = voices;
     session.ranking = ranked.scoreMap;
