@@ -1517,6 +1517,7 @@ const STATIC_LANGUAGE_ALIASES = new Map([
   ['français', 'fr'],
   ['francais', 'fr'],
   ['italian', 'it'],
+  ['greek', 'el'],
   ['japanese', 'ja'],
   ['korean', 'ko'],
   // Chinese
@@ -2323,6 +2324,12 @@ async function hydrateV3ArenaVoices(rows, traceCb) {
         sheet_name: rec.voice_name || '',
         language: rec.language || ''
       };
+      const modelIds = Array.isArray(voice.high_quality_base_model_ids)
+        ? voice.high_quality_base_model_ids
+        : [];
+      if (!modelIds.includes('eleven_v3')) {
+        voice.high_quality_base_model_ids = [...modelIds, 'eleven_v3'];
+      }
       if (!Array.isArray(voice._matched_keywords)) voice._matched_keywords = [];
       voice._matched_keywords.push('v3_arena_ranking');
       out.push(voice);
@@ -2360,15 +2367,29 @@ function mergeVoicesWithCuratedV3(existing, curatedVoices) {
   return curatedFirst.concat(rest);
 }
 
+function shouldUseV3ArenaRankings(userText, plan) {
+  return (
+    normalizeModelPreferenceList(plan?.model_preference).includes('eleven_v3') ||
+    detectBestV3CuratedIntent(userText)
+  );
+}
+
 async function maybeAugmentVoicesWithCuratedV3(userText, plan, voices, traceCb) {
   const src = Array.isArray(voices) ? voices : [];
-  if (!detectBestV3CuratedIntent(userText)) return src;
+  if (!shouldUseV3ArenaRankings(userText, plan)) return src;
   if (plan?.__owner_id) return src;
   if (src.some((v) => v && v._v3_curated)) return src;
   try {
     const rows = selectV3ArenaRows(plan, userText);
     if (!rows.length) return src;
-    const hydrated = await hydrateV3ArenaVoices(rows, traceCb);
+    let hydrated = await hydrateV3ArenaVoices(rows, traceCb);
+    hydrated = await applyFetchConstraintFilters(
+      hydrated,
+      plan,
+      userText,
+      plan?.target_voice_language || null,
+      traceCb
+    );
     if (!hydrated.length) return src;
     const merged = mergeVoicesWithCuratedV3(src, hydrated);
     if (Array.isArray(voices)) {
@@ -2489,10 +2510,15 @@ function isHighQuality(voice) {
 
 function voiceSupportsModel(voice, modelId) {
   if (!voice || typeof voice !== 'object' || !modelId) return false;
-  const ids = voice.high_quality_base_model_ids;
-  if (!Array.isArray(ids) || !ids.length) return false;
   const want = String(modelId).toLowerCase().trim();
-  return ids.some((id) => String(id || '').toLowerCase().trim() === want);
+  const ids = Array.isArray(voice.high_quality_base_model_ids)
+    ? voice.high_quality_base_model_ids
+    : [];
+  if (ids.some((id) => String(id || '').toLowerCase().trim() === want)) return true;
+  const verified = Array.isArray(voice.verified_languages) ? voice.verified_languages : [];
+  return verified.some(
+    (entry) => String(entry?.model_id || '').toLowerCase().trim() === want
+  );
 }
 
 function isV3Voice(voice) {
@@ -2503,17 +2529,20 @@ function filterVoicesByModelPreference(voices, modelPref) {
   if (!Array.isArray(voices) || !voices.length) return voices || [];
   const prefs = normalizeModelPreferenceList(modelPref);
   if (!prefs.length) return voices;
-  const matched = voices.filter((v) => prefs.some((p) => voiceSupportsModel(v, p)));
-  return matched.length ? matched : voices;
+  return voices.filter((v) => prefs.some((p) => voiceSupportsModel(v, p)));
 }
 
 /** Normalize model preference to a list of model ids (empty = any). */
 function normalizeModelPreferenceList(modelPref) {
   const supported = new Set([
-    'eleven_v3',
-    'eleven_flash_v2_5',
+    'eleven_monolingual_v1',
+    'eleven_multilingual_v1',
+    'eleven_multilingual_v2',
+    'eleven_turbo_v2',
     'eleven_turbo_v2_5',
-    'eleven_multilingual_v2'
+    'eleven_flash_v2',
+    'eleven_flash_v2_5',
+    'eleven_v3',
   ]);
   if (!modelPref || modelPref === 'any') return [];
   if (Array.isArray(modelPref)) {
@@ -2558,6 +2587,8 @@ function detectMultipleLanguageIntents(text) {
     if (!raw) return [];
     const lower = raw.toLowerCase();
 
+    // Verification/bilingual wording describes one intersection, not independent catalogs.
+    if (detectVerifiedLanguageConstraint(raw)) return [];
     if (!/[,;]|\s+\band\b|\s+oraz\s+|\s+&\s+/i.test(raw)) return [];
     if (!/\bvoices?\b|\bgłos(y|ów|ami)?\b/i.test(lower)) return [];
 
@@ -4070,6 +4101,111 @@ function voiceHasVerifiedEnAndEs(voice) {
   return langs.has('en') && langs.has('es');
 }
 
+function languageHintIso2(text) {
+  const hint = parseUserLanguageHints((text || '').toString());
+  if (!hint?.iso2 || hint.reason === 'fuzzy_language') return null;
+  return hint.iso2.toLowerCase().slice(0, 2);
+}
+
+/**
+ * Detect one voice pool constrained to multiple verified languages.
+ * Independent language catalogs are intentionally left to detectMultipleLanguageIntents.
+ */
+function detectVerifiedLanguageConstraint(text) {
+  try {
+    const raw = (text || '').toString().trim();
+    if (!raw) return null;
+
+    const verifiedRe =
+      /\b(?:but\s+)?(?:also\s+)?verified\s+(?:for|in)\s+([\p{L}]{2,24}(?:\s+[\p{L}]{2,24})?)/iu;
+    const verifiedMatch = raw.match(verifiedRe);
+    if (verifiedMatch) {
+      const secondaryIso2 = languageHintIso2(verifiedMatch[1]);
+      const primaryText = raw.slice(0, verifiedMatch.index).replace(/[,;:\s]+$/g, '');
+      const primaryIso2 = languageHintIso2(primaryText);
+      if (primaryIso2 && secondaryIso2 && primaryIso2 !== secondaryIso2) {
+        return {
+          primaryIso2,
+          requiredIso2: [secondaryIso2],
+          reason: 'verified_for'
+        };
+      }
+    }
+
+    if (!/\bbilingual\b/i.test(raw)) return null;
+    const segments = raw
+      .split(/\s*(?:[+\/&,]|\band\b|[-–—])\s*/i)
+      .map((part) => part.trim())
+      .filter(Boolean);
+    const languages = [];
+    for (const segment of segments) {
+      const iso2 = languageHintIso2(segment);
+      if (iso2 && !languages.includes(iso2)) languages.push(iso2);
+    }
+    if (languages.length >= 2) {
+      return {
+        primaryIso2: languages[0],
+        requiredIso2: languages.slice(1),
+        reason: 'bilingual'
+      };
+    }
+  } catch (_) {}
+  return null;
+}
+
+function getVerifiedLanguageRequirements(plan, userText, primaryLanguage) {
+  const required = [];
+  const add = (iso2) => {
+    const normalized = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    if (normalized && !required.includes(normalized)) required.push(normalized);
+  };
+  add(primaryLanguage);
+  for (const iso2 of Array.isArray(plan?.__required_verified_languages)
+    ? plan.__required_verified_languages
+    : []) {
+    add(iso2);
+  }
+  const constraint = detectVerifiedLanguageConstraint(userText);
+  if (constraint) {
+    add(constraint.primaryIso2);
+    for (const iso2 of constraint.requiredIso2) add(iso2);
+  }
+  if (detectBilingualEnEs(userText)) {
+    add('en');
+    add('es');
+  }
+  return required;
+}
+
+function voiceHasKnownLanguageMetadata(voice) {
+  if (!voice || typeof voice !== 'object') return false;
+  if (extractIso2FromLanguageField(voice.language)) return true;
+  return (Array.isArray(voice.verified_languages) ? voice.verified_languages : []).some(
+    (entry) => extractIso2FromLanguageField(entry?.language)
+  );
+}
+
+function filterVoicesByLanguageRequirements(voices, primaryLanguage, requiredLanguages) {
+  const src = Array.isArray(voices) ? voices : [];
+  const primary = (primaryLanguage || '').toString().toLowerCase().slice(0, 2);
+  const requirements = Array.from(
+    new Set(
+      (Array.isArray(requiredLanguages) ? requiredLanguages : [])
+        .map((iso2) => (iso2 || '').toString().toLowerCase().slice(0, 2))
+        .filter(Boolean)
+    )
+  );
+  const isIntersection = requirements.length > (primary ? 1 : 0);
+  if (!requirements.length && !primary) return src;
+  return src.filter((voice) => {
+    if (isIntersection) {
+      return requirements.every((iso2) => voiceHasVerifiedIso2(voice, iso2));
+    }
+    if (!primary || !voiceHasKnownLanguageMetadata(voice)) return true;
+    return voiceHasVerifiedIso2(voice, primary);
+  });
+}
+
 function voiceVerifiedEntriesForIso2(voice, iso2) {
   const target = (iso2 || '').toString().toLowerCase().slice(0, 2);
   if (!voice || !target) return [];
@@ -4383,45 +4519,78 @@ function detectModelPreferenceFromText(text) {
     .replace(/[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/g, '-')
     .toLowerCase();
 
-  if (/\b(without|no|exclude|bez)\s+(eleven[\s_-]?v3|v3\s+model|model\s+v3)\b/.test(lower)) {
+  if (
+    /\b(without|no|exclude|bez)\s+(?:the\s+)?(?:eleven[\s_-]?(?:v3|flash|turbo|multilingual|monolingual)|v[123]\s+model|model\s+v[123])\b/.test(
+      lower
+    )
+  ) {
     return null;
   }
 
-  const wantsFlash =
-    /\beleven[\s_-]?flash[\s_-]?v?2\.?5\b/.test(lower) ||
-    /\bflash\s*2\.?5\b/.test(lower) ||
-    /\bmodel\s+flash\s*2\.?5\b/.test(lower) ||
-    /\beleven_flash_v2_5\b/.test(lower);
-
-  const wantsTurbo =
-    /\beleven[\s_-]?turbo(?:[\s_-]?v?2\.?5)?\b/.test(lower) ||
-    /\bturbo(?:\s+v?\d(?:\.\d)?)?\b/.test(lower) ||
-    /\beleven_turbo_v2_5\b/.test(lower);
-  const wantsMultilingualV2 =
+  const wantsMonolingualV1 =
+    /\beleven[\s_-]?monolingual[\s_-]?v?1\b/.test(lower) ||
+    /\bmonolingual\s+v?1\b/.test(lower) ||
+    lower.includes('eleven_monolingual_v1');
+  const wantsMultilingualV1 =
+    /\beleven[\s_-]?multilingual[\s_-]?v?1\b/.test(lower) ||
+    /\bmultilingual\s+v?1\b/.test(lower) ||
+    lower.includes('eleven_multilingual_v1');
+  const explicitMultilingualV2 =
     /\beleven[\s_-]?multilingual[\s_-]?v?2\b/.test(lower) ||
     /\bmultilingual\s+v?2\b/.test(lower) ||
-    /\beleven_multilingual_v2\b/.test(lower);
+    lower.includes('eleven_multilingual_v2');
+  const wantsFlashV2 =
+    /\bflash\s+v?2\b(?!\.\d)/.test(lower) ||
+    lower.includes('eleven_flash_v2');
+  const wantsFlashV25 =
+    /\bflash(?:[\s_-]+v?)?2[._]?5\b/.test(lower) ||
+    lower.includes('eleven_flash_v2_5');
+  const mentionsFlash = /\bflash\b/.test(lower) || lower.includes('eleven_flash_');
+  const wantsTurboV2 =
+    /\bturbo\s+v?2\b(?!\.\d)/.test(lower) ||
+    lower.includes('eleven_turbo_v2');
+  const wantsTurboV25 =
+    /\bturbo(?:[\s_-]+v?)?2[._]?5\b/.test(lower) ||
+    lower.includes('eleven_turbo_v2_5');
+  const mentionsTurbo = /\bturbo\b/.test(lower) || lower.includes('eleven_turbo_');
   const hasV4 = /\b(?:eleven[\s_-]?)?v4\b|\bmodel\s+v4\b/.test(lower);
+  const genericV2 =
+    /\bv2\s+model\b/.test(lower) ||
+    /\bmodel\s+v2\b/.test(lower) ||
+    /^\s*v2\s*$/.test(lower) ||
+    (/\bv2\b(?!\.\d)/.test(lower) && /\b(voices?|głos(?:y|ów)?|glos(?:y|ow)?|model)\b/.test(lower));
+  const wantsMultilingualV2 =
+    explicitMultilingualV2 ||
+    (genericV2 &&
+      !mentionsFlash &&
+      !mentionsTurbo &&
+      !wantsMonolingualV1 &&
+      !wantsMultilingualV1 &&
+      !hasV4);
 
   // Product-qualified versions must not leak into generic V3 detection
   // (for example, "Turbo v3" is a Turbo request, not Eleven v3).
   const genericV3Text = lower
     .replace(/\bturbo\s+v?3\b/g, 'turbo')
-    .replace(/\bmultilingual\s+v?3\b/g, 'multilingual');
+    .replace(/\bflash\s+v?3\b/g, 'flash')
+    .replace(/\bmultilingual\s+v?3\b/g, 'multilingual')
+    .replace(/\bmonolingual\s+v?3\b/g, 'monolingual');
   const wantsV3 =
     /\beleven[\s_-]?v3\b/.test(genericV3Text) ||
-    /\bv3\s+model\b/.test(genericV3Text) ||
-    /\bmodel\s+v3\b/.test(genericV3Text) ||
-    /\bwith\s+v3\b/.test(genericV3Text) ||
-    /\bna\s+v3\b/.test(genericV3Text) ||
-    /\bw\s+model(u|em)?\s+v3\b/.test(genericV3Text) ||
-    /\b(głos(?:y|ów)?|glos(?:y|ow)?|voices?)\s+v3\b/.test(genericV3Text) ||
-    /\bv3\s+(głos(?:y|ów)?|glos(?:y|ow)?|voices?)\b/.test(genericV3Text);
+    /\bv3\b/.test(genericV3Text);
 
   const requested = [];
-  if (wantsFlash) requested.push('eleven_flash_v2_5');
-  if (wantsTurbo) requested.push('eleven_turbo_v2_5');
+  if (wantsMonolingualV1) requested.push('eleven_monolingual_v1');
+  if (wantsMultilingualV1) requested.push('eleven_multilingual_v1');
   if (wantsMultilingualV2) requested.push('eleven_multilingual_v2');
+  if (wantsFlashV2 && !wantsFlashV25) requested.push('eleven_flash_v2');
+  if (wantsFlashV25 || (mentionsFlash && !wantsFlashV2)) {
+    requested.push('eleven_flash_v2_5');
+  }
+  if (wantsTurboV2 && !wantsTurboV25) requested.push('eleven_turbo_v2');
+  if (wantsTurboV25 || (mentionsTurbo && !wantsTurboV2)) {
+    requested.push('eleven_turbo_v2_5');
+  }
   if (wantsV3) requested.push('eleven_v3');
   if (requested.length === 1) return requested[0];
   if (requested.length > 1) return requested;
@@ -4820,6 +4989,90 @@ function applyVoiceLibraryFilters(voices, filtersOrPlan) {
   out = filterVoicesByCustomRates(out, filtersOrPlan);
   out = filterVoicesByExcludedNames(out, filtersOrPlan);
   return out;
+}
+
+function copyFilteredVoiceMetadata(source, filtered, options = {}) {
+  const out = Array.isArray(filtered) ? [...filtered] : [];
+  if (!Array.isArray(source)) return out;
+  const allowed = new Set(out.map((voice) => voice?.voice_id).filter(Boolean));
+  if (Array.isArray(source.facetGroups)) {
+    const globallySeen = new Set();
+    const dedupeAcrossGroups =
+      options.dedupeAcrossGroups === true && source.variantIntent?.isSpecific !== true;
+    out.facetGroups = source.facetGroups
+      .map((group) => {
+        const groupSeen = new Set();
+        const voices = (Array.isArray(group?.voices) ? group.voices : []).filter((voice) => {
+          const id = voice?.voice_id;
+          if (!id || !allowed.has(id) || groupSeen.has(id)) return false;
+          if (dedupeAcrossGroups && globallySeen.has(id)) return false;
+          groupSeen.add(id);
+          if (dedupeAcrossGroups) globallySeen.add(id);
+          return true;
+        });
+        return { ...group, voices };
+      })
+      .filter((group) => group.voices.length);
+  }
+  if (source.facetAxis) out.facetAxis = source.facetAxis;
+  if (source.facetIso2) out.facetIso2 = source.facetIso2;
+  if (source.variantIntent) out.variantIntent = source.variantIntent;
+  return out;
+}
+
+async function applyFetchConstraintFilters(voices, plan, userText, language, traceCb, options = {}) {
+  const trace = typeof traceCb === 'function' ? traceCb : () => {};
+  const source = Array.isArray(voices) ? voices : [];
+  let out = [...source];
+  const requirements = getVerifiedLanguageRequirements(plan, userText, language);
+  if (language || requirements.length) {
+    const before = out.length;
+    out = filterVoicesByLanguageRequirements(out, language, requirements);
+    try {
+      trace({
+        stage: 'verified_language_filter',
+        params: {
+          primary: language || '-',
+          required: requirements.join(',') || '-',
+          before: String(before)
+        },
+        count: out.length
+      });
+    } catch (_) {}
+  }
+
+  const qualityPref = plan?.quality_preference || 'any';
+  if (qualityPref === 'high_only') {
+    out = out.filter(isHighQuality);
+  } else if (qualityPref === 'no_high') {
+    out = out.filter((voice) => !isHighQuality(voice));
+  }
+
+  const modelPref = plan?.model_preference || 'any';
+  if (isSpecificModelPreference(modelPref) && out.length) {
+    out = await hydrateVoiceModelMetadataShortlist(out, modelPref, trace, {
+      limit: out.length,
+      concurrency: 3
+    });
+    const before = out.length;
+    out = filterVoicesByModelPreference(out, modelPref);
+    try {
+      trace({
+        stage: 'model_filter',
+        params: {
+          model: Array.isArray(modelPref) ? modelPref.join(',') : String(modelPref),
+          before: String(before),
+          after: String(out.length)
+        },
+        count: out.length
+      });
+    } catch (_) {}
+  }
+
+  out = applyVoiceLibraryFilters(out, plan || {});
+  return copyFilteredVoiceMetadata(source, out, {
+    dedupeAcrossGroups: options.dedupeAcrossGroups === true
+  });
 }
 
 function buildSessionNoticeFilters(keywordPlan) {
@@ -5678,6 +5931,16 @@ function normalizeKeywordPlan(plan, userText) {
     }
   } catch (_) {}
 
+  try {
+    const languageConstraint = detectVerifiedLanguageConstraint(userText);
+    if (languageConstraint && (!detectBilingualEnEs(userText) || languageConstraint.reason === 'verified_for')) {
+      out.target_voice_language = languageConstraint.primaryIso2;
+      out.target_locale = null;
+      out.target_accent = null;
+      out.__required_verified_languages = languageConstraint.requiredIso2;
+    }
+  } catch (_) {}
+
   // Drop keywords that conflict with the dominant use_case (e.g. cartoonish on conversational briefs).
   try {
     const useKw = Array.isArray(out.use_case_keywords) ? out.use_case_keywords : [];
@@ -5711,6 +5974,40 @@ function normalizeKeywordPlan(plan, userText) {
     }
   } catch (_) {}
 
+  return out;
+}
+
+function inheritGlobalSearchConstraints(subPlan, globalPlan) {
+  const out = subPlan || {};
+  const global = globalPlan || {};
+  const scalarFields = [
+    'quality_preference',
+    'model_preference',
+    'notice_period_preference',
+    'min_notice_period_days',
+    'custom_rates_preference',
+    'target_gender',
+    '__no_notice_period',
+    '__min_notice_period_days',
+    '__no_custom_rates',
+    '__dualGenderOneEach',
+    '__bothGendersCatalog',
+    '__featured',
+    '__sort',
+    // '__listAll' is intentionally not inherited: "list all" applies to the
+    // segment that mentions it, so each language subplan detects it itself.
+    '__forceUseCases',
+    '__forceDescriptives'
+  ];
+  for (const field of scalarFields) {
+    if (global[field] !== undefined && global[field] !== null) out[field] = global[field];
+  }
+  if (Array.isArray(global.__excludedVoiceNames)) {
+    out.__excludedVoiceNames = [...global.__excludedVoiceNames];
+  }
+  if (Array.isArray(global.__excludedGenders)) {
+    out.__excludedGenders = [...global.__excludedGenders];
+  }
   return out;
 }
 
@@ -5867,7 +6164,7 @@ The JSON MUST have exactly these fields:
   "target_accent": string or null,          // e.g. "american", "british", "polish"
   "target_gender": "male" | "female" | "neutral" | null,
   "quality_preference": "any" | "high_only" | "no_high",
-  "model_preference": "any" | "eleven_v3" | "eleven_flash_v2_5" | "eleven_turbo_v2_5" | "eleven_multilingual_v2" | string[],
+  "model_preference": "any" | "eleven_monolingual_v1" | "eleven_multilingual_v1" | "eleven_multilingual_v2" | "eleven_turbo_v2" | "eleven_turbo_v2_5" | "eleven_flash_v2" | "eleven_flash_v2_5" | "eleven_v3" | string[],
   "notice_period_preference": "any" | "min_days" | "no_notice",
   "min_notice_period_days": integer or null,
   "custom_rates_preference": "any" | "exclude",
@@ -5907,8 +6204,12 @@ RULES:
 - model_preference:
   - "eleven_v3" when the user explicitly asks for ElevenLabs V3 / eleven v3 / V3 model support
     (e.g. "with V3 model", "eleven v3 voices", "na modelu V3").
-  - "eleven_flash_v2_5" when the user asks for Flash 2.5 / eleven flash v2.5.
-  - "eleven_turbo_v2_5" for Turbo requests, and "eleven_multilingual_v2" for Multilingual v2.
+  - "eleven_monolingual_v1" for Monolingual v1; "eleven_multilingual_v1" for Multilingual v1.
+  - "eleven_multilingual_v2" for Multilingual v2 and an otherwise unqualified "V2 model".
+  - "eleven_flash_v2" / "eleven_flash_v2_5" for an explicit Flash v2 / Flash v2.5.
+    An unqualified Flash request means "eleven_flash_v2_5".
+  - "eleven_turbo_v2" / "eleven_turbo_v2_5" for an explicit Turbo v2 / Turbo v2.5.
+    An unqualified Turbo request means "eleven_turbo_v2_5".
   - Return an array when multiple supported models are explicitly requested.
   - V4 has no supported catalog model id: return "any", never map V4 to V3.
   - "any" in all other cases (including when the user only says "best" or "top" without mentioning a model).
@@ -6149,7 +6450,10 @@ IMPORTANT:
       style_keywords: [],
       extra_keywords: [userText.toLowerCase()]
     };
-    return applyCustomRatesToPlan(applyNoticePeriodToPlan(fallback, userText), userText);
+    return normalizeKeywordPlan(
+      applyCustomRatesToPlan(applyNoticePeriodToPlan(fallback, userText), userText),
+      userText
+    );
   }
 }
 
@@ -6262,7 +6566,6 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   }
 
   const qualityPref = plan.quality_preference || 'any';
-  const modelPref = plan.model_preference || 'any';
 
   // Resolve variant constraints once (used by fanout + scoring + diagnostics)
   const resolved = resolveVariantConstraints(userText, plan, facetKB, accentCatalog);
@@ -7174,10 +7477,14 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             }
           } catch (_) {}
 
-          if (plan.__no_notice_period === true || plan.__min_notice_period_days > 0 || plan.__no_custom_rates === true) {
-            return applyVoiceLibraryFilters(allVoices, plan);
-          }
-          return allVoices;
+          return await applyFetchConstraintFilters(
+            allVoices,
+            plan,
+            userText,
+            language,
+            trace,
+            { dedupeAcrossGroups: true }
+          );
         }
       }
     }
@@ -8420,24 +8727,6 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     return v;
   });
 
-  // Bilingual EN+ES: prefer voices verified for both English and Spanish.
-  if (isBilingualEnEsSearch && voices.length) {
-    const verifiedBoth = voices.filter(voiceHasVerifiedEnAndEs);
-    try {
-      trace({
-        stage: 'bilingual_filter',
-        params: {
-          verified_both: String(verifiedBoth.length),
-          total_before: String(voices.length)
-        },
-        count: verifiedBoth.length
-      });
-    } catch (_) {}
-    if (verifiedBoth.length > 0) {
-      voices = verifiedBoth;
-    }
-  }
-
   // Specific variant: drop keyword-polluted candidates that don't match the requested locale/accent.
   if (resolved?.variantMode === 'specific' && language && voices.length) {
     const beforeVariant = voices.length;
@@ -8487,32 +8776,8 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     }
   } catch (_) {}
 
-  // extra language filter (heuristic)
-  if (language && voices.length) {
-    const langFiltered = voices.filter((v) => isVoiceInLanguage(v, language));
-    if (langFiltered.length >= 5) {
-      voices = langFiltered;
-    }
-  }
+  voices = await applyFetchConstraintFilters(voices, plan, userText, language, trace);
 
-  // Never re-admit candidates whose primary metadata explicitly contradicts a
-  // requested language/gender. Unknown metadata stays eligible.
-  if (language && voices.length) {
-    const before = voices.length;
-    voices = voices.filter((v) => {
-      const primary = getExplicitVoicePrimaryIso2(v);
-      return !primary || primary === language;
-    });
-    if (before !== voices.length) {
-      try {
-        trace({
-          stage: 'explicit_primary_language_filter',
-          params: { language, before: String(before), after: String(voices.length) },
-          count: voices.length
-        });
-      } catch (_) {}
-    }
-  }
   if ((gender === 'male' || gender === 'female') && voices.length) {
     const before = voices.length;
     voices = voices.filter((v) => {
@@ -8528,53 +8793,6 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
         });
       } catch (_) {}
     }
-  }
-
-  // quality preference
-  if (qualityPref === 'high_only') {
-    const onlyHigh = voices.filter(isHighQuality);
-    if (onlyHigh.length) voices = onlyHigh;
-  } else if (qualityPref === 'no_high') {
-    const onlyStandard = voices.filter((v) => !isHighQuality(v));
-    if (onlyStandard.length) voices = onlyStandard;
-  }
-
-  if (isSpecificModelPreference(modelPref)) {
-    voices = await hydrateVoiceModelMetadataShortlist(voices, modelPref, trace, {
-      limit: 30,
-      concurrency: 3
-    });
-    const beforeModel = voices.length;
-    voices = filterVoicesByModelPreference(voices, modelPref);
-    try {
-      trace({
-        stage: 'model_filter',
-        params: {
-          model: Array.isArray(modelPref) ? modelPref.join(',') : String(modelPref),
-          before: String(beforeModel),
-          after: String(voices.length)
-        },
-        count: voices.length
-      });
-    } catch (_) {}
-  }
-
-  if (plan.__no_notice_period === true || plan.__min_notice_period_days > 0 || plan.__no_custom_rates === true) {
-    const beforeLibraryFilters = voices.length;
-    voices = applyVoiceLibraryFilters(voices, plan);
-    try {
-      trace({
-        stage: 'voice_library_filters',
-        params: {
-          no_notice: String(plan.__no_notice_period === true),
-          min_days: String(plan.__min_notice_period_days ?? '-'),
-          no_custom_rates: String(plan.__no_custom_rates === true),
-          before: String(beforeLibraryFilters),
-          after: String(voices.length)
-        },
-        count: voices.length
-      });
-    } catch (_) {}
   }
 
   // Candidate ranking prep: coverage score + diversity seeding before cap
@@ -9533,14 +9751,13 @@ function buildMessageFromSession(session) {
       const genderFilter = filters.gender || 'any';
 
       const out = [];
+      const renderedVoiceIds = new Set();
 
       const renderGroup = (group) => {
         const gVoices = Array.isArray(group?.voices) ? group.voices : [];
         if (!gVoices.length) return;
 
         const title = `${String(facetAxis || group.facetType || 'facet').toUpperCase()}: ${String(group.facetLabel || group.facetKey || '').toUpperCase()}`;
-        out.push('```' + title + '```');
-
         const sorted = [...gVoices].sort((a, b) => (ranking?.[b.voice_id] || 0) - (ranking?.[a.voice_id] || 0));
         const uniq = [];
         const seen = new Set();
@@ -9554,17 +9771,23 @@ function buildMessageFromSession(session) {
         const buckets = { female: [], male: [], other: [] };
         const bothGendersCatalog = wantsBothGendersCatalog(null, originalQuery);
         for (const v of uniq) {
+          if (variantIntent?.isSpecific !== true && renderedVoiceIds.has(v.voice_id)) continue;
           const isHq = isHighQuality(v);
           if (qualityFilter === 'high_only' && !isHq) continue;
           if (qualityFilter === 'no_high' && isHq) continue;
           const g = getGenderGroup(v);
           if (bothGendersCatalog && g === 'other') continue;
           if (genderFilter !== 'any' && g !== genderFilter) continue;
-          if (buckets[g].length < maxPerGender) buckets[g].push(v);
+          if (buckets[g].length < maxPerGender) {
+            buckets[g].push(v);
+            if (variantIntent?.isSpecific !== true) renderedVoiceIds.add(v.voice_id);
+          }
         }
 
         const order = getGenderRenderOrder(genderFilter, originalQuery);
         const genderLabels = { female: labels.female, male: labels.male, other: labels.other };
+        if (!order.some((key) => (buckets[key] || []).length)) return;
+        out.push('```' + title + '```');
         for (const k of order) {
           const arr = buckets[k] || [];
           if (!arr.length) continue;
@@ -12177,7 +12400,7 @@ function shouldHydrateVoiceModelMetadata(modelPref, options = {}) {
 async function hydrateVoiceModelMetadataShortlist(voices, modelPref, traceCb, options = {}) {
   const src = Array.isArray(voices) ? voices : [];
   if (!src.length || !shouldHydrateVoiceModelMetadata(modelPref, options)) return src;
-  const limit = Math.max(1, Math.min(50, Number(options.limit) || 30));
+  const limit = Math.max(1, Math.min(500, Number(options.limit) || 30));
   const concurrency = Math.max(1, Math.min(4, Number(options.concurrency) || 3));
   const candidates = src
     .filter(
@@ -12185,7 +12408,9 @@ async function hydrateVoiceModelMetadataShortlist(voices, modelPref, traceCb, op
         voice &&
         voice.voice_id &&
         (!Array.isArray(voice.high_quality_base_model_ids) ||
-          voice.high_quality_base_model_ids.length === 0)
+          voice.high_quality_base_model_ids.length === 0) &&
+        !(Array.isArray(voice.verified_languages) &&
+          voice.verified_languages.some((entry) => entry?.model_id))
     )
     .slice(0, limit);
   let nextIndex = 0;
@@ -12198,6 +12423,9 @@ async function hydrateVoiceModelMetadataShortlist(voices, modelPref, traceCb, op
       if (Array.isArray(cached.modelIds)) {
         voice.high_quality_base_model_ids = [...cached.modelIds];
       }
+      if (Array.isArray(cached.verifiedLanguages)) {
+        voice.verified_languages = cached.verifiedLanguages.map((entry) => ({ ...entry }));
+      }
       return;
     }
 
@@ -12205,10 +12433,17 @@ async function hydrateVoiceModelMetadataShortlist(voices, modelPref, traceCb, op
     const modelIds = Array.isArray(detailed?.high_quality_base_model_ids)
       ? detailed.high_quality_base_model_ids.map(String).filter(Boolean)
       : null;
-    voiceModelMetadataCache.set(voiceId, { at: Date.now(), modelIds });
+    const verifiedLanguages = Array.isArray(detailed?.verified_languages)
+      ? detailed.verified_languages.map((entry) => ({ ...entry }))
+      : null;
+    voiceModelMetadataCache.set(voiceId, { at: Date.now(), modelIds, verifiedLanguages });
     if (modelIds) {
       voice.high_quality_base_model_ids = [...modelIds];
       hydratedCount += 1;
+    }
+    if (verifiedLanguages) {
+      voice.verified_languages = verifiedLanguages.map((entry) => ({ ...entry }));
+      if (!modelIds && verifiedLanguages.some((entry) => entry?.model_id)) hydratedCount += 1;
     }
   };
 
@@ -12480,11 +12715,17 @@ function buildSearchReport(trace, plan, mode, summary) {
 
     // LatAm Spanish diagnostics (derived from trace)
     try {
-      const bilingualTrace = trace.filter((t) => t && t.stage === 'bilingual_filter');
+      const bilingualTrace = trace.filter(
+        (t) =>
+          t &&
+          t.stage === 'verified_language_filter' &&
+          String(t?.params?.required || '').includes('en') &&
+          String(t?.params?.required || '').includes('es')
+      );
       if (bilingualTrace.length) {
         const last = bilingualTrace[bilingualTrace.length - 1];
         lines.push('Bilingual:');
-        lines.push(`• verified_en_es=${last?.params?.verified_both ?? '-'} (pool before filter=${last?.params?.total_before ?? '-'})`);
+        lines.push(`• verified_en_es=${last?.count ?? '-'} (pool before filter=${last?.params?.before ?? '-'})`);
         lines.push('');
       }
       const hasLatamAlias = trace.some(
@@ -12756,6 +12997,38 @@ function runDevAsserts() {
   devAssert(detectBilingualEnEs('bilingual english and spanish voice'), 'bilingual: explicit bilingual keyword');
   devAssert(detectBilingualEnEs('en/es voice for IVR'), 'bilingual: en/es shorthand');
   devAssert(!detectBilingualEnEs('American English voice for a Spanish course'), 'bilingual: not inferred from unrelated English+Spanish mention');
+  {
+    const q =
+      'Greek voice for announcements, but also verified for English; high quality and v2 model';
+    const constraint = detectVerifiedLanguageConstraint(q);
+    devAssert(
+      constraint?.primaryIso2 === 'el' &&
+        constraint.requiredIso2.length === 1 &&
+        constraint.requiredIso2[0] === 'en',
+      'verified language: Greek primary + English requirement'
+    );
+    devAssert(
+      detectMultipleLanguageIntents(q).length === 0,
+      'verified language: not split into independent catalogs'
+    );
+    devAssert(
+      detectMultipleLanguageIntents('Greek voices and separately French voices').length === 2,
+      'multi-language: explicit separate catalogs remain independent'
+    );
+    const intersection = filterVoicesByLanguageRequirements(
+      [
+        { voice_id: 'both', language: 'el', verified_languages: [{ language: 'en' }] },
+        { voice_id: 'greek', language: 'el', verified_languages: [] },
+        { voice_id: 'english', language: 'en', verified_languages: [] }
+      ],
+      'el',
+      ['el', 'en']
+    );
+    devAssert(
+      intersection.length === 1 && intersection[0].voice_id === 'both',
+      'verified language: intersection is fail-closed'
+    );
+  }
 
   // Bilingual: accent must not be applied to shared-voices queries
   {
@@ -12846,25 +13119,27 @@ function runDevAsserts() {
   devAssert(detectBestV3CuratedIntent('najlepszy głos v3') === true, 'best v3 intent: polish');
   devAssert(detectBestV3CuratedIntent('best v3 voices in polish') === true, 'best v3 intent: en');
   devAssert(detectBestV3CuratedIntent('find a warm v3 narrator') === false, 'best v3 intent: not mere v3');
+  devAssert(
+    shouldUseV3ArenaRankings('warm v3 Greek voice', { model_preference: 'eleven_v3' }),
+    'v3 arena: every explicit v3 search uses CSV rankings'
+  );
   {
-    // "best v3 narrator" hits the curated intent without the planner asking for v3,
-    // so ranking may request model ids but must never rewrite the shared plan.
-    const plan = { model_preference: 'any' };
+    const plan = { model_preference: detectModelPreferenceFromText('best v3 narrator') };
     devAssert(
-      detectModelPreferenceFromText('best v3 narrator') === null,
-      'best v3: planner leaves loose v3 phrasing as any'
+      plan.model_preference === 'eleven_v3',
+      'best v3: generic version maps to eleven_v3'
     );
     devAssert(detectBestV3CuratedIntent('best v3 narrator') === true, 'best v3 intent: loose phrasing');
     devAssert(
       (isSpecificModelPreference(plan.model_preference) ||
         detectBestV3CuratedIntent('best v3 narrator')) === true,
-      'best v3: ranking can request model ids without a specific model preference'
+      'best v3: ranking requests v3 model ids'
     );
     devAssert(
       shouldHydrateVoiceModelMetadata(plan.model_preference, { force: true }) === true,
       'best v3: forced hydration runs for loose v3 intent on an any plan'
     );
-    devAssert(plan.model_preference === 'any', 'best v3: plan model_preference unchanged');
+    devAssert(plan.model_preference === 'eleven_v3', 'best v3: plan model preference is consistent');
   }
   devAssert(
     shouldHydrateVoiceModelMetadata('eleven_v3') === true,
@@ -12907,14 +13182,59 @@ function runDevAsserts() {
     );
   }
   devAssert(detectModelPreferenceFromText('flash 2.5 voices') === 'eleven_flash_v2_5', 'model pref: flash 2.5');
+  devAssert(detectModelPreferenceFromText('flash voices') === 'eleven_flash_v2_5', 'model pref: generic flash');
+  devAssert(detectModelPreferenceFromText('flash v2 voices') === 'eleven_flash_v2', 'model pref: flash v2');
+  devAssert(detectModelPreferenceFromText('turbo voices') === 'eleven_turbo_v2_5', 'model pref: generic turbo');
+  devAssert(detectModelPreferenceFromText('turbo v2 voices') === 'eleven_turbo_v2', 'model pref: turbo v2');
   devAssert(
     detectModelPreferenceFromText('turbo v3 voices') === 'eleven_turbo_v2_5',
     'model pref: turbo v3 does not become eleven v3'
   );
   devAssert(
+    detectModelPreferenceFromText('monolingual v1 voices') === 'eleven_monolingual_v1',
+    'model pref: monolingual v1'
+  );
+  devAssert(
+    detectModelPreferenceFromText('multilingual v1 voices') === 'eleven_multilingual_v1',
+    'model pref: multilingual v1'
+  );
+  devAssert(
     detectModelPreferenceFromText('multilingual v2 voices') === 'eleven_multilingual_v2',
     'model pref: multilingual v2'
   );
+  devAssert(
+    detectModelPreferenceFromText('Greek announcements, high quality and v2 model') ===
+      'eleven_multilingual_v2',
+    'model pref: generic v2 model'
+  );
+  devAssert(detectModelPreferenceFromText('v3') === 'eleven_v3', 'model pref: bare v3');
+  {
+    const modelVoices = [
+      { voice_id: 'hq', high_quality_base_model_ids: ['eleven_multilingual_v2'] },
+      {
+        voice_id: 'verified',
+        verified_languages: [{ language: 'el', model_id: 'eleven_multilingual_v2' }]
+      },
+      { voice_id: 'other', high_quality_base_model_ids: ['eleven_v3'] }
+    ];
+    devAssert(
+      voiceSupportsModel(modelVoices[1], 'eleven_multilingual_v2'),
+      'model support: verified_languages model_id'
+    );
+    const matchedModel = filterVoicesByModelPreference(modelVoices, 'eleven_multilingual_v2');
+    devAssert(
+      matchedModel.length === 2 && matchedModel.every((voice) => voice.voice_id !== 'other'),
+      'model filter: matches all metadata sources'
+    );
+    devAssert(
+      filterVoicesByModelPreference(modelVoices, 'eleven_flash_v2_5').length === 0,
+      'model filter: explicit no-match fails closed'
+    );
+    devAssert(
+      filterVoicesByModelPreference(modelVoices, 'any').length === modelVoices.length,
+      'model filter: any remains open'
+    );
+  }
   devAssert(detectModelPreferenceFromText('V4 friendly voices') === null, 'model pref: unsupported v4 stays any');
   devAssert(
     normalizeKeywordPlan({ model_preference: 'eleven_v3' }, 'V4 friendly voices').model_preference === 'any',
@@ -12927,6 +13247,80 @@ function runDevAsserts() {
       'model pref: flash+v3 keeps both'
     );
     devAssert(normalizePlanModelPreference(both).length === 2, 'model pref: normalize keeps both');
+  }
+  {
+    const inherited = inheritGlobalSearchConstraints(
+      { target_voice_language: 'el', quality_preference: 'any', model_preference: 'any' },
+      {
+        quality_preference: 'high_only',
+        model_preference: 'eleven_multilingual_v2',
+        __no_notice_period: true,
+        __no_custom_rates: true
+      }
+    );
+    devAssert(
+      inherited.target_voice_language === 'el' &&
+        inherited.quality_preference === 'high_only' &&
+        inherited.model_preference === 'eleven_multilingual_v2' &&
+        inherited.__no_notice_period === true &&
+        inherited.__no_custom_rates === true,
+      'multi-language: subplan inherits global constraints'
+    );
+  }
+  {
+    const keptListAll = inheritGlobalSearchConstraints(
+      { target_voice_language: 'pt', __listAll: false },
+      { __listAll: true, quality_preference: 'high_only' }
+    );
+    devAssert(
+      keptListAll.__listAll === false && keptListAll.quality_preference === 'high_only',
+      'multi-language: inherit does not overwrite per-language listAll'
+    );
+  }
+  {
+    // "list all" belongs to the language segment that mentions it, not to the whole query.
+    const listAllPerLanguage = (text) => {
+      const intents = detectMultipleLanguageIntents(text);
+      const out = {};
+      for (const li of intents) {
+        const partText = li.segment || `${li.title} voices`;
+        out[li.iso2] = detectListAll(partText);
+      }
+      return out;
+    };
+    const commaCase = listAllPerLanguage('Spanish voices list all, and Portuguese voices');
+    devAssert(
+      commaCase.es === true && commaCase.pt === false,
+      'multi-language: listAll stays on the Spanish segment (comma form)'
+    );
+    const andCase = listAllPerLanguage('Spanish list all and Portuguese voices');
+    devAssert(
+      andCase.es === true && andCase.pt === false,
+      'multi-language: listAll stays on the Spanish segment (and form)'
+    );
+    const trailingCase = listAllPerLanguage('Spanish voices, and Portuguese voices list all');
+    devAssert(
+      trailingCase.es === false && trailingCase.pt === true,
+      'multi-language: listAll follows the fragment that contains it'
+    );
+  }
+  {
+    const a = { voice_id: 'a' };
+    const b = { voice_id: 'b' };
+    const source = [a, b];
+    source.facetGroups = [
+      { facetKey: 'standard', voices: [a, b] },
+      { facetKey: 'central', voices: [a] }
+    ];
+    source.variantIntent = { isSpecific: false };
+    const filtered = copyFilteredVoiceMetadata(source, [a, b], {
+      dedupeAcrossGroups: true
+    });
+    devAssert(
+      filtered.facetGroups.length === 1 &&
+        filtered.facetGroups[0].voices.length === 2,
+      'facet groups: voice ids are globally deduplicated'
+    );
   }
   devAssert(
     contentMatchedKeywords(['warm', 'locale:pt-pt', 'accent:european', 'professional']).join(',') ===
@@ -14564,6 +14958,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         await ensureLanguageIndexLoaded(traceCb);
         const partText = li.segment || `${li.title} voices`;
         const subPlan = await buildKeywordPlan(partText);
+        inheritGlobalSearchConstraints(subPlan, keywordPlan);
         subPlan.target_voice_language = li.iso2;
         if (li.locale) {
           subPlan.target_locale = li.locale;
@@ -14573,11 +14968,11 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
             if (accFromLocale) subPlan.target_accent = accFromLocale;
           } catch (_) {}
         }
-        subPlan.__featured = false;
-        subPlan.__sort = null;
+        subPlan.__featured = keywordPlan.__featured === true;
+        subPlan.__sort = keywordPlan.__sort || null;
         subPlan.__listAll = detectListAll(partText);
-        subPlan.__forceUseCases = false;
-        subPlan.__forceDescriptives = false;
+        subPlan.__forceUseCases = keywordPlan.__forceUseCases === true;
+        subPlan.__forceDescriptives = keywordPlan.__forceDescriptives === true;
         if (detectOneMaleOneFemale(cleaned)) {
           subPlan.__dualGenderOneEach = true;
           subPlan.target_gender = null;
