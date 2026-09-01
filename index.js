@@ -1247,6 +1247,13 @@ class FacetKB {
     if (!top.length) return [];
 
     const lower = (userText || '').toString().toLowerCase();
+    const isSpanishLatam = k === 'es' && LATAM_SPANISH_RE.test(lower);
+    // Bare "american" is a different catalog accent than "latin american"; it must never
+    // surface for LatAm Spanish. Declared up front so every return path below can use it.
+    const removeBareAmericanForLatam = (items) =>
+      isSpanishLatam
+        ? items.filter((x) => normalizeCatalogToken(x.norm || x.accent) !== 'american')
+        : items;
     const textNorm = normalizeCatalogToken(
       lower.replace(/[^\p{L}\p{N}\s\-']/gu, ' ')
     );
@@ -1262,7 +1269,7 @@ class FacetKB {
       (t) => !skipTokens.has(t) && !ACCENT_MATCH_STOPWORDS.has(t)
     );
     if (!matchTokens.length && !textNorm) {
-      return top
+      return removeBareAmericanForLatam(top)
         .slice(0, Math.max(2, Math.min(6, limit)))
         .map((x) => ({ ...x, matchKind: 'popularity' }));
     }
@@ -1301,7 +1308,7 @@ class FacetKB {
         kept.sort(
           (a, b) => (b._len || 0) - (a._len || 0) || (b.count || 0) - (a.count || 0)
         );
-        return kept
+        return removeBareAmericanForLatam(kept)
           .slice(0, Math.max(1, Math.min(6, limit)))
           .map(({ _len, ...rest }) => rest);
       }
@@ -1352,8 +1359,10 @@ class FacetKB {
         String(b.norm || b.accent || '').length - String(a.norm || a.accent || '').length ||
         (b.count || 0) - (a.count || 0)
     );
-    if (exact.length >= 1) return exact.slice(0, Math.max(1, Math.min(6, limit)));
-    if (partial.length >= 2) return partial.slice(0, Math.max(2, Math.min(6, limit)));
+    const safeExact = removeBareAmericanForLatam(exact);
+    const safePartial = removeBareAmericanForLatam(partial);
+    if (safeExact.length >= 1) return safeExact.slice(0, Math.max(1, Math.min(6, limit)));
+    if (safePartial.length >= 2) return safePartial.slice(0, Math.max(2, Math.min(6, limit)));
 
     // 2) fuzzy: try closest among candidate strings for longer tokens (skip stopwords)
     try {
@@ -1375,11 +1384,12 @@ class FacetKB {
       }
       best = dedupePreserveOrder(best.map((x) => x.norm)).map((n) => top.find((x) => x.norm === n)).filter(Boolean);
       best.sort((a, b) => (b.count || 0) - (a.count || 0));
+      best = removeBareAmericanForLatam(best);
       if (best.length) return best.slice(0, Math.max(2, Math.min(6, limit))).map((x) => ({ ...x, matchKind: 'fuzzy' }));
     } catch (_) {}
 
     // 3) popularity fallback
-    return top
+    return removeBareAmericanForLatam(top)
       .slice(0, Math.max(2, Math.min(6, limit)))
       .map((x) => ({ ...x, matchKind: 'popularity' }));
   }
@@ -2499,14 +2509,20 @@ function filterVoicesByModelPreference(voices, modelPref) {
 
 /** Normalize model preference to a list of model ids (empty = any). */
 function normalizeModelPreferenceList(modelPref) {
+  const supported = new Set([
+    'eleven_v3',
+    'eleven_flash_v2_5',
+    'eleven_turbo_v2_5',
+    'eleven_multilingual_v2'
+  ]);
   if (!modelPref || modelPref === 'any') return [];
   if (Array.isArray(modelPref)) {
     return modelPref
       .map((x) => String(x || '').toLowerCase().trim())
-      .filter((x) => x === 'eleven_v3' || x === 'eleven_flash_v2_5');
+      .filter((x) => supported.has(x));
   }
   const s = String(modelPref).toLowerCase().trim();
-  if (s === 'eleven_v3' || s === 'eleven_flash_v2_5') return [s];
+  if (supported.has(s)) return [s];
   return [];
 }
 
@@ -2557,6 +2573,9 @@ function detectMultipleLanguageIntents(text) {
       const cleanedSeg = seg.replace(/\s+voices?\s*$/i, '').trim() || seg;
       const hint = parseUserLanguageHints(cleanedSeg) || parseUserLanguageHints(seg);
       if (!hint?.iso2) continue;
+      // Fuzzy correction is useful for a whole brief, but unsafe for list segments:
+      // an adjective can otherwise become an invented second language.
+      if (hint.reason === 'fuzzy_language') continue;
       const iso2 = hint.iso2.toLowerCase().slice(0, 2);
       if (seenIso2.has(iso2)) continue;
       seenIso2.add(iso2);
@@ -3121,6 +3140,15 @@ function isVoiceInLanguage(voice, langCode) {
   }
 
   return false;
+}
+
+function getExplicitVoicePrimaryIso2(voice) {
+  const raw = (voice?.language || '').toString().trim().toLowerCase();
+  if (!raw) return null;
+  const locale = extractLocaleFromField(raw);
+  if (locale) return locale.slice(0, 2);
+  if (/^[a-z]{2}$/.test(raw)) return raw;
+  return languageIndex.byName.get(raw) || STATIC_LANGUAGE_ALIASES.get(raw) || null;
 }
 
 // -------------------------------------------------------------
@@ -4337,6 +4365,7 @@ function detectQualityPreferenceFromText(text) {
     lower.includes('high quality') ||
     lower.includes('high-quality') ||
     lower.includes('high quaility') ||
+    lower.includes('high qualirt') ||
     lower.includes('wysoka jakość') ||
     lower.includes('wysokiej jakości') ||
     lower.includes('wysoka jakosc') ||
@@ -4358,28 +4387,53 @@ function detectModelPreferenceFromText(text) {
     return null;
   }
 
-  const wantsV3 =
-    /\beleven[\s_-]?v3\b/.test(lower) ||
-    /\bv3\s+model\b/.test(lower) ||
-    /\bmodel\s+v3\b/.test(lower) ||
-    /\bwith\s+v3\b/.test(lower) ||
-    /\bna\s+v3\b/.test(lower) ||
-    /\bw\s+model(u|em)?\s+v3\b/.test(lower) ||
-    /\b(głos(?:y|ów)?|glos(?:y|ow)?|voices?)\s+v3\b/.test(lower) ||
-    /\bv3\s+(głos(?:y|ów)?|glos(?:y|ow)?|voices?)\b/.test(lower);
-
   const wantsFlash =
     /\beleven[\s_-]?flash[\s_-]?v?2\.?5\b/.test(lower) ||
     /\bflash\s*2\.?5\b/.test(lower) ||
     /\bmodel\s+flash\s*2\.?5\b/.test(lower) ||
     /\beleven_flash_v2_5\b/.test(lower);
 
-  // Both requested: keep union (do not silently drop to v3-only)
-  if (wantsV3 && wantsFlash) return ['eleven_v3', 'eleven_flash_v2_5'];
-  if (wantsFlash) return 'eleven_flash_v2_5';
-  if (wantsV3) return 'eleven_v3';
+  const wantsTurbo =
+    /\beleven[\s_-]?turbo(?:[\s_-]?v?2\.?5)?\b/.test(lower) ||
+    /\bturbo(?:\s+v?\d(?:\.\d)?)?\b/.test(lower) ||
+    /\beleven_turbo_v2_5\b/.test(lower);
+  const wantsMultilingualV2 =
+    /\beleven[\s_-]?multilingual[\s_-]?v?2\b/.test(lower) ||
+    /\bmultilingual\s+v?2\b/.test(lower) ||
+    /\beleven_multilingual_v2\b/.test(lower);
+  const hasV4 = /\b(?:eleven[\s_-]?)?v4\b|\bmodel\s+v4\b/.test(lower);
+
+  // Product-qualified versions must not leak into generic V3 detection
+  // (for example, "Turbo v3" is a Turbo request, not Eleven v3).
+  const genericV3Text = lower
+    .replace(/\bturbo\s+v?3\b/g, 'turbo')
+    .replace(/\bmultilingual\s+v?3\b/g, 'multilingual');
+  const wantsV3 =
+    /\beleven[\s_-]?v3\b/.test(genericV3Text) ||
+    /\bv3\s+model\b/.test(genericV3Text) ||
+    /\bmodel\s+v3\b/.test(genericV3Text) ||
+    /\bwith\s+v3\b/.test(genericV3Text) ||
+    /\bna\s+v3\b/.test(genericV3Text) ||
+    /\bw\s+model(u|em)?\s+v3\b/.test(genericV3Text) ||
+    /\b(głos(?:y|ów)?|glos(?:y|ow)?|voices?)\s+v3\b/.test(genericV3Text) ||
+    /\bv3\s+(głos(?:y|ów)?|glos(?:y|ow)?|voices?)\b/.test(genericV3Text);
+
+  const requested = [];
+  if (wantsFlash) requested.push('eleven_flash_v2_5');
+  if (wantsTurbo) requested.push('eleven_turbo_v2_5');
+  if (wantsMultilingualV2) requested.push('eleven_multilingual_v2');
+  if (wantsV3) requested.push('eleven_v3');
+  if (requested.length === 1) return requested[0];
+  if (requested.length > 1) return requested;
+  // V4 has no supported catalog model id; never silently map it to Eleven v3.
+  if (hasV4) return null;
 
   return null;
+}
+
+function hasUnsupportedV4ModelMention(text) {
+  const lower = (text || '').toString().toLowerCase();
+  return /\b(?:eleven[\s_-]?)?v4\b|\bmodel\s+v4\b/.test(lower);
 }
 
 function normalizePlanModelPreference(mp) {
@@ -4609,6 +4663,11 @@ function formatNoticePeriodLabel(voice, uiLang) {
   if (days == null) {
     return lang === 'pl' ? 'brak notice period' : 'no notice period';
   }
+  if (days === MAX_NOTICE_PERIOD_DAYS) {
+    return lang === 'pl'
+      ? `infinity (${days} dni notice period)`
+      : `infinity (${days} days notice period)`;
+  }
   if (typeof days === 'number' && days > 0) {
     return lang === 'pl' ? `${days} dni notice period` : `${days} days notice period`;
   }
@@ -4705,9 +4764,61 @@ function filterVoicesByCustomRates(voices, filtersOrPlan) {
   return out;
 }
 
+function extractExcludedVoiceNames(text) {
+  const raw = (text || '').toString();
+  if (!raw) return [];
+  const names = [];
+  const re =
+    /\b(?:avoid|exclude|without|skip|omit|unikaj|wyklucz|wyłącz|wylacz|pomiń|pomin)\s+(?:the\s+)?(?:voice\s+|głos\s+|glos\s+)?(?:"([^"]{1,60})"|'([^']{1,60})'|([A-ZÀ-ÖØ-öø-ÿ][\p{L}\p{N}'-]*))/giu;
+  let match;
+  while ((match = re.exec(raw))) {
+    const name = (match[1] || match[2] || match[3] || '').trim();
+    if (!name) continue;
+    const normalized = normalizeCatalogToken(name);
+    if (
+      !normalized ||
+      /^(high|quality|custom|rates?|notice|period|studio|male|female|all)$/.test(normalized)
+    ) {
+      continue;
+    }
+    names.push(name);
+  }
+  return dedupePreserveOrder(names).slice(0, 12);
+}
+
+function voiceMatchesExcludedName(voice, excludedName) {
+  const actual = normalizeCatalogToken((voice?.name || '').toString().replace(/^💲/, ''));
+  const excluded = normalizeCatalogToken(excludedName || '');
+  if (!actual || !excluded) return false;
+  return actual === excluded || actual.startsWith(`${excluded} `);
+}
+
+function filterVoicesByExcludedNames(voices, filtersOrPlan) {
+  const excluded =
+    filtersOrPlan?.excludedVoiceNames || filtersOrPlan?.__excludedVoiceNames || [];
+  if (!Array.isArray(voices) || !voices.length || !Array.isArray(excluded) || !excluded.length) {
+    return voices;
+  }
+  const applyList = (list) =>
+    (Array.isArray(list) ? list : []).filter(
+      (voice) => !excluded.some((name) => voiceMatchesExcludedName(voice, name))
+    );
+  const out = applyList(voices);
+  if (Array.isArray(voices.facetGroups) && voices.facetGroups.length) {
+    out.facetGroups = voices.facetGroups
+      .map((group) => ({ ...group, voices: applyList(group?.voices) }))
+      .filter((group) => group.voices.length);
+    if (voices.facetAxis) out.facetAxis = voices.facetAxis;
+    if (voices.facetIso2) out.facetIso2 = voices.facetIso2;
+    if (voices.variantIntent) out.variantIntent = voices.variantIntent;
+  }
+  return out;
+}
+
 function applyVoiceLibraryFilters(voices, filtersOrPlan) {
   let out = filterVoicesByNoticePeriod(voices, filtersOrPlan);
   out = filterVoicesByCustomRates(out, filtersOrPlan);
+  out = filterVoicesByExcludedNames(out, filtersOrPlan);
   return out;
 }
 
@@ -4758,6 +4869,15 @@ function applySessionCustomRatesFiltersToPlan(plan, filters) {
     plan.__no_custom_rates = false;
     plan.custom_rates_preference = 'any';
   }
+  return plan;
+}
+
+function applySessionVoiceNameExclusionsToPlan(plan, filters) {
+  if (!plan || !filters) return plan;
+  plan.__excludedVoiceNames = dedupePreserveOrder([
+    ...(Array.isArray(plan.__excludedVoiceNames) ? plan.__excludedVoiceNames : []),
+    ...(Array.isArray(filters.excludedVoiceNames) ? filters.excludedVoiceNames : [])
+  ]).slice(0, 12);
   return plan;
 }
 
@@ -5190,6 +5310,17 @@ function applyFilterChangesFromText(session, lower) {
     }
   }
 
+  const excludedVoiceNames = extractExcludedVoiceNames(lower);
+  if (excludedVoiceNames.length) {
+    session.filters.excludedVoiceNames = dedupePreserveOrder([
+      ...(Array.isArray(session.filters.excludedVoiceNames)
+        ? session.filters.excludedVoiceNames
+        : []),
+      ...excludedVoiceNames
+    ]).slice(0, 12);
+    changed = true;
+  }
+
   if (serverChanged) session._serverFiltersChanged = true;
   return changed;
 }
@@ -5478,11 +5609,17 @@ function normalizeKeywordPlan(plan, userText) {
   const mpFromText = detectModelPreferenceFromText(userText);
   if (mpFromText) {
     out.model_preference = mpFromText;
+  } else if (hasUnsupportedV4ModelMention(userText)) {
+    out.model_preference = 'any';
   }
   out.model_preference = normalizePlanModelPreference(out.model_preference);
 
   applyNoticePeriodToPlan(out, userText);
   applyCustomRatesToPlan(out, userText);
+  out.__excludedVoiceNames = dedupePreserveOrder([
+    ...(Array.isArray(out.__excludedVoiceNames) ? out.__excludedVoiceNames : []),
+    ...extractExcludedVoiceNames(userText)
+  ]).slice(0, 12);
 
   // sanitize gender
   if (out.target_gender !== 'male' && out.target_gender !== 'female' && out.target_gender !== 'neutral') {
@@ -5503,6 +5640,40 @@ function normalizeKeywordPlan(plan, userText) {
           'arabic'
         ]);
         out.extra_keywords = clampArr(merged, 20);
+      }
+    }
+  } catch (_) {}
+
+  // Explicit regional text wins over an LLM-produced conflicting language/accent.
+  // Keep mixed Spain+LatAm briefs broad so downstream fanout can represent both.
+  try {
+    const isBilingual = detectBilingualEnEs(userText);
+    const hasLatam = LATAM_SPANISH_RE.test(lower);
+    const hasSpain =
+      /\b(spain|castilian|es-es|european spanish|spanish\s+(?:voice\s+)?with no accent)\b/.test(lower);
+    if (!isBilingual && hasLatam && !hasSpain) {
+      out.target_voice_language = 'es';
+      out.target_accent = 'latin american';
+      out.target_locale = null;
+    } else if (!isBilingual && hasSpain && !hasLatam) {
+      out.target_voice_language = 'es';
+      out.target_accent = 'peninsular';
+      out.target_locale = 'es-ES';
+    } else if (
+      /\b(portugal|pt-pt|pt-eu|european portuguese|portuguese[- ]european)\b/.test(lower)
+    ) {
+      out.target_voice_language = 'pt';
+      out.target_accent = 'european';
+      out.target_locale = 'pt-PT';
+    } else {
+      const englishAccent = [
+        [/\b(australian|en-au)\b/, 'australian'],
+        [/\b(british|en-gb|en-uk|uk english)\b/, 'british'],
+        [/\b(general american|standard american|american|en-us|us english)\b/, 'american']
+      ].find(([re]) => re.test(lower));
+      if (englishAccent) {
+        out.target_voice_language = 'en';
+        out.target_accent = englishAccent[1];
       }
     }
   } catch (_) {}
@@ -5696,7 +5867,7 @@ The JSON MUST have exactly these fields:
   "target_accent": string or null,          // e.g. "american", "british", "polish"
   "target_gender": "male" | "female" | "neutral" | null,
   "quality_preference": "any" | "high_only" | "no_high",
-  "model_preference": "any" | "eleven_v3" | "eleven_flash_v2_5" | ["eleven_v3","eleven_flash_v2_5"],
+  "model_preference": "any" | "eleven_v3" | "eleven_flash_v2_5" | "eleven_turbo_v2_5" | "eleven_multilingual_v2" | string[],
   "notice_period_preference": "any" | "min_days" | "no_notice",
   "min_notice_period_days": integer or null,
   "custom_rates_preference": "any" | "exclude",
@@ -5737,7 +5908,9 @@ RULES:
   - "eleven_v3" when the user explicitly asks for ElevenLabs V3 / eleven v3 / V3 model support
     (e.g. "with V3 model", "eleven v3 voices", "na modelu V3").
   - "eleven_flash_v2_5" when the user asks for Flash 2.5 / eleven flash v2.5.
-  - When BOTH flash 2.5 and v3 are requested, return both as an array (do not drop one).
+  - "eleven_turbo_v2_5" for Turbo requests, and "eleven_multilingual_v2" for Multilingual v2.
+  - Return an array when multiple supported models are explicitly requested.
+  - V4 has no supported catalog model id: return "any", never map V4 to V3.
   - "any" in all other cases (including when the user only says "best" or "top" without mentioning a model).
 
 - notice_period_preference:
@@ -5852,7 +6025,9 @@ IMPORTANT:
     plan.quality_preference = qp || 'any';
 
     const mp = detectModelPreferenceFromText(userText);
-    plan.model_preference = normalizePlanModelPreference(mp || plan.model_preference || 'any');
+    plan.model_preference = normalizePlanModelPreference(
+      hasUnsupportedV4ModelMention(userText) ? 'any' : (mp || plan.model_preference || 'any')
+    );
 
     // Negative exclusions (accent/locale/gender)
     try {
@@ -8320,6 +8495,41 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     }
   }
 
+  // Never re-admit candidates whose primary metadata explicitly contradicts a
+  // requested language/gender. Unknown metadata stays eligible.
+  if (language && voices.length) {
+    const before = voices.length;
+    voices = voices.filter((v) => {
+      const primary = getExplicitVoicePrimaryIso2(v);
+      return !primary || primary === language;
+    });
+    if (before !== voices.length) {
+      try {
+        trace({
+          stage: 'explicit_primary_language_filter',
+          params: { language, before: String(before), after: String(voices.length) },
+          count: voices.length
+        });
+      } catch (_) {}
+    }
+  }
+  if ((gender === 'male' || gender === 'female') && voices.length) {
+    const before = voices.length;
+    voices = voices.filter((v) => {
+      const actual = getGenderGroup(v);
+      return actual === 'other' || actual === gender;
+    });
+    if (before !== voices.length) {
+      try {
+        trace({
+          stage: 'explicit_gender_filter',
+          params: { gender, before: String(before), after: String(voices.length) },
+          count: voices.length
+        });
+      } catch (_) {}
+    }
+  }
+
   // quality preference
   if (qualityPref === 'high_only') {
     const onlyHigh = voices.filter(isHighQuality);
@@ -10275,6 +10485,10 @@ function pickQueryUseCases(plan, userText) {
     set.delete('informative_educational');
     set.delete('characters_animation');
     set.add('narrative_story');
+  } else if (briefFamily === 'conversational') {
+    // Explicit support/agent/conversational briefs must not inherit storyteller
+    // categories from a noisy planner or a previous refinement.
+    return ['conversational'];
   }
 
   // Deterministic priority: prefer conversational for support/call-center intents,
@@ -11349,6 +11563,9 @@ function detectNamedVoiceIntent(text) {
     if (isDiscoveryBrief) return false;
 
     if (/\b(voice\s+talent|professional\s+voice\s+talent|pvc)\b/.test(lower)) return true;
+    if (/\b(?:alternatives?|similar\s+voices?|voices?\s+similar)\s+(?:to|for)\s+[A-ZÀ-ÖØ-öø-ÿ]/.test(raw)) {
+      return true;
+    }
     if (/\blibrary\s+names?\b/.test(lower) || /\bother\s+(?:library\s+)?names?\b/.test(lower)) return true;
     if (/\balias(?:es)?\b/.test(lower) && /\bvoices?\b/.test(lower)) return true;
     if (
@@ -11361,6 +11578,9 @@ function detectNamedVoiceIntent(text) {
     if (/[—–-]\s*(?:italian|spanish|english|french|german|portuguese)?\s*(?:professional\s+)?voice\s+talent\b/i.test(raw)) {
       return true;
     }
+    if (/^[A-ZÀ-ÖØ-öø-ÿ][\w' .]{1,50}\s*[—–-]\s*(?:italian|spanish|english|french|german|portuguese)\b/i.test(raw.trim())) {
+      return true;
+    }
     if (extractLibraryVoiceNames(raw).length > 0 && /\b(check|library|alias|talent|named)\b/.test(lower)) {
       return true;
     }
@@ -11368,6 +11588,11 @@ function detectNamedVoiceIntent(text) {
   } catch (_) {
     return false;
   }
+}
+
+function detectNamedVoiceAlternativesIntent(text) {
+  const raw = (text || '').toString();
+  return /\b(?:alternatives?|similar\s+voices?|voices?\s+similar)\s+(?:to|for)\s+[A-ZÀ-ÖØ-öø-ÿ]/.test(raw);
 }
 
 function extractLibraryVoiceNames(text) {
@@ -11383,6 +11608,18 @@ function extractLibraryVoiceNames(text) {
       const n = String(m[1] || '').trim();
       if (n && !/^(male|female|voice|voices)$/i.test(n)) names.push(n);
     }
+
+    // "alternatives to Carla Bluhm available in EU" / "voices similar to NAME"
+    const alternative = raw.match(
+      /\b(?:alternatives?|similar\s+voices?|voices?\s+similar)\s+(?:to|for)\s+([A-ZÀ-ÖØ-öø-ÿ][\w'À-ÖØ-öø-ÿ-]*(?:\s+[A-ZÀ-ÖØ-öø-ÿ][\w'À-ÖØ-öø-ÿ-]*){0,3})(?=\s+(?:available|in|for|with|that|which|who)\b|[,.;!?]|$)/
+    );
+    if (alternative?.[1]) names.push(alternative[1].trim());
+
+    // A library title followed by a language descriptor, e.g. "Mr Magoo - Italian ...".
+    const titledLanguage = raw.trim().match(
+      /^([A-ZÀ-ÖØ-öø-ÿ][\w' .]{1,50}?)\s*[—–-]\s*(?:italian|spanish|english|french|german|portuguese)\b/i
+    );
+    if (titledLanguage?.[1]) names.push(titledLanguage[1].trim());
 
     // "Title - … Voice Talent" / "for voice Title - …"
     const dashTalent = raw.match(
@@ -11511,6 +11748,48 @@ function buildNamedVoiceLookupMessage(voices, names, userText) {
   return lines.filter((x) => x != null).join('\n') || labels.noVoices || 'No voices found.';
 }
 
+function detectListedVoiceEvaluationIntent(text) {
+  const ids = extractAllVoiceIds(text);
+  if (ids.length >= 2) return true;
+  if (ids.length !== 1) return false;
+  const lower = (text || '').toString().toLowerCase();
+  return /\b(check|evaluate|review|verify|suitable|quality|studio|stable|stability|category|marked)\b/.test(
+    lower
+  );
+}
+
+function buildListedVoiceEvaluationMessage(voices, userText) {
+  if (!Array.isArray(voices) || !voices.length) return '';
+  const lower = (userText || '').toString().toLowerCase();
+  const asksSuitability = /\b(suitable|fit|use case|nada(?:je|ją|ja)|zastosowani)\b/i.test(lower);
+  const asksStability = /\b(stable|stability|stabiln)\b/i.test(lower);
+  const lines = ['*Voice evaluation from catalog metadata*'];
+  for (const voice of voices) {
+    if (voice?.__notFound) {
+      lines.push('', `\`${voice.voice_id}\` — not found in the Voice Library or your workspace.`);
+      continue;
+    }
+    lines.push('', formatVoiceLine(voice, 'en'));
+    lines.push(`• Language: ${voice.language || 'not specified'}`);
+    lines.push(`• Category: ${voice.category || voice.sharing?.category || 'not specified'}`);
+    lines.push(`• Marked studio/high quality: ${isHighQuality(voice) ? 'Yes' : 'No'}`);
+    if (asksSuitability) {
+      const description = (voice.description || '').toString().trim();
+      lines.push(
+        `• Suitability: catalog metadata alone cannot confirm the use-case fit${
+          description ? `; description: ${description.slice(0, 220)}` : ' — review the preview'
+        }.`
+      );
+    }
+    if (asksStability) {
+      lines.push(
+        '• Stability: the catalog does not expose a stability benchmark; verify with a representative synthesis test.'
+      );
+    }
+  }
+  return lines.join('\n');
+}
+
 async function lookupVoiceById(voiceId, traceCb) {
   const trace = typeof traceCb === 'function' ? traceCb : () => {};
   if (!voiceId) return null;
@@ -11518,6 +11797,30 @@ async function lookupVoiceById(voiceId, traceCb) {
   if (shared?.voice_id) return shared;
   const priv = await fetchPrivateVoiceById(voiceId, trace);
   return priv?.voice_id ? priv : null;
+}
+
+async function respondListedVoiceEvaluation(event, cleaned, threadTs, client, uiLang, session = null) {
+  if (!detectListedVoiceEvaluationIntent(cleaned)) return false;
+  const ids = extractAllVoiceIds(cleaned);
+  const voices = [];
+  for (const id of ids) {
+    const voice = await lookupVoiceById(id, () => {});
+    voices.push(voice?.voice_id ? voice : { voice_id: id, __notFound: true });
+  }
+  if (session && typeof session === 'object') {
+    const found = voices.filter((voice) => voice?.voice_id && !voice.__notFound);
+    if (found.length) {
+      session.voices = found;
+      session.ranking = Object.fromEntries(
+        found.map((voice, index) => [voice.voice_id, found.length - index])
+      );
+      session.lastActive = Date.now();
+    }
+  }
+  let message = buildListedVoiceEvaluationMessage(voices, cleaned);
+  message = await translateForUserLanguage(message, uiLang);
+  await safePostMessage(client, { channel: event.channel, thread_ts: threadTs, text: message });
+  return true;
 }
 
 function buildVoiceLookupMessage(voice, userText) {
@@ -11605,6 +11908,7 @@ function detectVoiceNoticePeriodIntent(text) {
   if (!noticeMention) return false;
 
   const voiceIds = extractAllVoiceIds(raw);
+  const voiceNames = extractNoticePeriodVoiceNames(raw);
   const refersToListedVoices =
     /\b(these|those|following|poniższe|ponizsze|tych|te)\s+(voices?|głos(y|ów)?|glos(y|ow)?)\b/i.test(lower) ||
     /\b(for|dla)\s+(these|those|them|nich|tych)\b/i.test(lower);
@@ -11624,8 +11928,32 @@ function detectVoiceNoticePeriodIntent(text) {
   if (isSearchBrief) return false;
 
   if (voiceIds.length > 0) return true;
+  if (voiceNames.length > 0 && isLookup) return true;
   if (refersToListedVoices && isLookup) return true;
   return false;
+}
+
+function extractNoticePeriodVoiceNames(text) {
+  const raw = (text || '').toString();
+  const match = raw.match(
+    /(?:notice\s*period|okres(?:u)?\s+wypowiedzenia)\s+(?:for|of|dla)\s+(.+)$/is
+  );
+  if (!match?.[1]) return [];
+  const tail = match[1]
+    .replace(/^(?:these|those|following|the|tych|te|poniższych|ponizszych)\s+(?:voices?|głosów|glosow)\s*:?\s*/i, '')
+    .trim();
+  if (!tail || /^(?:these|those|them|voices?|nich|tych)$/i.test(tail)) return [];
+  return dedupePreserveOrder(
+    tail
+      .split(/[\n,;]+/)
+      .map((part) =>
+        part
+          .replace(/^[\d.)*\-\s]+/, '')
+          .replace(/\b[A-Za-z0-9]{10,32}\b/g, '')
+          .trim()
+      )
+      .filter((name) => /^[\p{L}][\p{L}\p{N}' .-]{1,59}$/u.test(name))
+  ).slice(0, 12);
 }
 
 function resolveVoicesForNoticePeriodQuestion(text, session) {
@@ -11637,6 +11965,11 @@ function resolveVoicesForNoticePeriodQuestion(text, session) {
       if (inSession) return inSession;
       return { voice_id: id, __needsLookup: true };
     });
+  }
+
+  const names = extractNoticePeriodVoiceNames(raw);
+  if (names.length) {
+    return names.map((name) => ({ name, __needsNameLookup: true }));
   }
 
   const lower = raw.toLowerCase();
@@ -11754,6 +12087,13 @@ async function respondVoiceNoticePeriodLookup(event, cleaned, threadTs, client, 
         voices.push(fresh);
       } else {
         voices.push({ voice_id: item.voice_id, __notFound: true });
+      }
+    } else if (item?.__needsNameLookup) {
+      const matches = await lookupVoicesByName([item.name]);
+      if (matches[0]?.voice_id) {
+        voices.push(matches[0]);
+      } else {
+        voices.push({ voice_id: item.name, __notFound: true });
       }
     } else if (!Object.prototype.hasOwnProperty.call(item, 'notice_period')) {
       const fresh = await lookupVoiceById(item.voice_id, () => {});
@@ -12567,6 +12907,19 @@ function runDevAsserts() {
     );
   }
   devAssert(detectModelPreferenceFromText('flash 2.5 voices') === 'eleven_flash_v2_5', 'model pref: flash 2.5');
+  devAssert(
+    detectModelPreferenceFromText('turbo v3 voices') === 'eleven_turbo_v2_5',
+    'model pref: turbo v3 does not become eleven v3'
+  );
+  devAssert(
+    detectModelPreferenceFromText('multilingual v2 voices') === 'eleven_multilingual_v2',
+    'model pref: multilingual v2'
+  );
+  devAssert(detectModelPreferenceFromText('V4 friendly voices') === null, 'model pref: unsupported v4 stays any');
+  devAssert(
+    normalizeKeywordPlan({ model_preference: 'eleven_v3' }, 'V4 friendly voices').model_preference === 'any',
+    'model pref: planner cannot map v4 to v3'
+  );
   {
     const both = detectModelPreferenceFromText('flash 2.5 and eleven v3 voices');
     devAssert(
@@ -12597,12 +12950,59 @@ function runDevAsserts() {
     'named voice: extracts Mr Magoo'
   );
   devAssert(
+    detectNamedVoiceIntent('alternatives to Carla Bluhm available in EU') === true,
+    'named voice: alternatives route to lookup'
+  );
+  devAssert(
+    detectNamedVoiceAlternativesIntent('alternatives to Carla Bluhm available in EU') === true,
+    'named voice: alternatives intent'
+  );
+  devAssert(
+    extractLibraryVoiceNames('alternatives to Carla Bluhm available in EU').includes('Carla Bluhm'),
+    'named voice: alternatives extract reference name'
+  );
+  devAssert(
     detectNamedVoiceIntent('check whether the following male voices are suitable for our IVR') === true,
     'named voice: evaluate following voices intent'
   );
   devAssert(
     !detectNamedVoiceIntent('find italian male voices for narration'),
     'named voice: generic italian browse is not named intent'
+  );
+  devAssert(
+    detectMultipleLanguageIntents('Italian voices, germane and soothing voices').length < 2,
+    'multi-language: fuzzy adjective does not invent German'
+  );
+  devAssert(
+    pickQueryUseCases(
+      { use_case_keywords: ['conversational', 'narration', 'storytelling'] },
+      'only american conversational v3 voice'
+    ).join(',') === 'conversational',
+    'use cases: conversational family is exclusive'
+  );
+  {
+    const latamPlan = normalizeKeywordPlan(
+      { target_voice_language: 'es', target_accent: 'american', target_locale: 'en-US' },
+      'Spanish Latin American female voices for an agent'
+    );
+    devAssert(
+      latamPlan.target_voice_language === 'es' &&
+        latamPlan.target_accent === 'latin american' &&
+        latamPlan.target_locale == null,
+      'plan normalization: Latin American Spanish overrides bare american'
+    );
+    const auPlan = normalizeKeywordPlan(
+      { target_voice_language: null, target_accent: 'australian' },
+      'Australian news voices'
+    );
+    devAssert(
+      auPlan.target_voice_language === 'en' && auPlan.target_accent === 'australian',
+      'plan normalization: accent-only Australian implies English'
+    );
+  }
+  devAssert(
+    detectQualityPreferenceFromText('elderly Italian voice, high qualirt') === 'high_only',
+    'quality pref: production typo qualirt'
   );
 
   // P0-2: specific variant mode must preserve locale/accent through combined/global broaden param builders
@@ -12717,6 +13117,60 @@ function runDevAsserts() {
 
   // Accent normalization
   devAssert(normalizeRequestedAccent('General American') === 'american', 'normalize accent: General American -> american');
+
+  // LatAm Spanish must never be offered the bare "american" accent, on ANY suggestAccents
+  // return path (early popularity return, phrase match, direct match, fuzzy, popularity fallback).
+  // Uses a synthetic catalog where bare "american" is the most popular accent, so an
+  // unfiltered path would surface it first.
+  {
+    const kbLatam = new FacetKB();
+    const esAccents = ['american', 'latin american', 'mexican', 'castilian', 'colombian'];
+    kbLatam.allowedAccentsByIso2.set('es', new Set(esAccents));
+    kbLatam.accentCountByIso2Accent.set(
+      'es',
+      new Map([
+        ['american', 9999],
+        ['latin american', 300],
+        ['mexican', 200],
+        ['castilian', 100],
+        ['colombian', 50]
+      ])
+    );
+    kbLatam.accentSlugByIso2Accent.set(
+      'es',
+      new Map(esAccents.map((a) => [a, a.replace(/\s+/g, '-')]))
+    );
+    kbLatam.loadedAt = Date.now();
+
+    const latamTexts = [
+      'spanish latam',
+      'latin american spanish female voice',
+      'es-419 voice',
+      'latino narrator',
+      'south american spanish',
+      'caribbean spanish',
+      'latam',
+      '  latam  ...  '
+    ];
+    for (const t of latamTexts) {
+      const out = kbLatam.suggestAccents('es', t, { limit: 6 }) || [];
+      devAssert(
+        out.every((x) => normalizeCatalogToken(x.norm || x.accent) !== 'american'),
+        `FacetKB: LatAm Spanish must not suggest bare american ("${t}")`
+      );
+    }
+
+    // The early popularity return still works (and stays unfiltered for non-LatAm text).
+    const outEmpty = kbLatam.suggestAccents('es', '   ', { limit: 3 }) || [];
+    devAssert(
+      outEmpty.length > 0 && outEmpty.every((x) => x.matchKind === 'popularity'),
+      'FacetKB: empty text falls back to popularity'
+    );
+    devAssert(
+      outEmpty.some((x) => normalizeCatalogToken(x.norm || x.accent) === 'american'),
+      'FacetKB: non-LatAm text keeps american in popularity fallback'
+    );
+  }
 
   // Catalog-driven accent matching should work for accents not hardcoded in regexes (e.g., Italian "sicilian").
   // Seed FacetKB from local JSON fixtures (no network required).
@@ -13356,6 +13810,82 @@ function runDevAsserts() {
     );
   }
 
+  // Listed IDs are evaluated directly and never refined through the previous language.
+  {
+    const listedQ = `check whether these male voices are suitable and marked as studio quality:
+Moritz Wegner PhufIH7nYh2Up1uej6aY
+Jonas KHmfNHtEjHhLK9eER20w
+Helmut covxL85MSd0uUrktE45z`;
+    const ids = extractAllVoiceIds(listedQ);
+    devAssert(ids.length === 3, 'listed lookup: preserves every explicit voice id');
+    devAssert(
+      detectListedVoiceEvaluationIntent(listedQ),
+      'listed lookup: routes before thread refinement'
+    );
+    const previousPlan = { target_voice_language: 'cs' };
+    devAssert(
+      detectListedVoiceEvaluationIntent(listedQ) && previousPlan.target_voice_language === 'cs',
+      'listed lookup: routing is independent of inherited Czech language'
+    );
+    const message = buildListedVoiceEvaluationMessage(
+      [
+        {
+          voice_id: ids[0],
+          name: 'Moritz Wegner',
+          language: 'de',
+          category: 'high_quality',
+          notice_period: MAX_NOTICE_PERIOD_DAYS
+        },
+        {
+          voice_id: ids[1],
+          name: 'Jonas',
+          language: 'de',
+          category: 'generated',
+          notice_period: null
+        }
+      ],
+      listedQ
+    );
+    devAssert(
+      message.includes('Marked studio/high quality: Yes') &&
+        message.includes('Marked studio/high quality: No'),
+      'listed lookup: reports catalog quality for each voice'
+    );
+    devAssert(
+      message.includes('infinity') && message.includes('Suitability:'),
+      'listed lookup: reports notice infinity and bounded suitability'
+    );
+  }
+
+  // Explicit voice-name exclusions apply to plans, sessions, and rendered candidates.
+  {
+    const excluded = extractExcludedVoiceNames('show warm voices but avoid Aria');
+    devAssert(excluded.length === 1 && normalizeCatalogToken(excluded[0]) === 'aria', 'exclude name: parse avoid Aria');
+    const candidates = [
+      { voice_id: 'aria1', name: 'Aria - Warm Narrator' },
+      { voice_id: 'other1', name: 'Freya' }
+    ];
+    const filtered = filterVoicesByExcludedNames(candidates, { __excludedVoiceNames: excluded });
+    devAssert(
+      filtered.length === 1 && filtered[0].voice_id === 'other1',
+      'exclude name: Aria removed deterministically'
+    );
+    const exclusionPlan = normalizeKeywordPlan(
+      { target_voice_language: 'en' },
+      'English conversational voices, avoid Aria'
+    );
+    devAssert(
+      exclusionPlan.__excludedVoiceNames.some((name) => normalizeCatalogToken(name) === 'aria'),
+      'exclude name: persisted on keyword plan'
+    );
+    const session = { filters: {} };
+    devAssert(
+      applyFilterChangesFromText(session, 'avoid aria') &&
+        session.filters.excludedVoiceNames.includes('aria'),
+      'exclude name: follow-up updates session filter'
+    );
+  }
+
   // Creator browse: intent + voice-id extraction for owner lookup
   {
     const creatorQ = "find other voices from the user who has 'covxL85MSd0uUrktE45z'";
@@ -13493,6 +14023,16 @@ CaJslL1xziwefCeTNzHv	Cristina Campos - Friendly and Soft
     };
     const fromSession = resolveVoicesForNoticePeriodQuestion('check notice period for these voices', session);
     devAssert(fromSession.length === 2, 'notice lookup: resolve from session shortlist');
+    const namesQ = 'check the notice period for Moritz Wegner, Jonas, Helmut';
+    devAssert(
+      detectVoiceNoticePeriodIntent(namesQ),
+      'notice lookup: named list routes to direct inspection'
+    );
+    const namedResolved = resolveVoicesForNoticePeriodQuestion(namesQ, null);
+    devAssert(
+      namedResolved.length === 3 && namedResolved.every((voice) => voice.__needsNameLookup),
+      'notice lookup: preserves named list for direct lookup'
+    );
     devAssert(
       buildVoiceNoticePeriodMessage(session.voices, 'en').includes('30 days notice period'),
       'notice lookup: message includes notice period label'
@@ -13637,6 +14177,13 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
     let uiLang =
       (guessUiLanguageFromText(cleaned) || 'en').toString().slice(0, 2).toLowerCase();
 
+    if (await respondVoiceNoticePeriodLookup(event, cleaned, threadTs, client, null, uiLang)) {
+      return;
+    }
+    if (await respondListedVoiceEvaluation(event, cleaned, threadTs, client, uiLang)) {
+      return;
+    }
+
     // Voice ID lookup — before keyword plan / search
     const bareVoiceId = extractBareVoiceId(cleaned);
     if (bareVoiceId && detectVoiceLookupIntent(cleaned) && !detectCreatorVoicesIntent(cleaned)) {
@@ -13670,10 +14217,6 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
     }
 
     const compatUiLang = (guessUiLanguageFromText(cleaned) || 'en').toString().slice(0, 2).toLowerCase();
-    if (await respondVoiceNoticePeriodLookup(event, cleaned, threadTs, client, null, uiLang)) {
-      return;
-    }
-
     if (await respondVoiceLanguageCompatibility(event, cleaned, threadTs, client, null, compatUiLang)) {
       return;
     }
@@ -13711,11 +14254,36 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           voices = await lookupVoicesByName([m[1].replace(/\s*[—–-].*$/, '').trim()], { traceCb });
         }
       }
-      let message = buildNamedVoiceLookupMessage(
-        voices,
-        names.length ? names : ids,
-        cleaned
-      );
+      let message;
+      if (voices.length && detectNamedVoiceAlternativesIntent(cleaned)) {
+        const source = voices[0];
+        const similar = await findSimilarVoicesByVoiceId(source.voice_id, traceCb);
+        let alternatives = Array.isArray(similar?.voices) ? similar.voices : [];
+        alternatives = alternatives.filter((v) => v?.voice_id && v.voice_id !== source.voice_id);
+        const langHint = parseUserLanguageHints(cleaned)?.iso2 || null;
+        if (langHint) {
+          alternatives = alternatives.filter((v) => {
+            const primary = getExplicitVoicePrimaryIso2(v);
+            return !primary || primary === langHint;
+          });
+        }
+        if (alternatives.length) {
+          const label = names[0] || source.name || source.voice_id;
+          message = [`Alternatives to ${label}:`, '']
+            .concat(alternatives.slice(0, 8).map((v) => formatVoiceLine(v, 'en')))
+            .join('\n');
+        } else {
+          message =
+            buildNamedVoiceLookupMessage(voices, names.length ? names : ids, cleaned) +
+            '\n\nI found the reference voice, but no similar-voice candidates were available.';
+        }
+      } else {
+        message = buildNamedVoiceLookupMessage(
+          voices,
+          names.length ? names : ids,
+          cleaned
+        );
+      }
       message = await translateForUserLanguage(message, uiLang);
       await safePostMessage(
         client,
@@ -14692,6 +15260,7 @@ if (!DEV_ASSERTS_ENABLED && !isDevPocEnabled()) {
         plan.__forceDescriptives = existing.filters.strictDescriptives === true;
         applySessionNoticeFiltersToPlan(plan, existing.filters);
         applySessionCustomRatesFiltersToPlan(plan, existing.filters);
+        applySessionVoiceNameExclusionsToPlan(plan, existing.filters);
 
         const searchTrace = [];
         const traceCb = (entry) => { try { searchTrace.push(entry); } catch (_) {} };
@@ -14731,6 +15300,19 @@ if (!DEV_ASSERTS_ENABLED && !isDevPocEnabled()) {
     }
 
     if (await respondVoiceNoticePeriodLookup(event, cleaned, threadTs, client, existing, existing.uiLanguage)) {
+      return;
+    }
+
+    if (
+      await respondListedVoiceEvaluation(
+        event,
+        cleaned,
+        threadTs,
+        client,
+        existing.uiLanguage,
+        existing
+      )
+    ) {
       return;
     }
 
@@ -14783,6 +15365,7 @@ if (!DEV_ASSERTS_ENABLED && !isDevPocEnabled()) {
         plan.__forceDescriptives = existing.filters.strictDescriptives === true;
         applySessionNoticeFiltersToPlan(plan, existing.filters);
         applySessionCustomRatesFiltersToPlan(plan, existing.filters);
+        applySessionVoiceNameExclusionsToPlan(plan, existing.filters);
 
         const voices = await fetchVoicesByKeywords(plan, existing.originalQuery, traceCb);
         if (!voices.length) {
@@ -14828,6 +15411,7 @@ if (!DEV_ASSERTS_ENABLED && !isDevPocEnabled()) {
       refinedPlan.__forceUseCases = existing.filters.strictUseCase === true;
       applySessionNoticeFiltersToPlan(refinedPlan, existing.filters);
       applySessionCustomRatesFiltersToPlan(refinedPlan, existing.filters);
+      applySessionVoiceNameExclusionsToPlan(refinedPlan, existing.filters);
       const combinedQuery = [existing.originalQuery || '', cleaned].join(' ').trim();
       const searchTrace = [];
       const traceCb = (entry) => {
@@ -14979,6 +15563,7 @@ app.action('toggle_featured', async ({ ack, body, client }) => {
     plan.__listAll = session.filters.listAll === true;
     applySessionNoticeFiltersToPlan(plan, session.filters);
     applySessionCustomRatesFiltersToPlan(plan, session.filters);
+    applySessionVoiceNameExclusionsToPlan(plan, session.filters);
 
     const searchTrace = [];
     const traceCb = (e) => { try { searchTrace.push(e); } catch (_) {} };
@@ -15027,6 +15612,7 @@ app.action('show_more', async ({ ack, body, client }) => {
     plan.__listAll = true;
     applySessionNoticeFiltersToPlan(plan, session.filters);
     applySessionCustomRatesFiltersToPlan(plan, session.filters);
+    applySessionVoiceNameExclusionsToPlan(plan, session.filters);
 
     const searchTrace = [];
     const traceCb = (e) => { try { searchTrace.push(e); } catch (_) {} };
