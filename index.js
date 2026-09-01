@@ -3187,9 +3187,17 @@ function getExplicitVoicePrimaryIso2(voice) {
 // -------------------------------------------------------------
 
 function extractIso2FromLanguageField(val) {
-  const s = (val || '').toString().trim();
+  if (val && typeof val === 'object') {
+    return extractIso2FromLanguageField(
+      val.language_id || val.language || val.code || val.iso_639_1
+    );
+  }
+  const s = (val || '').toString().trim().toLowerCase();
   if (!s) return null;
-  return s.toLowerCase().slice(0, 2);
+  const locale = extractLocaleFromField(s);
+  if (locale) return locale.slice(0, 2);
+  if (/^[a-z]{2}$/.test(s)) return s;
+  return languageIndex.byName.get(s) || STATIC_LANGUAGE_ALIASES.get(s) || null;
 }
 
 function extractLocaleFromField(val) {
@@ -4080,15 +4088,25 @@ function isStrongLanguageRequest(userText, keywordPlan) {
   return true;
 }
 
+function verifiedLanguageEntryMatchesIso2(entry, iso2) {
+  const target = (iso2 || '').toString().toLowerCase().slice(0, 2);
+  if (!entry || !target) return false;
+  return (
+    extractIso2FromLanguageField(entry.language) === target ||
+    extractIso2FromLanguageField(extractLocaleFromField(entry.locale)) === target
+  );
+}
+
 function voiceHasVerifiedIso2(voice, iso2) {
   const target = (iso2 || '').toString().toLowerCase().slice(0, 2);
   if (!voice || !target) return false;
   const vIso2 = extractIso2FromLanguageField(voice.language);
   if (vIso2 === target) return true;
+  const localeIso2 = extractIso2FromLanguageField(extractLocaleFromField(voice.locale));
+  if (localeIso2 === target) return true;
   const verified = Array.isArray(voice.verified_languages) ? voice.verified_languages : [];
   for (const entry of verified) {
-    const el = extractIso2FromLanguageField(entry?.language);
-    if (el === target) return true;
+    if (verifiedLanguageEntryMatchesIso2(entry, target)) return true;
   }
   return false;
 }
@@ -4180,12 +4198,20 @@ function getVerifiedLanguageRequirements(plan, userText, primaryLanguage) {
 function voiceHasKnownLanguageMetadata(voice) {
   if (!voice || typeof voice !== 'object') return false;
   if (extractIso2FromLanguageField(voice.language)) return true;
+  if (extractLocaleFromField(voice.locale)) return true;
   return (Array.isArray(voice.verified_languages) ? voice.verified_languages : []).some(
-    (entry) => extractIso2FromLanguageField(entry?.language)
+    (entry) =>
+      extractIso2FromLanguageField(entry?.language) ||
+      extractLocaleFromField(entry?.locale)
   );
 }
 
-function filterVoicesByLanguageRequirements(voices, primaryLanguage, requiredLanguages) {
+function filterVoicesByLanguageRequirements(
+  voices,
+  primaryLanguage,
+  requiredLanguages,
+  options = {}
+) {
   const src = Array.isArray(voices) ? voices : [];
   const primary = (primaryLanguage || '').toString().toLowerCase().slice(0, 2);
   const requirements = Array.from(
@@ -4201,16 +4227,42 @@ function filterVoicesByLanguageRequirements(voices, primaryLanguage, requiredLan
     if (isIntersection) {
       return requirements.every((iso2) => voiceHasVerifiedIso2(voice, iso2));
     }
-    if (!primary || !voiceHasKnownLanguageMetadata(voice)) return true;
+    if (!primary) return true;
+    if (!voiceHasKnownLanguageMetadata(voice)) return options.failClosedUnknown !== true;
     return voiceHasVerifiedIso2(voice, primary);
   });
+}
+
+function shouldHydrateLanguageConstraints(primaryLanguage, requiredLanguages) {
+  return Boolean(
+    (primaryLanguage || '').toString().trim() ||
+      (Array.isArray(requiredLanguages) && requiredLanguages.length)
+  );
+}
+
+function shouldFailClosedUnknown(hydratedLanguageMetadata) {
+  return hydratedLanguageMetadata === true;
+}
+
+function formatVerifiedLanguageConstraint(primaryLanguage, requiredLanguages) {
+  const primary = (primaryLanguage || '').toString().toLowerCase().slice(0, 2);
+  const requirements = Array.from(
+    new Set(
+      [primary, ...(Array.isArray(requiredLanguages) ? requiredLanguages : [])]
+        .map((iso2) => (iso2 || '').toString().toLowerCase().slice(0, 2))
+        .filter(Boolean)
+    )
+  );
+  if (!requirements.length) return '';
+  const [first, ...rest] = requirements;
+  return `${first.toUpperCase()}${rest.map((iso2) => ` + VERIFIED ${iso2.toUpperCase()}`).join('')}`;
 }
 
 function voiceVerifiedEntriesForIso2(voice, iso2) {
   const target = (iso2 || '').toString().toLowerCase().slice(0, 2);
   if (!voice || !target) return [];
   const verified = Array.isArray(voice.verified_languages) ? voice.verified_languages : [];
-  return verified.filter((entry) => extractIso2FromLanguageField(entry?.language) === target);
+  return verified.filter((entry) => verifiedLanguageEntryMatchesIso2(entry, target));
 }
 
 function voiceVerifiedLocales(voice, iso2) {
@@ -4284,8 +4336,22 @@ function voiceMatchesGccIntent(voice, userText) {
   return false;
 }
 
-function buildSoftStrictBuckets(voices, ranking, iso2, requestedLocale, requestedAccent) {
+function buildSoftStrictBuckets(
+  voices,
+  ranking,
+  iso2,
+  requestedLocale,
+  requestedAccent,
+  requiredLanguages = []
+) {
   const target = (iso2 || '').toString().toLowerCase().slice(0, 2);
+  const requirements = Array.from(
+    new Set(
+      [target, ...(Array.isArray(requiredLanguages) ? requiredLanguages : [])]
+        .map((language) => (language || '').toString().toLowerCase().slice(0, 2))
+        .filter(Boolean)
+    )
+  );
   const reqLocale = normalizeRequestedLocale(requestedLocale);
   const reqAccent = normalizeRequestedAccent(requestedAccent);
 
@@ -4297,7 +4363,7 @@ function buildSoftStrictBuckets(voices, ranking, iso2, requestedLocale, requeste
   const verifiedOnly = [];
 
   for (const v of sorted) {
-    if (!voiceHasVerifiedIso2(v, target)) continue;
+    if (!requirements.every((language) => voiceHasVerifiedIso2(v, language))) continue;
 
     // Primary-language heuristic:
     // - used to qualify "Exact" matches
@@ -4438,9 +4504,23 @@ function buildVerifiedFallbackMessage(voices, ranking, iso2, requestedLocale, li
   return lines.join('\n');
 }
 
-function buildVerifiedFallbackMessageSoft(voices, ranking, iso2, requestedLocale, requestedAccent, limit = 20) {
+function buildVerifiedFallbackMessageSoft(
+  voices,
+  ranking,
+  iso2,
+  requestedLocale,
+  requestedAccent,
+  limit = 20,
+  requiredLanguages = []
+) {
   const labels = getLabels();
-  const sorted = [...(voices || [])].sort(
+  const eligible = filterVoicesByLanguageRequirements(
+    voices,
+    iso2,
+    [iso2, ...(Array.isArray(requiredLanguages) ? requiredLanguages : [])],
+    { failClosedUnknown: true }
+  );
+  const sorted = [...eligible].sort(
     (a, b) => (ranking?.[b.voice_id] || 0) - (ranking?.[a.voice_id] || 0)
   );
   const max = Math.min(sorted.length, limit);
@@ -4449,7 +4529,8 @@ function buildVerifiedFallbackMessageSoft(voices, ranking, iso2, requestedLocale
   const acc = normalizeRequestedAccent(requestedAccent);
   const locSuffix = loc ? ` (${loc})` : '';
   const accSuffix = acc ? ` [accent=${acc}]` : '';
-  const header = `\`\`\`ALSO VERIFIED FOR ${String(iso2 || '').toUpperCase()}${locSuffix}${accSuffix} (missing/unknown or non-exact locale/accent)\`\`\``;
+  const constraintLabel = formatVerifiedLanguageConstraint(iso2, requiredLanguages);
+  const header = `\`\`\`ALSO VERIFIED FOR ${constraintLabel}${locSuffix}${accSuffix} (missing/unknown or non-exact locale/accent)\`\`\``;
 
   const lines = [header];
   if (max === 0) return '';
@@ -5025,9 +5106,23 @@ async function applyFetchConstraintFilters(voices, plan, userText, language, tra
   const source = Array.isArray(voices) ? voices : [];
   let out = [...source];
   const requirements = getVerifiedLanguageRequirements(plan, userText, language);
+  const modelPref = plan?.model_preference || 'any';
+  const hydrateLanguageConstraints = shouldHydrateLanguageConstraints(language, requirements);
+  let hydratedLanguageMetadata = false;
+  if ((hydrateLanguageConstraints || isSpecificModelPreference(modelPref)) && out.length) {
+    out = await hydrateVoiceModelMetadataShortlist(out, modelPref, trace, {
+      limit: out.length,
+      concurrency: 3,
+      force: hydrateLanguageConstraints,
+      requireLanguageMetadata: hydrateLanguageConstraints
+    });
+    hydratedLanguageMetadata = hydrateLanguageConstraints;
+  }
   if (language || requirements.length) {
     const before = out.length;
-    out = filterVoicesByLanguageRequirements(out, language, requirements);
+    out = filterVoicesByLanguageRequirements(out, language, requirements, {
+      failClosedUnknown: shouldFailClosedUnknown(hydratedLanguageMetadata)
+    });
     try {
       trace({
         stage: 'verified_language_filter',
@@ -5048,12 +5143,7 @@ async function applyFetchConstraintFilters(voices, plan, userText, language, tra
     out = out.filter((voice) => !isHighQuality(voice));
   }
 
-  const modelPref = plan?.model_preference || 'any';
   if (isSpecificModelPreference(modelPref) && out.length) {
-    out = await hydrateVoiceModelMetadataShortlist(out, modelPref, trace, {
-      limit: out.length,
-      concurrency: 3
-    });
     const before = out.length;
     out = filterVoicesByModelPreference(out, modelPref);
     try {
@@ -9446,6 +9536,23 @@ async function fetchTopVoicesByLanguage(languageCode, qualityPreference, plan, u
 // GPT: curator – rank voices for this specific brief
 // -------------------------------------------------------------
 
+function voiceHasModelMetadata(voice) {
+  return (
+    (Array.isArray(voice?.high_quality_base_model_ids) &&
+      voice.high_quality_base_model_ids.length > 0) ||
+    (Array.isArray(voice?.verified_languages) &&
+      voice.verified_languages.some((entry) => entry?.model_id))
+  );
+}
+
+function shouldHydrateRankingMetadata(wantsModelInfo, voices) {
+  return (Array.isArray(voices) ? voices : []).some(
+    (voice) =>
+      !Array.isArray(voice?.verified_languages) ||
+      (wantsModelInfo === true && !voiceHasModelMetadata(voice))
+  );
+}
+
 async function rankVoicesWithGPT(userText, keywordPlan, voices, traceCb) {
   const MAX_VOICES = 50;
   const truncate = (val, max) => {
@@ -9456,12 +9563,20 @@ async function rankVoicesWithGPT(userText, keywordPlan, voices, traceCb) {
   voices = await maybeAugmentVoicesWithCuratedV3(userText, keywordPlan, voices, traceCb);
   const wantsModelInfo =
     isSpecificModelPreference(keywordPlan?.model_preference) || detectBestV3CuratedIntent(userText);
-  voices = await hydrateVoiceModelMetadataShortlist(
-    voices,
-    keywordPlan?.model_preference,
-    traceCb,
-    { limit: 30, concurrency: 3, force: wantsModelInfo }
-  );
+  if (shouldHydrateRankingMetadata(wantsModelInfo, voices)) {
+    voices = await hydrateVoiceModelMetadataShortlist(
+      voices,
+      keywordPlan?.model_preference,
+      traceCb,
+      {
+        limit: 30,
+        concurrency: 3,
+        force: true,
+        forceModelMetadata: wantsModelInfo,
+        requireVerifiedLanguageMetadata: true
+      }
+    );
+  }
   const candidates = voices.slice(0, MAX_VOICES).map((v) => {
     const entry = {
       voice_id: v.voice_id,
@@ -12402,24 +12517,30 @@ async function hydrateVoiceModelMetadataShortlist(voices, modelPref, traceCb, op
   if (!src.length || !shouldHydrateVoiceModelMetadata(modelPref, options)) return src;
   const limit = Math.max(1, Math.min(500, Number(options.limit) || 30));
   const concurrency = Math.max(1, Math.min(4, Number(options.concurrency) || 3));
-  const candidates = src
-    .filter(
-      (voice) =>
-        voice &&
-        voice.voice_id &&
-        (!Array.isArray(voice.high_quality_base_model_ids) ||
-          voice.high_quality_base_model_ids.length === 0) &&
-        !(Array.isArray(voice.verified_languages) &&
-          voice.verified_languages.some((entry) => entry?.model_id))
-    )
-    .slice(0, limit);
+  const needsModelMetadata =
+    isSpecificModelPreference(modelPref) || options?.forceModelMetadata === true;
+  const needsLanguageMetadata = options?.requireLanguageMetadata === true;
+  const needsVerifiedLanguageMetadata =
+    options?.requireVerifiedLanguageMetadata === true;
+  const pending = src.filter(
+    (voice) =>
+      voice &&
+      voice.voice_id &&
+      ((needsModelMetadata && !voiceHasModelMetadata(voice)) ||
+        (needsLanguageMetadata && !voiceHasKnownLanguageMetadata(voice)) ||
+        (needsVerifiedLanguageMetadata && !Array.isArray(voice.verified_languages)))
+  );
+  const candidates = pending.slice(0, limit);
   let nextIndex = 0;
   let hydratedCount = 0;
+  let fetchedCount = 0;
+  let cacheHitCount = 0;
 
   const hydrateOne = async (voice) => {
     const voiceId = String(voice.voice_id);
     const cached = voiceModelMetadataCache.get(voiceId);
     if (cached && Date.now() - cached.at <= VOICE_MODEL_METADATA_TTL_MS) {
+      cacheHitCount += 1;
       if (Array.isArray(cached.modelIds)) {
         voice.high_quality_base_model_ids = [...cached.modelIds];
       }
@@ -12430,6 +12551,7 @@ async function hydrateVoiceModelMetadataShortlist(voices, modelPref, traceCb, op
     }
 
     const detailed = await fetchPrivateVoiceById(voiceId);
+    fetchedCount += 1;
     const modelIds = Array.isArray(detailed?.high_quality_base_model_ids)
       ? detailed.high_quality_base_model_ids.map(String).filter(Boolean)
       : null;
@@ -12460,7 +12582,13 @@ async function hydrateVoiceModelMetadataShortlist(voices, modelPref, traceCb, op
     traceCb?.({
       stage: 'model_metadata_hydration',
       params: {
-        requested: String(candidates.length),
+        selected: String(candidates.length),
+        fetched: String(fetchedCount),
+        cache_hits: String(cacheHitCount),
+        skipped_complete: String(Math.max(0, src.length - pending.length)),
+        deferred_by_limit: String(Math.max(0, pending.length - candidates.length)),
+        usable_model: String(src.filter(voiceHasModelMetadata).length),
+        usable_language: String(src.filter(voiceHasKnownLanguageMetadata).length),
         limit: String(limit),
         concurrency: String(concurrency)
       },
@@ -13028,6 +13156,96 @@ function runDevAsserts() {
       intersection.length === 1 && intersection[0].voice_id === 'both',
       'verified language: intersection is fail-closed'
     );
+    const localeOnlyVoice = {
+      voice_id: 'locale-only',
+      verified_languages: [{ locale: 'el-GR', accent: 'athenian' }]
+    };
+    devAssert(
+      voiceHasVerifiedIso2(localeOnlyVoice, 'el') === true,
+      'verified language: locale-only entry is recognized'
+    );
+    devAssert(
+      voiceVerifiedEntriesForIso2(localeOnlyVoice, 'el').length === 1,
+      'verified language: locale-only entry is returned'
+    );
+    devAssert(
+      voiceVerifiedLocales(localeOnlyVoice, 'el').includes('el-GR'),
+      'verified language: locale-only entry exposes locale'
+    );
+    devAssert(
+      voiceVerifiedAccents(localeOnlyVoice, 'el').includes('athenian'),
+      'verified language: locale-only entry exposes accent'
+    );
+    const singleLanguage = filterVoicesByLanguageRequirements(
+      [
+        { voice_id: 'greek', language: 'el' },
+        { voice_id: 'english', language: 'en', accent: 'american' }
+      ],
+      'el',
+      ['el'],
+      { failClosedUnknown: true }
+    );
+    devAssert(
+      singleLanguage.length === 1 && singleLanguage[0].voice_id === 'greek',
+      'verified language: single-language filter drops explicit non-match'
+    );
+    const unknownLanguageVoice = [{ voice_id: 'unknown-language' }];
+    devAssert(
+      filterVoicesByLanguageRequirements(unknownLanguageVoice, 'el', ['el'], {
+        failClosedUnknown: shouldFailClosedUnknown(false)
+      }).length === 1,
+      'verified language: skipped hydration keeps unknown metadata fail-open'
+    );
+    devAssert(
+      filterVoicesByLanguageRequirements(unknownLanguageVoice, 'el', ['el'], {
+        failClosedUnknown: shouldFailClosedUnknown(true)
+      }).length === 0,
+      'verified language: attempted hydration drops remaining unknown metadata'
+    );
+    devAssert(
+      filterVoicesByLanguageRequirements(
+        [{ voice_id: 'greek-only', language: 'el' }],
+        'el',
+        ['el', 'en'],
+        { failClosedUnknown: false }
+      ).length === 0,
+      'verified language: intersection still drops greek-only voices'
+    );
+    devAssert(
+      shouldHydrateLanguageConstraints('el', []) === true &&
+        shouldHydrateLanguageConstraints(null, ['el']) === true &&
+        shouldHydrateLanguageConstraints(null, []) === false,
+      'verified language: hydration decision follows language constraints'
+    );
+    const buckets = buildSoftStrictBuckets(
+      [
+        { voice_id: 'both', language: 'el', verified_languages: [{ language: 'en' }] },
+        { voice_id: 'greek-only', language: 'el' }
+      ],
+      {},
+      'el',
+      null,
+      null,
+      ['el', 'en']
+    );
+    devAssert(
+      [...buckets.exact, ...buckets.verifiedOnly].every((voice) => voice.voice_id === 'both'),
+      'verified language: fallback cannot re-admit failed intersection'
+    );
+    devAssert(
+      formatVerifiedLanguageConstraint('el', ['el', 'en']) === 'EL + VERIFIED EN',
+      'verified language: intersection label includes every requirement'
+    );
+    devAssert(
+      filterVoicesByModelPreference(
+        [
+          { voice_id: 'supported', high_quality_base_model_ids: ['eleven_multilingual_v2'] },
+          { voice_id: 'unknown' }
+        ],
+        'eleven_multilingual_v2'
+      ).map((voice) => voice.voice_id).join(',') === 'supported',
+      'model filter: explicit preference fails closed on missing metadata'
+    );
   }
 
   // Bilingual: accent must not be applied to shared-voices queries
@@ -13152,6 +13370,33 @@ function runDevAsserts() {
   devAssert(
     shouldHydrateVoiceModelMetadata('any', { force: false }) === false,
     'hydrate gate: explicit force false'
+  );
+  devAssert(
+    shouldHydrateRankingMetadata(false, [{ voice_id: 'complete', verified_languages: [] }]) ===
+      false,
+    'ranking hydration: complete prior hydration may skip'
+  );
+  devAssert(
+    shouldHydrateRankingMetadata(false, [
+      { voice_id: 'generic-incomplete', language: 'en' }
+    ]) === true,
+    'ranking hydration: generic ranking repairs incomplete metadata'
+  );
+  devAssert(
+    shouldHydrateRankingMetadata(true, [
+      { voice_id: 'model-incomplete', verified_languages: [] }
+    ]) === true,
+    'ranking hydration: model intent repairs incomplete metadata'
+  );
+  devAssert(
+    shouldHydrateRankingMetadata(true, [
+      {
+        voice_id: 'model-complete',
+        verified_languages: [],
+        high_quality_base_model_ids: ['eleven_v3']
+      }
+    ]) === false,
+    'ranking hydration: complete model metadata may skip'
   );
   {
     const pl = selectV3ArenaRows({ target_voice_language: 'pl' }, 'najlepszy głos v3');
@@ -15227,12 +15472,14 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
             : null;
 
         if (isStrong && iso2) {
+          const requiredLanguages = getVerifiedLanguageRequirements(keywordPlan, cleaned, iso2);
           const buckets = buildSoftStrictBuckets(
             voices || [],
             session.ranking || {},
             iso2,
             requestedLocale,
-            requestedAccent
+            requestedAccent,
+            requiredLanguages
           );
           const strictVoices = buckets.exact || [];
           const verifiedOnly = buckets.verifiedOnly || [];
@@ -15253,7 +15500,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           } catch (_) {}
 
           const locSuffix = requestedLocale ? ` (${normalizeRequestedLocale(requestedLocale) || requestedLocale})` : '';
-          const strictHeader = `\`\`\`STRICT MATCHES ${iso2.toUpperCase()}${locSuffix}\`\`\``;
+          const constraintLabel = formatVerifiedLanguageConstraint(iso2, requiredLanguages);
+          const strictHeader = `\`\`\`STRICT MATCHES ${constraintLabel}${locSuffix}\`\`\``;
           const strictSession = { ...session, voices: strictVoices };
           const labels = getLabels();
           let strictBody = buildMessageFromSession(strictSession);
@@ -15279,7 +15527,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
               iso2,
               requestedLocale,
               requestedAccent,
-              20
+              20,
+              requiredLanguages
             );
             vMsg = await translateForUserLanguage(vMsg, session.uiLanguage);
             const vBlocks = buildBlocksFromText(vMsg);
@@ -15476,19 +15725,22 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           : null;
 
       if (isStrong && iso2) {
+        const requiredLanguages = getVerifiedLanguageRequirements(keywordPlan, cleaned, iso2);
         const buckets = buildSoftStrictBuckets(
           voices || [],
           session.ranking || {},
           iso2,
           requestedLocale,
-          requestedAccent
+          requestedAccent,
+          requiredLanguages
         );
         const strictVoices = buckets.exact || [];
         const verifiedFallback = buckets.verifiedOnly || [];
 
         const locNorm = normalizeRequestedLocale(requestedLocale);
         const locSuffix = locNorm ? ` (${locNorm})` : requestedLocale ? ` (${requestedLocale})` : '';
-        const strictHeader = `\`\`\`STRICT MATCHES ${iso2.toUpperCase()}${locSuffix}\`\`\``;
+        const constraintLabel = formatVerifiedLanguageConstraint(iso2, requiredLanguages);
+        const strictHeader = `\`\`\`STRICT MATCHES ${constraintLabel}${locSuffix}\`\`\``;
         const strictSession = { ...session, voices: strictVoices };
         const labels = getLabels();
         let strictBody = buildMessageFromSession(strictSession);
@@ -15509,7 +15761,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           iso2,
           requestedLocale,
           requestedAccent,
-          20
+          20,
+          requiredLanguages
         );
         if (fallbackMsg && String(fallbackMsg).trim()) {
           fallbackMsg = await translateForUserLanguage(fallbackMsg, session.uiLanguage);
