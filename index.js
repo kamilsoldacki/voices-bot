@@ -87,9 +87,30 @@ function mapSharedVoicesSortValue(sort) {
   return SHARED_VOICES_SORT_MAP[key] || null;
 }
 
-function normalizeVoiceAccentsLanguage(language) {
+// Voice Library language codes are mostly ISO 639-1, plus a few longer ids
+// returned by GET /v1/models and accepted by shared-voices: fil, ceb, ast, yue.
+const LIBRARY_EXTENDED_LANGUAGE_CODES = new Set(['fil', 'ceb', 'ast', 'yue']);
+
+function normalizeLibraryLanguageCode(language) {
   const value = (language || '').toString().trim().toLowerCase();
-  return /^[a-z]{2}$/.test(value) ? value : null;
+  if (!value) return null;
+  // Tagalog's old catalog key is empty in the library; Filipino voices use fil.
+  if (value === 'tl') return 'fil';
+  if (/^[a-z]{2}$/.test(value)) return value;
+  if (LIBRARY_EXTENDED_LANGUAGE_CODES.has(value)) return value;
+  return null;
+}
+
+function normalizeVoiceAccentsLanguage(language) {
+  return normalizeLibraryLanguageCode(language);
+}
+
+function isCodeShapedAccentToken(value) {
+  const token = normalizeCatalogToken(value);
+  if (!token) return false;
+  // Official accent filters are words ("american"). Code-shaped strings
+  // ("en-american", "de-standard") come from crawled verified_languages.accent.
+  return /^[a-z]{2,3}-[a-z0-9]+(?:-[a-z0-9]+)*$/.test(token);
 }
 
 function parseOfficialVoiceAccentsResponse(data) {
@@ -306,7 +327,7 @@ function slugifyAccentName(s) {
 function normalizeAccentForApiParam(iso2, accent) {
   const raw = (accent || '').toString().toLowerCase().trim();
   if (!raw) return null;
-  const lang = (iso2 || '').toString().toLowerCase().slice(0, 2);
+  const lang = normalizeLibraryLanguageCode(iso2);
   const official = resolveOfficialAccentForApiParam(lang, raw);
   if (official) return official;
   const hasSpaces = /\s/.test(raw);
@@ -334,7 +355,7 @@ function normalizeAccentForApiParam(iso2, accent) {
 }
 
 function accentFormCacheKey(iso2, accentNorm) {
-  const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+  const k = normalizeLibraryLanguageCode(iso2);
   const a = normalizeCatalogToken(accentNorm);
   if (!k || !a) return null;
   return `sv:accentForm:${k}:${a}`;
@@ -360,7 +381,7 @@ function setCachedAccentForm(iso2, accentNorm, preferred, evidence) {
   try {
     const key = accentFormCacheKey(iso2, accentNorm);
     if (!key) return false;
-    const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    const k = normalizeLibraryLanguageCode(iso2);
     const a = normalizeCatalogToken(accentNorm);
     if (!k || !a) return false;
     if (preferred !== 'name' && preferred !== 'slug') return false;
@@ -417,7 +438,7 @@ class AccentCatalog {
 
   noteLanguageUsed(iso2) {
     try {
-      const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+      const k = normalizeLibraryLanguageCode(iso2);
       if (!k) return;
       this.recentLanguageUse.set(k, Date.now());
     } catch (_) {}
@@ -484,13 +505,13 @@ class AccentCatalog {
       const defaults = ['en', 'es', 'pt', 'zh', 'pl'];
       const recent = Array.from(this.recentLanguageUse.entries())
         .sort((a, b) => (b[1] || 0) - (a[1] || 0))
-        .map(([k]) => (k || '').toString().toLowerCase().slice(0, 2))
+        .map(([k]) => normalizeLibraryLanguageCode(k))
         .filter(Boolean)
         .slice(0, 6);
       const out = [];
       const seen = new Set();
       for (const k of [...recent, ...defaults]) {
-        const kk = (k || '').toString().toLowerCase().slice(0, 2);
+        const kk = normalizeLibraryLanguageCode(k);
         if (!kk || seen.has(kk)) continue;
         seen.add(kk);
         out.push(kk);
@@ -515,6 +536,7 @@ class AccentCatalog {
   _extractBucketsFromVoices(voices) {
     const out = { accent: new Set(), locale: new Set(), dialect: new Set(), region: new Set() };
     const add = (set, val) => {
+      if (set === out.accent && isCodeShapedAccentToken(val)) return;
       const t = normalizeCatalogToken(val);
       if (t) set.add(t);
     };
@@ -522,9 +544,6 @@ class AccentCatalog {
       const t = normalizeLocaleToken(val);
       if (!t) return;
       out.locale.add(t);
-      // allow zh-* equivalents for cmn-* locales
-      const m = t.match(/^cmn-([a-z0-9]{2,3})$/i);
-      if (m) out.locale.add(`zh-${String(m[1]).toLowerCase()}`);
     };
     const addAny = (bucket, v) => {
       if (typeof v === 'string') {
@@ -560,7 +579,7 @@ class AccentCatalog {
   }
 
   async _refreshOneLanguage(iso2) {
-    const code = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    const code = normalizeLibraryLanguageCode(iso2);
     if (!code) return false;
     const XI_KEY = process.env.ELEVENLABS_API_KEY;
     if (!XI_KEY) return false;
@@ -620,7 +639,7 @@ class AccentCatalog {
       if (result && typeof result === 'object') {
         let targetKey = null;
         for (const [k, entry] of Object.entries(result)) {
-          const lc = (entry && typeof entry === 'object' && entry.language_code) ? String(entry.language_code).toLowerCase().slice(0, 2) : null;
+          const lc = (entry && typeof entry === 'object' && entry.language_code) ? normalizeLibraryLanguageCode(entry.language_code) : null;
           if (lc === code) {
             targetKey = k;
             break;
@@ -652,7 +671,7 @@ class AccentCatalog {
   }
 
   _ensureBucket(iso2) {
-    const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    const k = normalizeLibraryLanguageCode(iso2);
     if (!k) return null;
     if (!this.byIso2.has(k)) {
       this.byIso2.set(k, { accents: new Set(), locales: new Set() });
@@ -668,7 +687,7 @@ class AccentCatalog {
 
     for (const [name, entry] of Object.entries(result)) {
       const code = (entry && typeof entry === 'object' && entry.language_code) ? String(entry.language_code) : null;
-      const iso2 = (code || '').toLowerCase().slice(0, 2);
+      const iso2 = normalizeLibraryLanguageCode(code);
       if (!iso2) continue;
 
       const bucket = this._ensureBucket(iso2);
@@ -678,6 +697,7 @@ class AccentCatalog {
       const locales = Array.isArray(entry?.locale) ? entry.locale : [];
 
       accents.forEach((a) => {
+        if (isCodeShapedAccentToken(a)) return;
         const t = normalizeCatalogToken(a);
         if (t) bucket.accents.add(t);
       });
@@ -686,20 +706,14 @@ class AccentCatalog {
         const t = normalizeLocaleToken(loc);
         if (!t) return;
         bucket.locales.add(t);
-        // Chinese locales sometimes show up as cmn-CN/cmn-TW; allow zh-* equivalents
-        if (iso2 === 'zh') {
-          const m = t.match(/^cmn-([a-z0-9]{2,3})$/i);
-          if (m) {
-            bucket.locales.add(`zh-${String(m[1]).toLowerCase()}`);
-          }
-        }
       });
 
       // Build zh slugs list from accents (best-effort, filtered later per query)
       if (iso2 === 'zh' && accents.length) {
         accents.forEach((a) => {
+          if (isCodeShapedAccentToken(a)) return;
           const s = slugifyAccentName(a);
-          if (s) this.zhAccentSlugs.push(s);
+          if (s && !isCodeShapedAccentToken(s)) this.zhAccentSlugs.push(s);
         });
       }
     }
@@ -717,7 +731,7 @@ class AccentCatalog {
 
   isAccentAllowed(iso2, accent) {
     try {
-      const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+      const k = normalizeLibraryLanguageCode(iso2);
       const a = normalizeCatalogToken(accent);
       if (!k || !a) return false;
       const bucket = this.byIso2.get(k);
@@ -730,7 +744,7 @@ class AccentCatalog {
 
   isLocaleAllowed(iso2, locale) {
     try {
-      const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+      const k = normalizeLibraryLanguageCode(iso2);
       const l = normalizeLocaleToken(locale);
       if (!k || !l) return false;
       const bucket = this.byIso2.get(k);
@@ -769,16 +783,11 @@ class AccentCatalog {
     const set = new Set(locales.map((x) => normalizeLocaleToken(x)));
     const want = (dialect || '').toString().toLowerCase();
 
-    // Prefer zh-* since the rest of the bot already uses zh-XX tags.
+    // Voice Library Chinese locales are cmn-CN / cmn-TW. zh-CN and zh-HK are rejected.
     const pickFirst = (cands) => cands.find((c) => set.has(normalizeLocaleToken(c))) || null;
 
-    if (want === 'cantonese') {
-      return [pickFirst(['zh-hk', 'zh-tw', 'zh-cn'])].filter(Boolean);
-    }
-    if (want === 'mandarin') {
-      return [pickFirst(['zh-cn', 'zh-tw', 'zh-hk'])].filter(Boolean);
-    }
-    return [pickFirst(['zh-cn', 'zh-tw', 'zh-hk'])].filter(Boolean);
+    if (want === 'cantonese') return [];
+    return [pickFirst(['cmn-cn', 'cmn-tw'])].filter(Boolean);
   }
 }
 
@@ -840,7 +849,7 @@ class FacetKB {
   }
 
   hasIso2(iso2) {
-    const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    const k = normalizeLibraryLanguageCode(iso2);
     if (!k) return false;
     return this.allowedAccentsByIso2.has(k) || this.allowedLocalesByIso2.has(k);
   }
@@ -909,7 +918,7 @@ class FacetKB {
     // 1) facets.json: allowed accents/locales + accent_slugs mapping
     if (facets && typeof facets === 'object') {
       for (const [iso2Raw, entry] of Object.entries(facets)) {
-        const iso2 = (iso2Raw || '').toString().toLowerCase().slice(0, 2);
+        const iso2 = normalizeLibraryLanguageCode(iso2Raw);
         if (!iso2 || !entry || typeof entry !== 'object') continue;
 
         const accents = Array.isArray(entry.accent) ? entry.accent : [];
@@ -918,15 +927,16 @@ class FacetKB {
 
         const aSet = new Set();
         for (const a of accents) {
+          if (isCodeShapedAccentToken(a)) continue;
           const norm = normalizeCatalogToken(a);
           if (norm) aSet.add(norm);
         }
         const lSet = new Set();
         for (const loc of locales) {
-          // use the same normalizer as the rest of the bot for compare safety
-          const canon = normalizeRequestedLocale(loc) || loc;
-          const norm = normalizeLocaleToken(canon);
-          if (norm) lSet.add(norm);
+          const canon = normalizeRequestedLocale(loc);
+          const norm = normalizeLocaleToken(canon || '');
+          if (!norm || norm.startsWith('zh-')) continue;
+          lSet.add(norm);
         }
 
         allowedAccentsByIso2.set(iso2, aSet);
@@ -949,7 +959,7 @@ class FacetKB {
     // 2) verify_counts.json: popularity counts + explicit slugs per accent
     if (verify && typeof verify === 'object') {
       for (const [iso2Raw, entry] of Object.entries(verify)) {
-        const iso2 = (iso2Raw || '').toString().toLowerCase().slice(0, 2);
+        const iso2 = normalizeLibraryLanguageCode(iso2Raw);
         if (!iso2 || !entry || typeof entry !== 'object') continue;
         const accentsObj = entry.accents && typeof entry.accents === 'object' ? entry.accents : {};
 
@@ -981,7 +991,7 @@ class FacetKB {
   }
 
   _getTopAccents(iso2) {
-    const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    const k = normalizeLibraryLanguageCode(iso2);
     if (!k) return [];
     if (this._topAccentsCache.has(k)) return this._topAccentsCache.get(k);
 
@@ -1001,7 +1011,7 @@ class FacetKB {
   }
 
   checkAccentAllowed(iso2, accent) {
-    const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    const k = normalizeLibraryLanguageCode(iso2);
     const a = normalizeCatalogToken(accent);
     if (!k || !a) return { known: false, allowed: false };
     if (!this.allowedAccentsByIso2.has(k)) return { known: false, allowed: false };
@@ -1019,7 +1029,7 @@ class FacetKB {
   }
 
   checkLocaleAllowed(iso2, locale) {
-    const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    const k = normalizeLibraryLanguageCode(iso2);
     const canon = normalizeRequestedLocale(locale) || locale;
     const l = normalizeLocaleToken(canon);
     if (!k || !l) return { known: false, allowed: false };
@@ -1028,7 +1038,7 @@ class FacetKB {
   }
 
   getAccentSlug(iso2, accent) {
-    const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    const k = normalizeLibraryLanguageCode(iso2);
     const a = normalizeCatalogToken(accent);
     if (!k || !a) return null;
     const m = this.accentSlugByIso2Accent.get(k);
@@ -1061,7 +1071,7 @@ class FacetKB {
   }
 
   getAxisForIso2(iso2) {
-    const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    const k = normalizeLibraryLanguageCode(iso2);
     if (!k) return null;
     const localeCount = (this.allowedLocalesByIso2.get(k) || new Set()).size;
     const accentCount = (this.allowedAccentsByIso2.get(k) || new Set()).size;
@@ -1077,7 +1087,7 @@ class FacetKB {
   }
 
   getFacetVariants(iso2, axis, { maxVariants = 6 } = {}) {
-    const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    const k = normalizeLibraryLanguageCode(iso2);
     const ax = (axis || '').toString();
     const maxN = Math.max(1, Math.min(15, Number(maxVariants) || 6));
     if (!k) return [];
@@ -1127,7 +1137,7 @@ class FacetKB {
   }
 
   getVariantForFacetKey(iso2, axis, facetKey) {
-    const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    const k = normalizeLibraryLanguageCode(iso2);
     const ax = (axis || '').toString();
     const key = (facetKey || '').toString().trim();
     if (!k || !ax || !key) return null;
@@ -1166,7 +1176,7 @@ class FacetKB {
 
   // Suggest locales for a language (no popularity data; deterministic ordering)
   suggestLocales(iso2, userText, { limit = 3 } = {}) {
-    const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    const k = normalizeLibraryLanguageCode(iso2);
     if (!k) return [];
     const set = this.allowedLocalesByIso2.get(k);
     if (!set || !set.size) return [];
@@ -1208,7 +1218,7 @@ class FacetKB {
       }
       if (k === 'zh') {
         // Prefer cmn-* because that's what facets.json currently exposes for zh.
-        const pri = ['cmn-cn', 'cmn-tw', 'zh-cn', 'zh-tw', 'zh-hk'];
+        const pri = ['cmn-cn', 'cmn-tw'];
         const out = [];
         for (const p of pri) {
           const hit = list.find((x) => x.norm === p);
@@ -1241,7 +1251,7 @@ class FacetKB {
 
   // Suggest best 2–3 accents given userText (fuzzy + popularity fallback)
   suggestAccents(iso2, userText, { limit = 3 } = {}) {
-    const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    const k = normalizeLibraryLanguageCode(iso2);
     if (!k) return [];
     const top = this._getTopAccents(k);
     if (!top.length) return [];
@@ -1403,7 +1413,7 @@ const facetKB = new FacetKB();
 // Goal: avoid hardcoded language lists and prevent "random-language" results when user
 // explicitly requested a language (e.g., "Brazilian Portuguese").
 //
-// Per ElevenLabs support: requests must use ISO 639-1 (2-letter) codes.
+// Voice Library requests use ISO 639-1 plus fil, ceb, ast, and yue.
 const LANGUAGE_INDEX_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 const languageIndex = {
   loadedAt: 0,
@@ -1427,7 +1437,11 @@ function normalizeLangName(s) {
 
 function rebuildLanguageIndexCaches() {
   try {
-    languageIndex.iso2Set = new Set(Array.from(languageIndex.byName.values()).filter((v) => /^[a-z]{2}$/.test(v)));
+    languageIndex.iso2Set = new Set(
+      Array.from(languageIndex.byName.values())
+        .map((v) => normalizeLibraryLanguageCode(v))
+        .filter(Boolean)
+    );
     const names = Array.from(languageIndex.byName.keys())
       .map((n) => normalizeLangName(n))
       .filter((n) => n && n.length >= 4);
@@ -1469,9 +1483,8 @@ async function ensureLanguageIndexLoaded(traceCb) {
         const byName = new Map();
         for (const l of langs) {
           const name = normalizeLangName(l?.name);
-          // Support says: use ISO639-1 in requests. Some responses expose language_id; we accept any field that is iso2.
           const maybe = normalizeLangName(l?.language_code || l?.language || l?.code || l?.language_id);
-          const iso2 = /^[a-z]{2}$/.test(maybe) ? maybe : null;
+          const iso2 = normalizeLibraryLanguageCode(maybe);
           if (name && iso2) {
             byName.set(name, iso2);
           }
@@ -1524,6 +1537,9 @@ const STATIC_LANGUAGE_ALIASES = new Map([
   ['chinese', 'zh'],
   ['mandarin', 'zh'],
   ['cantonese', 'zh'],
+  ['filipino', 'fil'],
+  ['tagalog', 'fil'],
+  ['cebuano', 'ceb'],
   ['portuguese', 'pt'],
   ['português', 'pt'],
   ['portugues', 'pt'],
@@ -1537,12 +1553,13 @@ const STATIC_LANGUAGE_ALIASES = new Map([
 // This prevents false positives like "to" being interpreted as a language code.
 const FALLBACK_ISO2_ALLOWLIST = new Set([
   'en','pl','es','de','fr','it','pt','nl','sv','no','da','fi','cs','sk','hu','ro','bg','el','tr',
-  'ar','he','hi','ja','ko','zh','id','ms','th','vi','uk','ru'
+  'ar','he','hi','ja','ko','zh','id','ms','th','vi','uk','ru',
+  'fil','ceb','ast','yue'
 ]);
 
 // Tokens that name the target language (not a regional accent) – skip in accent matching.
 function getLanguageNameSkipTokens(iso2) {
-  const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+  const k = normalizeLibraryLanguageCode(iso2);
   if (!k) return new Set();
   const skip = new Set([k]);
   try {
@@ -1564,7 +1581,7 @@ const ACCENT_FALLBACK_PRESETS = new Map([
 ]);
 
 function buildAccentFallbackKeys(iso2, kb, excludeKeys = []) {
-  const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+  const k = normalizeLibraryLanguageCode(iso2);
   if (!k) return [];
   const exclude = new Set((excludeKeys || []).map((x) => normalizeCatalogToken(x)).filter(Boolean));
   const skipAccents = getLanguageNameSkipTokens(k);
@@ -1622,10 +1639,11 @@ const LOCALE_ALIASES = new Map([
   // French
   ['fr-ca', 'fr-CA'],
   ['fr-qc', 'fr-CA'],
-  // Chinese
-  ['zh-cn', 'zh-CN'],
-  ['zh-tw', 'zh-TW'],
-  ['zh-hk', 'zh-HK']
+  // Chinese. Voice Library locales are cmn-CN / cmn-TW. zh-HK is not a library locale.
+  ['zh-cn', 'cmn-CN'],
+  ['zh-tw', 'cmn-TW'],
+  ['cmn-cn', 'cmn-CN'],
+  ['cmn-tw', 'cmn-TW']
 ]);
 
 const ACCENT_ALIASES = new Map([
@@ -1695,12 +1713,17 @@ function normalizeRequestedLocale(input) {
     const alias = LOCALE_ALIASES.get(tag);
     if (alias) return alias;
 
-    // Accept xx-YY or xx-999 (UN M.49 region code like es-419)
-    const m = tag.match(/^([a-z]{2})-([a-z]{2}|\d{3})$/);
+    // Accept xx-YY, xxx-YY (cmn-CN, fil-PH) or xx-999 (UN M.49 region like es-419)
+    const m = tag.match(/^([a-z]{2,3})-([a-z]{2}|\d{3})$/);
     if (!m) return null;
     const lang = m[1].toLowerCase();
     const region = m[2];
     const reg = /^\d{3}$/.test(region) ? region : region.toUpperCase();
+    if (lang === 'zh') {
+      if (reg === 'CN') return 'cmn-CN';
+      if (reg === 'TW') return 'cmn-TW';
+      return null;
+    }
     return `${lang}-${reg}`;
   } catch (_) {
     return null;
@@ -1768,33 +1791,39 @@ function parseUserLanguageHints(userText) {
   const text = (userText || '').toString();
   const lower = text.toLowerCase();
 
-  // 1) locale like pt-BR, es-MX
+  // 1) locale like pt-BR, es-MX, cmn-CN, fil-PH
   // NOTE: allow only '-' or '_' (optionally with spaces around), never plain space.
   // This prevents false positives like "It is" -> it-IS.
-  const mLocale = text.match(/\b([A-Za-z]{2})\s*[-_]\s*([A-Za-z]{2})\b/);
+  const mLocale = text.match(/\b([A-Za-z]{2,3})\s*[-_]\s*([A-Za-z]{2})\b/);
   if (mLocale) {
-    const iso2 = mLocale[1].toLowerCase();
-    const localeRaw = `${iso2}-${mLocale[2].toUpperCase()}`;
-    const locale = normalizeRequestedLocale(localeRaw) || localeRaw;
-    const ok = languageIndex.iso2Set.size
-      ? languageIndex.iso2Set.has(iso2)
-      : FALLBACK_ISO2_ALLOWLIST.has(iso2);
-    if (ok) return { iso2, locale, explicit: true, reason: 'locale' };
+    const localeRaw = `${mLocale[1].toLowerCase()}-${mLocale[2].toUpperCase()}`;
+    const locale = normalizeRequestedLocale(localeRaw);
+    const iso2 = locale ? libraryLanguageFromLocaleTag(locale) : null;
+    const known = iso2 && (
+      LIBRARY_EXTENDED_LANGUAGE_CODES.has(iso2) ||
+      (languageIndex.iso2Set.size
+        ? languageIndex.iso2Set.has(iso2)
+        : FALLBACK_ISO2_ALLOWLIST.has(iso2))
+    );
+    if (known && locale) return { iso2, locale, explicit: true, reason: 'locale' };
   }
 
-  // 2) ISO2 token ONLY when explicitly marked (to avoid false positives like "to", "in", "an")
+  // 2) Language code ONLY when explicitly marked (to avoid false positives like "to", "in", "an")
   // Examples we accept:
-  // - "language: en", "lang=en"
+  // - "language: en", "lang=en", "language: fil"
   // - "język: pl"
   // - "(en)" or "[en]"
   const mExplicitIso =
-    lower.match(/\b(?:language|lang(?:uage)?|język|jezyk|idioma)\s*[:=]\s*([a-z]{2})\b/) ||
-    lower.match(/[\(\[]\s*([a-z]{2})\s*[\)\]]/);
+    lower.match(/\b(?:language|lang(?:uage)?|język|jezyk|idioma)\s*[:=]\s*([a-z]{2,3})\b/) ||
+    lower.match(/[\(\[]\s*([a-z]{2,3})\s*[\)\]]/);
   if (mExplicitIso) {
-    const iso2 = (mExplicitIso[1] || '').toLowerCase();
-    const ok = languageIndex.iso2Set.size
-      ? languageIndex.iso2Set.has(iso2)
-      : FALLBACK_ISO2_ALLOWLIST.has(iso2);
+    const iso2 = normalizeLibraryLanguageCode(mExplicitIso[1]);
+    const ok = iso2 && (
+      iso2.length > 2 ||
+      (languageIndex.iso2Set.size
+        ? languageIndex.iso2Set.has(iso2)
+        : FALLBACK_ISO2_ALLOWLIST.has(iso2))
+    );
     if (ok) return { iso2, locale: null, explicit: true, reason: 'iso2_explicit' };
   }
 
@@ -1909,9 +1938,8 @@ function parseUserLanguageHints(userText) {
             if (/\b(latam|latin america|latinamerican|es-419)\b/.test(lower)) locale = 'es-419';
           }
           if (iso2 === 'zh') {
-            if (/\b(zh-tw|taiwan|traditional)\b/.test(lower)) locale = 'zh-TW';
-            else if (/\b(zh-hk|hong\s*kong|hk)\b/.test(lower)) locale = 'zh-HK';
-            else if (/\b(zh-cn|china|mainland|simplified|cn)\b/.test(lower)) locale = 'zh-CN';
+            if (/\b(zh-tw|taiwan|traditional)\b/.test(lower)) locale = 'cmn-TW';
+            else if (/\b(zh-cn|china|mainland|simplified|cn)\b/.test(lower)) locale = 'cmn-CN';
           }
           return {
             iso2,
@@ -2134,7 +2162,7 @@ const ISO3_TO_ISO2 = {
   deu: 'de',
   ell: 'el',
   eng: 'en',
-  fil: 'tl',
+  fil: 'fil',
   fin: 'fi',
   fra: 'fr',
   hin: 'hi',
@@ -2262,10 +2290,10 @@ function loadV3ArenaRankings() {
 }
 
 function iso2ToArenaLangCodes(iso2) {
-  const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+  const k = normalizeLibraryLanguageCode(iso2);
   if (!k) return [];
   if (k === 'zh') return ['cmn'];
-  if (k === 'tl' || k === 'fl') return ['fil'];
+  if (k === 'fil' || k === 'fl') return ['fil'];
   return Object.keys(ISO3_TO_ISO2).filter((iso3) => ISO3_TO_ISO2[iso3] === k);
 }
 
@@ -2290,9 +2318,9 @@ function detectBestV3CuratedIntent(text) {
 function selectV3ArenaRows(plan, userText) {
   const all = loadV3ArenaRankings().filter((r) => r.model === 'eleven_v3');
   if (!all.length) return [];
-  let iso2 = (plan?.target_voice_language || '').toString().slice(0, 2).toLowerCase();
+  let iso2 = normalizeLibraryLanguageCode(plan?.target_voice_language);
   if (!iso2 && typeof detectVoiceLanguageFromText === 'function') {
-    iso2 = (detectVoiceLanguageFromText(userText) || '').toString().slice(0, 2).toLowerCase();
+    iso2 = normalizeLibraryLanguageCode(detectVoiceLanguageFromText(userText));
   }
   if (!iso2) {
     iso2 = guessUiLanguageFromText(userText) === 'pl' ? 'pl' : 'en';
@@ -2483,29 +2511,46 @@ function isHighQuality(voice) {
     if (sharingCat === 'high_quality' || sharingCat === 'high quality') return true;
   }
 
-  if (
-    Array.isArray(voice.high_quality_base_model_ids) &&
-    voice.high_quality_base_model_ids.length > 0
-  ) {
-    return true;
-  }
-
-  if (voice.labels && typeof voice.labels === 'object') {
-    const labelHq = String(voice.labels.high_quality || '').toLowerCase();
-    if (labelHq === 'true' || labelHq === 'yes' || labelHq === '1') return true;
-  }
-
-  if (
-    voice.sharing &&
-    typeof voice.sharing === 'object' &&
-    voice.sharing.labels &&
-    typeof voice.sharing.labels === 'object'
-  ) {
-    const labelHq = String(voice.sharing.labels.high_quality || '').toLowerCase();
-    if (labelHq === 'true' || labelHq === 'yes' || labelHq === '1') return true;
-  }
-
   return false;
+}
+
+function isStudioRecording(voice) {
+  return String(voice?.recording_quality || '').trim().toLowerCase() === 'studio';
+}
+
+function collectVoiceModelIds(voice) {
+  const out = [];
+  const seen = new Set();
+  const push = (id) => {
+    const value = String(id || '').trim();
+    const key = value.toLowerCase();
+    if (!value || seen.has(key)) return;
+    seen.add(key);
+    out.push(value);
+  };
+  if (Array.isArray(voice?.high_quality_base_model_ids)) {
+    voice.high_quality_base_model_ids.forEach(push);
+  }
+  if (Array.isArray(voice?.verified_languages)) {
+    voice.verified_languages.forEach((entry) => push(entry?.model_id));
+  }
+  return out;
+}
+
+function formatVerifiedLanguageSummaries(voice) {
+  const entries = Array.isArray(voice?.verified_languages) ? voice.verified_languages : [];
+  const out = [];
+  const seen = new Set();
+  for (const entry of entries) {
+    const language = String(entry?.language || '').trim();
+    const locale = String(entry?.locale || '').trim();
+    const accent = String(entry?.accent || '').trim();
+    const bit = [language, locale, accent].filter(Boolean).join(' / ');
+    if (!bit || seen.has(bit)) continue;
+    seen.add(bit);
+    out.push(bit);
+  }
+  return out;
 }
 
 function voiceSupportsModel(voice, modelId) {
@@ -2607,7 +2652,7 @@ function detectMultipleLanguageIntents(text) {
       // Fuzzy correction is useful for a whole brief, but unsafe for list segments:
       // an adjective can otherwise become an invented second language.
       if (hint.reason === 'fuzzy_language') continue;
-      const iso2 = hint.iso2.toLowerCase().slice(0, 2);
+      const iso2 = normalizeLibraryLanguageCode(hint.iso2);
       if (seenIso2.has(iso2)) continue;
       seenIso2.add(iso2);
       results.push({
@@ -3173,12 +3218,21 @@ function isVoiceInLanguage(voice, langCode) {
   return false;
 }
 
+function libraryLanguageFromLocaleTag(localeTag) {
+  const tag = (localeTag || '').toString();
+  const lang = tag.split('-')[0].toLowerCase();
+  if (!lang) return null;
+  if (lang === 'cmn') return 'zh';
+  return normalizeLibraryLanguageCode(lang);
+}
+
 function getExplicitVoicePrimaryIso2(voice) {
   const raw = (voice?.language || '').toString().trim().toLowerCase();
   if (!raw) return null;
   const locale = extractLocaleFromField(raw);
-  if (locale) return locale.slice(0, 2);
-  if (/^[a-z]{2}$/.test(raw)) return raw;
+  if (locale) return libraryLanguageFromLocaleTag(locale);
+  const code = normalizeLibraryLanguageCode(raw);
+  if (code) return code;
   return languageIndex.byName.get(raw) || STATIC_LANGUAGE_ALIASES.get(raw) || null;
 }
 
@@ -3195,20 +3249,26 @@ function extractIso2FromLanguageField(val) {
   const s = (val || '').toString().trim().toLowerCase();
   if (!s) return null;
   const locale = extractLocaleFromField(s);
-  if (locale) return locale.slice(0, 2);
-  if (/^[a-z]{2}$/.test(s)) return s;
+  if (locale) return libraryLanguageFromLocaleTag(locale);
+  const code = normalizeLibraryLanguageCode(s);
+  if (code) return code;
   return languageIndex.byName.get(s) || STATIC_LANGUAGE_ALIASES.get(s) || null;
 }
 
 function extractLocaleFromField(val) {
   const s = (val || '').toString().trim();
   if (!s) return null;
-  // normalize to xx-YY or xx-999 (UN M.49 region like es-419)
-  const m = s.match(/^([a-z]{2})\s*[-_]\s*([a-z]{2}|\d{3})$/i);
+  // xx-YY, xxx-YY (cmn-CN, fil-PH, ceb-PH) or xx-999 (UN M.49 region like es-419)
+  const m = s.match(/^([a-z]{2,3})\s*[-_]\s*([a-z]{2}|\d{3})$/i);
   if (!m) return null;
   const lang = m[1].toLowerCase();
   const regionRaw = m[2];
   const region = /^\d{3}$/.test(regionRaw) ? regionRaw : regionRaw.toUpperCase();
+  if (lang === 'zh') {
+    if (region === 'CN') return 'cmn-CN';
+    if (region === 'TW') return 'cmn-TW';
+    return null;
+  }
   return `${lang}-${region}`;
 }
 
@@ -3225,7 +3285,7 @@ function getRequestedLocale(userText, keywordPlan) {
     } catch (_) {}
     // If FacetKB knows the language and rejects the locale, treat as unset (conservative)
     try {
-      const iso2 = (keywordPlan?.target_voice_language || '').toString().toLowerCase().slice(0, 2);
+      const iso2 = normalizeLibraryLanguageCode(keywordPlan?.target_voice_language);
       if (iso2 && facetKB && facetKB.isLoaded && facetKB.isLoaded() && facetKB.hasIso2(iso2) && facetKB.checkLocaleAllowed) {
         const r = facetKB.checkLocaleAllowed(iso2, loc);
         if (r && r.known && !r.allowed) return null;
@@ -3237,7 +3297,7 @@ function getRequestedLocale(userText, keywordPlan) {
   if (hint && hint.locale) {
     const loc = normalizeRequestedLocale(hint.locale) || hint.locale;
     try {
-      const iso2 = (hint?.iso2 || keywordPlan?.target_voice_language || '').toString().toLowerCase().slice(0, 2);
+      const iso2 = normalizeLibraryLanguageCode(hint?.iso2 || keywordPlan?.target_voice_language);
       if (iso2 && facetKB && facetKB.isLoaded && facetKB.isLoaded() && facetKB.hasIso2(iso2) && facetKB.checkLocaleAllowed) {
         const r = facetKB.checkLocaleAllowed(iso2, loc);
         if (r && r.known && !r.allowed) return null;
@@ -3246,8 +3306,7 @@ function getRequestedLocale(userText, keywordPlan) {
     return loc;
   }
 
-  const iso2 =
-    (keywordPlan?.target_voice_language || hint?.iso2 || '').toString().toLowerCase().slice(0, 2);
+  const iso2 = normalizeLibraryLanguageCode(keywordPlan?.target_voice_language || hint?.iso2);
   if (!iso2) return null;
 
   // Best-effort regional inference for common cases (keep small & conservative)
@@ -3389,7 +3448,7 @@ function detectVariantIntent(userText, iso2, kb) {
   try {
     const text = (userText || '').toString();
     const lower = text.toLowerCase();
-    const lang = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    const lang = normalizeLibraryLanguageCode(iso2);
     const out = {
       isSpecific: false,
       axis: null, // 'locale' | 'accent'
@@ -3588,8 +3647,8 @@ function detectVariantIntent(userText, iso2, kb) {
 }
 
 function preferredLocalesForChineseDialect(dialect) {
-  if (dialect === 'cantonese') return ['zh-HK', 'zh-TW'];
-  if (dialect === 'mandarin') return ['zh-CN'];
+  if (dialect === 'cantonese') return [];
+  if (dialect === 'mandarin') return ['cmn-CN'];
   return [];
 }
 
@@ -3632,10 +3691,9 @@ function getRequestedAccent(userText, keywordPlan, requestedLocale) {
     const text = (userText || '').toString();
     const lower = text.toLowerCase();
     const loc = normalizeRequestedLocale(requestedLocale);
-    const iso2 = (keywordPlan?.target_voice_language || parseUserLanguageHints(text)?.iso2 || '')
-      .toString()
-      .toLowerCase()
-      .slice(0, 2);
+    const iso2 = normalizeLibraryLanguageCode(
+      keywordPlan?.target_voice_language || parseUserLanguageHints(text)?.iso2
+    );
 
     // Prefer explicit plan hint if present
     let planAcc =
@@ -3734,10 +3792,9 @@ function resolveVariantConstraints(userText, plan, kb, catalog) {
   const text = (userText || '').toString();
   const lower = text.toLowerCase();
   const hint = parseUserLanguageHints(text);
-  const targetIso2 = (plan?.target_voice_language || hint?.iso2 || detectVoiceLanguageFromText(text) || '')
-    .toString()
-    .toLowerCase()
-    .slice(0, 2) || null;
+  const targetIso2 = normalizeLibraryLanguageCode(
+    plan?.target_voice_language || hint?.iso2 || detectVoiceLanguageFromText(text)
+  );
 
   const out = {
     targetIso2,
@@ -4072,7 +4129,7 @@ function isStrongLanguageRequest(userText, keywordPlan) {
   const lower = text.toLowerCase();
   const hint = parseUserLanguageHints(text);
   const explicit = hasExplicitLanguageMention(text);
-  const iso2 = (keywordPlan?.target_voice_language || hint?.iso2 || '').toString().toLowerCase().slice(0, 2);
+  const iso2 = normalizeLibraryLanguageCode(keywordPlan?.target_voice_language || hint?.iso2);
   if (!explicit || !iso2) return false;
 
   // Locale is strong by definition
@@ -4089,7 +4146,7 @@ function isStrongLanguageRequest(userText, keywordPlan) {
 }
 
 function verifiedLanguageEntryMatchesIso2(entry, iso2) {
-  const target = (iso2 || '').toString().toLowerCase().slice(0, 2);
+  const target = normalizeLibraryLanguageCode(iso2);
   if (!entry || !target) return false;
   return (
     extractIso2FromLanguageField(entry.language) === target ||
@@ -4098,7 +4155,7 @@ function verifiedLanguageEntryMatchesIso2(entry, iso2) {
 }
 
 function voiceHasVerifiedIso2(voice, iso2) {
-  const target = (iso2 || '').toString().toLowerCase().slice(0, 2);
+  const target = normalizeLibraryLanguageCode(iso2);
   if (!voice || !target) return false;
   const vIso2 = extractIso2FromLanguageField(voice.language);
   if (vIso2 === target) return true;
@@ -4122,7 +4179,7 @@ function voiceHasVerifiedEnAndEs(voice) {
 function languageHintIso2(text) {
   const hint = parseUserLanguageHints((text || '').toString());
   if (!hint?.iso2 || hint.reason === 'fuzzy_language') return null;
-  return hint.iso2.toLowerCase().slice(0, 2);
+  return normalizeLibraryLanguageCode(hint.iso2);
 }
 
 /**
@@ -4174,7 +4231,7 @@ function detectVerifiedLanguageConstraint(text) {
 function getVerifiedLanguageRequirements(plan, userText, primaryLanguage) {
   const required = [];
   const add = (iso2) => {
-    const normalized = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    const normalized = normalizeLibraryLanguageCode(iso2);
     if (normalized && !required.includes(normalized)) required.push(normalized);
   };
   add(primaryLanguage);
@@ -4213,11 +4270,11 @@ function filterVoicesByLanguageRequirements(
   options = {}
 ) {
   const src = Array.isArray(voices) ? voices : [];
-  const primary = (primaryLanguage || '').toString().toLowerCase().slice(0, 2);
+  const primary = normalizeLibraryLanguageCode(primaryLanguage);
   const requirements = Array.from(
     new Set(
       (Array.isArray(requiredLanguages) ? requiredLanguages : [])
-        .map((iso2) => (iso2 || '').toString().toLowerCase().slice(0, 2))
+        .map((iso2) => normalizeLibraryLanguageCode(iso2))
         .filter(Boolean)
     )
   );
@@ -4245,11 +4302,11 @@ function shouldFailClosedUnknown(hydratedLanguageMetadata) {
 }
 
 function formatVerifiedLanguageConstraint(primaryLanguage, requiredLanguages) {
-  const primary = (primaryLanguage || '').toString().toLowerCase().slice(0, 2);
+  const primary = normalizeLibraryLanguageCode(primaryLanguage);
   const requirements = Array.from(
     new Set(
       [primary, ...(Array.isArray(requiredLanguages) ? requiredLanguages : [])]
-        .map((iso2) => (iso2 || '').toString().toLowerCase().slice(0, 2))
+        .map((iso2) => normalizeLibraryLanguageCode(iso2))
         .filter(Boolean)
     )
   );
@@ -4259,7 +4316,7 @@ function formatVerifiedLanguageConstraint(primaryLanguage, requiredLanguages) {
 }
 
 function voiceVerifiedEntriesForIso2(voice, iso2) {
-  const target = (iso2 || '').toString().toLowerCase().slice(0, 2);
+  const target = normalizeLibraryLanguageCode(iso2);
   if (!voice || !target) return [];
   const verified = Array.isArray(voice.verified_languages) ? voice.verified_languages : [];
   return verified.filter((entry) => verifiedLanguageEntryMatchesIso2(entry, target));
@@ -4344,11 +4401,11 @@ function buildSoftStrictBuckets(
   requestedAccent,
   requiredLanguages = []
 ) {
-  const target = (iso2 || '').toString().toLowerCase().slice(0, 2);
+  const target = normalizeLibraryLanguageCode(iso2);
   const requirements = Array.from(
     new Set(
       [target, ...(Array.isArray(requiredLanguages) ? requiredLanguages : [])]
-        .map((language) => (language || '').toString().toLowerCase().slice(0, 2))
+        .map((language) => normalizeLibraryLanguageCode(language))
         .filter(Boolean)
     )
   );
@@ -4394,7 +4451,7 @@ function filterVoicesForSpecificVariant(voices, iso2, resolved, plan) {
   if (!resolved || resolved.variantMode !== 'specific' || !Array.isArray(voices) || !voices.length) {
     return voices;
   }
-  const target = (iso2 || resolved.targetIso2 || '').toString().toLowerCase().slice(0, 2);
+  const target = normalizeLibraryLanguageCode(iso2 || resolved.targetIso2);
   if (!target) return voices;
 
   const reqLocale =
@@ -4449,7 +4506,7 @@ function voiceMatchesRequestedLocale(voice, requestedLocale) {
 }
 
 function voicePrimaryLooksLikeIso2(voice, iso2, requestedLocale) {
-  const target = (iso2 || '').toString().toLowerCase().slice(0, 2);
+  const target = normalizeLibraryLanguageCode(iso2);
   if (!voice || !target) return false;
 
   const primaryLang = extractIso2FromLanguageField(voice.language);
@@ -4933,8 +4990,12 @@ function formatVoiceLine(voice, uiLang) {
   const curated =
     typeof curatedRank === 'number' && curatedRank > 0 ? `[v3 #${curatedRank}] ` : '';
   let line = `<${url}|${curated}${name}> \`${voice.voice_id}\``;
+  const suffixes = [];
   const npLabel = formatNoticePeriodLabel(voice, uiLang);
-  if (npLabel) line += ` — ${npLabel}`;
+  if (npLabel) suffixes.push(npLabel);
+  if (voice?.live_moderation_enabled === true) suffixes.push('live moderation');
+  if (voice?.featured === true) suffixes.push('featured');
+  if (suffixes.length) line += ` — ${suffixes.join(' · ')}`;
   return line;
 }
 
@@ -5248,7 +5309,7 @@ function detectListAll(text) {
 function buildFacetClarifyMessage(pending) {
   try {
     const type = pending?.type;
-    const iso2 = (pending?.iso2 || '').toString().toLowerCase().slice(0, 2);
+    const iso2 = normalizeLibraryLanguageCode(pending?.iso2);
     const opts = Array.isArray(pending?.options) ? pending.options : [];
     if (!type || !iso2 || !opts.length) return null;
 
@@ -5836,7 +5897,7 @@ function detectSpecialIntent(userText, plan) {
   if (hasUsageKeyword && hasUseCaseKeyword) {
     let languageCode = null;
     if (plan && typeof plan.target_voice_language === 'string' && plan.target_voice_language.trim()) {
-      languageCode = plan.target_voice_language.trim().toLowerCase().slice(0, 2);
+      languageCode = normalizeLibraryLanguageCode(plan.target_voice_language);
     }
     if (!languageCode) {
       languageCode = detectVoiceLanguageFromText(userText);
@@ -5851,7 +5912,7 @@ function detectSpecialIntent(userText, plan) {
   if (hasUsageKeyword) {
     let languageCode = null;
     if (plan && typeof plan.target_voice_language === 'string' && plan.target_voice_language.trim()) {
-      languageCode = plan.target_voice_language.trim().toLowerCase().slice(0, 2);
+      languageCode = normalizeLibraryLanguageCode(plan.target_voice_language);
     }
     if (!languageCode) {
       languageCode = detectVoiceLanguageFromText(userText);
@@ -6425,15 +6486,11 @@ IMPORTANT:
       // Keep invariant: always either string iso2 or null (never undefined)
       plan.__excludedAccentsIso2 = null;
       plan.__excludedLocalesIso2 = null;
-      const hintedIso2 = (
+      const hintedIso2 = normalizeLibraryLanguageCode(
         plan?.target_voice_language ||
-        parseUserLanguageHints(userText)?.iso2 ||
-        detectVoiceLanguageFromText(userText) ||
-        ''
-      )
-        .toString()
-        .toLowerCase()
-        .slice(0, 2);
+          parseUserLanguageHints(userText)?.iso2 ||
+          detectVoiceLanguageFromText(userText)
+      );
       const excludedAcc = hintedIso2 ? extractNegativeAccents(userText, hintedIso2, facetKB) : [];
       const excludedLoc = hintedIso2 ? extractNegativeLocales(userText, hintedIso2, facetKB) : [];
       const excludedG = extractExcludedGenders(userText);
@@ -6567,7 +6624,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   try {
     const gcc = detectGccArabicVoiceIntent(userText);
     if (gcc) {
-      const lang = (plan.target_voice_language || '').toString().toLowerCase().slice(0, 2);
+      const lang = normalizeLibraryLanguageCode(plan.target_voice_language);
       if (!lang || lang === 'ar') {
         plan.target_voice_language = 'ar';
         if (!plan.target_accent || !String(plan.target_accent).trim()) {
@@ -6634,7 +6691,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
 
   let language = null;
   if (plan.target_voice_language && typeof plan.target_voice_language === 'string') {
-    language = plan.target_voice_language.slice(0, 2).toLowerCase();
+    language = normalizeLibraryLanguageCode(plan.target_voice_language);
   }
   try {
     if (language) accentCatalog?.noteLanguageUsed?.(language);
@@ -6704,7 +6761,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     if (isBilingualEnEsSearch) {
       accent = null;
     } else {
-    const iso2 = (language || resolved?.targetIso2 || '').toString().toLowerCase().slice(0, 2);
+    const iso2 = normalizeLibraryLanguageCode(language || resolved?.targetIso2);
     const hasIso2 = Boolean(iso2);
     const wantsAccent = hasIso2 && (() => {
       try {
@@ -7032,7 +7089,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
   async function expandSearchKeywordsWithLLM(targetIso2, keywords, traceCb2) {
     const trace2 = typeof traceCb2 === 'function' ? traceCb2 : () => {};
     try {
-      const iso = (targetIso2 || '').toString().toLowerCase().slice(0, 2);
+      const iso = normalizeLibraryLanguageCode(targetIso2);
       if (!iso || iso === 'en') return keywords;
       if (!readEnvBoolean('ENABLE_LLM_KEYWORD_TRANSLATION', true)) return keywords;
       if (!process.env.OPENAI_API_KEY) return keywords;
@@ -7954,7 +8011,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
             const iso2ForAccent = (() => {
               try {
                 const fromParams = typeof params.get === 'function' ? params.get('language') : null;
-                const cand = (fromParams || language || resolved?.targetIso2 || '').toString().toLowerCase().slice(0, 2);
+                const cand = normalizeLibraryLanguageCode(fromParams || language || resolved?.targetIso2);
                 return cand || null;
               } catch (_) {
                 return null;
@@ -7963,7 +8020,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
 
             const getNameForSlug = (iso2, slug) => {
               try {
-                const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+                const k = normalizeLibraryLanguageCode(iso2);
                 if (!k) return null;
                 if (!facetKB || !facetKB.isLoaded || !facetKB.isLoaded()) return null;
                 const m = facetKB.accentSlugByIso2Accent && typeof facetKB.accentSlugByIso2Accent.get === 'function'
@@ -9020,7 +9077,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
 
     // Popularity proxy (verify_counts): small tie-breaker by accent popularity when available
     try {
-      const iso = (resolved?.targetIso2 || language || '').toString().toLowerCase().slice(0, 2);
+      const iso = normalizeLibraryLanguageCode(resolved?.targetIso2 || language);
       const a = normalizeCatalogToken(v?.accent || '');
       if (iso && a && facetKB && facetKB.accentCountByIso2Accent) {
         const m = facetKB.accentCountByIso2Accent.get(iso);
@@ -9069,7 +9126,7 @@ async function fetchVoicesByKeywords(plan, userText, traceCb) {
     try {
       const vlangs = Array.isArray(v.verified_languages) ? v.verified_languages : [];
       const langs = new Set(
-        vlangs.map((e) => ((e && e.language) ? String(e.language).toLowerCase().slice(0,2) : null)).filter(Boolean)
+        vlangs.map((e) => (e && e.language ? normalizeLibraryLanguageCode(e.language) : null)).filter(Boolean)
       );
       if (langs.has('en') && langs.has('es')) {
         coverage += 0.8;
@@ -10422,7 +10479,7 @@ function extractNegativeAccents(userText, iso2, kb = null) {
   try {
     const text = (userText || '').toString();
     const lower = text.toLowerCase();
-    const lang = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    const lang = normalizeLibraryLanguageCode(iso2);
     if (!lower || !lang) return [];
 
     const out = new Set();
@@ -10494,7 +10551,7 @@ function extractNegativeLocales(userText, iso2, kb = null) {
   try {
     const text = (userText || '').toString();
     const lower = text.toLowerCase();
-    const lang = (iso2 || '').toString().toLowerCase().slice(0, 2);
+    const lang = normalizeLibraryLanguageCode(iso2);
     if (!lower) return [];
 
     const out = new Set();
@@ -10935,11 +10992,9 @@ function shouldApplyParam(kind, plan, userText, flags = {}) {
       // 3) Catalog-driven explicitness: if FacetKB can match a specific accent (direct/fuzzy),
       // treat it as an explicit accent preference (avoids hardcoding accent lists).
       try {
-        const iso2 =
-          (plan?.target_voice_language || parseUserLanguageHints(userText)?.iso2 || detectVoiceLanguageFromText(userText) || '')
-            .toString()
-            .toLowerCase()
-            .slice(0, 2);
+        const iso2 = normalizeLibraryLanguageCode(
+          plan?.target_voice_language || parseUserLanguageHints(userText)?.iso2 || detectVoiceLanguageFromText(userText)
+        );
         if (iso2 && facetKB && facetKB.isLoaded && facetKB.isLoaded() && facetKB.hasIso2 && facetKB.hasIso2(iso2) && facetKB.suggestAccents) {
           const sugg = facetKB.suggestAccents(iso2, userText, { limit: 2 }) || [];
           const best = sugg.find((x) => x && x.matchKind && x.matchKind !== 'popularity');
@@ -11012,7 +11067,7 @@ function hasExplicitUseCaseMention(userText) {
 }
 
 function inferLocale(language, accent, userText) {
-  const lang = (language || '').toString().slice(0, 2).toLowerCase();
+  const lang = normalizeLibraryLanguageCode(language);
   const acc = (accent || '').toString().toLowerCase();
   const lower = (userText || '').toString().toLowerCase();
   if (lang === 'en') {
@@ -11061,6 +11116,14 @@ function detectAgeFromText(text) {
   if (/\b(young|teen|młody|mlody|nastolat)\b/.test(lower)) return 'young';
   if (/\b(adult|dorosły|dorosly)\b/.test(lower)) return 'adult';
   if (/\b(old|senior|elderly|starszy|starczy)\b/.test(lower)) return 'old';
+  return null;
+}
+
+function normalizeAgeForApiParam(age) {
+  const value = (age || '').toString().trim().toLowerCase();
+  if (value === 'young' || value === 'child') return 'young';
+  if (value === 'middle_aged' || value === 'adult') return 'middle_aged';
+  if (value === 'old') return 'old';
   return null;
 }
 
@@ -11294,13 +11357,12 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   const chineseDialect = detectChineseDialectFromText(userText);
   const chinesePreferredLocales = (() => {
     try {
-      // Prefer FacetKB locales for zh (cmn-*) when available; AccentCatalog uses zh-*.
+      // Prefer FacetKB locales for zh (cmn-CN / cmn-TW). Never send zh-CN or zh-HK.
       if (language === 'zh' && facetKB && facetKB.isLoaded && facetKB.isLoaded() && facetKB.allowedLocalesByIso2) {
         const set = facetKB.allowedLocalesByIso2.get('zh');
         const has = (x) => !!(set && set.has(normalizeLocaleToken(x)));
         if (chineseDialect === 'mandarin') {
           if (has('cmn-CN')) return ['cmn-CN'];
-          if (has('zh-CN')) return ['zh-CN'];
         }
         if (chineseDialect === 'cantonese') {
           // if there's no Cantonese locale in facets, return empty to avoid catalog reject loops
@@ -11320,7 +11382,7 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
 
   const hasCatalogForLang = (iso2) => {
     try {
-      const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+      const k = normalizeLibraryLanguageCode(iso2);
       if (!k) return false;
       // Prefer FacetKB when loaded/fresh
       if (facetKB && typeof facetKB.isLoaded === 'function' && facetKB.isLoaded() && facetKB.hasIso2(k)) return true;
@@ -11369,7 +11431,7 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
       const aRaw = (acc || '').toString().trim();
       if (!aRaw) return null;
 
-      const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+      const k = normalizeLibraryLanguageCode(iso2);
       const official = resolveOfficialAccentForApiParam(k, aRaw);
       if (official) return official;
       const isZh = k === 'zh';
@@ -11447,7 +11509,7 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
 
   // Existing filters
   // Bilingual: avoid constraining language to let both EN/ES candidates through
-  const langForParams = options.forceLanguage || language;
+  const langForParams = normalizeLibraryLanguageCode(options.forceLanguage || language);
   if ((!isBilingualEnEs || options.forceLanguage) && langForParams && shouldApplyParam('language', plan, userText)) {
     params.set('language', langForParams);
   }
@@ -11455,7 +11517,7 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   const ensureLanguageForAccent = (iso2) => {
     try {
       if (isBilingualEnEs) return;
-      const k = (iso2 || '').toString().toLowerCase().slice(0, 2);
+      const k = normalizeLibraryLanguageCode(iso2);
       if (!k) return;
       if (typeof params.get === 'function') {
         const already = String(params.get('language') || '').trim();
@@ -11480,7 +11542,7 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
       shouldApplyParam('accent', plan, userText)
     ) {
       const cand = String(resolved.variantCandidates[0] || '').trim();
-      const iso2 = (language || resolved?.targetIso2 || '').toString().toLowerCase().slice(0, 2) || null;
+      const iso2 = normalizeLibraryLanguageCode(language || resolved?.targetIso2);
       // Preserve prior behavior: if we can't determine iso2, still allow accent-only filtering
       // (isAccentAllowedByCatalog(null, ...) is a graceful allow).
       if (cand && isAccentAllowedByCatalog(iso2, cand)) {
@@ -11536,7 +11598,7 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   } else if (!resolverAppliedAccent && !isBilingualEnEs && language === 'zh' && chineseDialect) {
     // Prefer locale-based hinting for Mandarin vs Cantonese (soft)
   } else if (!resolverAppliedAccent && !isBilingualEnEs && accent && shouldApplyParam('accent', plan, userText)) {
-    const iso2 = (language || resolved?.targetIso2 || '').toString().toLowerCase().slice(0, 2) || null;
+    const iso2 = normalizeLibraryLanguageCode(language || resolved?.targetIso2);
     // Preserve prior behavior: if we can't determine iso2, still allow accent-only filtering
     // (isAccentAllowedByCatalog(null, ...) is a graceful allow).
     if (isAccentAllowedByCatalog(iso2, accent)) {
@@ -11625,7 +11687,7 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   } catch (_) {}
   // LatAm Spanish: treat es-419 as region alias and DO NOT send it as a locale param.
   try {
-    if ((language || '').toString().slice(0, 2).toLowerCase() === 'es' && normalizeLocaleToken(loc) === 'es-419') {
+    if (normalizeLibraryLanguageCode(language) === 'es' && normalizeLocaleToken(loc) === 'es-419') {
       diag.locale_set = 'es-419';
       diag.locale_allowed = '-';
       diag.locale_reason = 'es-419_region_alias';
@@ -11725,7 +11787,8 @@ function appendQueryFiltersToParams(params, plan, userText, options = {}) {
   ) {
     params.set('include_custom_rates', 'false');
   }
-  if (age && shouldApplyParam('age', plan, userText)) params.set('age', age);
+  const apiAge = normalizeAgeForApiParam(age);
+  if (apiAge && shouldApplyParam('age', plan, userText)) params.set('age', apiAge);
   if (sort && shouldApplyParam('sort', plan, userText, { sort })) params.set('sort', sort);
 
   return {
@@ -12109,8 +12172,15 @@ function buildListedVoiceEvaluationMessage(voices, userText) {
     }
     lines.push('', formatVoiceLine(voice, 'en'));
     lines.push(`• Language: ${voice.language || 'not specified'}`);
+    const verified = formatVerifiedLanguageSummaries(voice);
+    if (verified.length) lines.push(`• Verified languages: ${verified.join('; ')}`);
+    const models = collectVoiceModelIds(voice);
+    if (models.length) lines.push(`• Models: ${models.join(', ')}`);
     lines.push(`• Category: ${voice.category || voice.sharing?.category || 'not specified'}`);
-    lines.push(`• Marked studio/high quality: ${isHighQuality(voice) ? 'Yes' : 'No'}`);
+    lines.push(`• Library high quality: ${isHighQuality(voice) ? 'Yes' : 'No'}`);
+    if (voice.recording_quality) {
+      lines.push(`• Recording quality: ${voice.recording_quality}`);
+    }
     if (asksSuitability) {
       const description = (voice.description || '').toString().trim();
       lines.push(
@@ -12143,7 +12213,8 @@ async function respondListedVoiceEvaluation(event, cleaned, threadTs, client, ui
   const voices = [];
   for (const id of ids) {
     const voice = await lookupVoiceById(id, () => {});
-    voices.push(voice?.voice_id ? voice : { voice_id: id, __notFound: true });
+    if (voice?.voice_id) voices.push(await enrichVoiceDisplayMetadata(voice, () => {}));
+    else voices.push({ voice_id: id, __notFound: true });
   }
   if (session && typeof session === 'object') {
     const found = voices.filter((voice) => voice?.voice_id && !voice.__notFound);
@@ -12169,6 +12240,17 @@ function buildVoiceLookupMessage(voice, userText) {
     `Language: ${voice.language || '—'}`,
     `Accent: ${voice.accent || '—'}`
   ];
+  const verified = formatVerifiedLanguageSummaries(voice);
+  if (verified.length) lines.push(`Verified languages: ${verified.join('; ')}`);
+  const models = collectVoiceModelIds(voice);
+  if (models.length) lines.push(`Models: ${models.join(', ')}`);
+  if (voice.category) lines.push(`Category: ${voice.category}`);
+  if (voice.recording_quality) lines.push(`Recording quality: ${voice.recording_quality}`);
+  if (voice.live_moderation_enabled === true) lines.push('Live moderation: enabled');
+  if (voice.featured === true) lines.push('Featured: yes');
+  const notice = formatNoticePeriodLabel(voice, 'en');
+  if (notice) lines.push(`Notice period: ${notice}`);
+  if (hasCustomRateMultiplier(voice)) lines.push('Custom rate: yes');
   if (detectVoiceIdQualityQuestion(userText)) {
     const hq = isHighQuality(voice);
     lines.push(
@@ -12187,7 +12269,7 @@ function detectVoiceLanguageCompatibilityIntent(text) {
   if (detectVoiceNoticePeriodIntent(raw)) return null;
   const lower = raw.toLowerCase();
   const hint = parseUserLanguageHints(raw);
-  const iso2 = hint?.iso2 ? hint.iso2.toLowerCase().slice(0, 2) : null;
+  const iso2 = hint?.iso2 ? normalizeLibraryLanguageCode(hint.iso2) : null;
   if (!iso2) return null;
 
   const hasVoiceRef =
@@ -12385,6 +12467,7 @@ async function respondVoiceLanguageCompatibility(event, cleaned, threadTs, clien
   let voice = resolved;
   if (resolved.__needsLookup) {
     voice = await lookupVoiceById(resolved.voice_id, () => {});
+    if (voice?.voice_id) voice = await enrichVoiceDisplayMetadata(voice, () => {});
     if (!voice) {
       const msg = await translateForUserLanguage(
         "I couldn't find a voice with that ID in the public Voice Library or your workspace.",
@@ -12395,7 +12478,9 @@ async function respondVoiceLanguageCompatibility(event, cleaned, threadTs, clien
     }
   } else if (!Array.isArray(voice.verified_languages)) {
     const fresh = await lookupVoiceById(voice.voice_id, () => {});
-    if (fresh) voice = fresh;
+    if (fresh?.voice_id) voice = await enrichVoiceDisplayMetadata(fresh, () => {});
+  } else {
+    voice = await enrichVoiceDisplayMetadata(voice, () => {});
   }
 
   let message = buildVoiceLanguageCompatibilityMessage(voice, intent.iso2);
@@ -12504,6 +12589,36 @@ async function fetchPrivateVoiceById(voiceId, traceCb) {
     } catch (_) {}
     return null;
   }
+}
+
+function copyDisplayMetadataFromFullVoice(target, detailed) {
+  if (!target || !detailed || typeof detailed !== 'object') return target;
+  if (Array.isArray(detailed.high_quality_base_model_ids)) {
+    target.high_quality_base_model_ids = detailed.high_quality_base_model_ids
+      .map((id) => String(id || '').trim())
+      .filter(Boolean);
+  }
+  if (Array.isArray(detailed.verified_languages)) {
+    target.verified_languages = detailed.verified_languages.map((entry) => ({
+      language: entry?.language ?? null,
+      locale: entry?.locale ?? null,
+      accent: entry?.accent ?? null,
+      model_id: entry?.model_id ?? null,
+      preview_url: entry?.preview_url ?? null
+    }));
+  }
+  if (detailed.recording_quality != null && String(detailed.recording_quality).trim()) {
+    target.recording_quality = detailed.recording_quality;
+  }
+  if (!target.category && detailed.category) target.category = detailed.category;
+  return target;
+}
+
+async function enrichVoiceDisplayMetadata(voice, traceCb) {
+  if (!voice?.voice_id) return voice;
+  const detailed = await fetchPrivateVoiceById(voice.voice_id, traceCb);
+  if (!detailed?.voice_id) return voice;
+  return copyDisplayMetadataFromFullVoice(voice, detailed);
 }
 
 // Curated-V3 ranking asks GPT for model ids while the shared plan stays 'any',
@@ -13103,6 +13218,45 @@ function runDevAsserts() {
   devAssert(h7.iso2 === 'zh', 'static alias: mandarin -> zh');
   const h8 = parseUserLanguageHints('mandarian');
   devAssert(h8.iso2 === 'zh', 'fuzzy language: mandarian -> zh');
+
+  devAssert(normalizeLibraryLanguageCode('fil') === 'fil', 'library language: fil kept');
+  devAssert(normalizeLibraryLanguageCode('ceb') === 'ceb', 'library language: ceb kept');
+  devAssert(normalizeLibraryLanguageCode('tl') === 'fil', 'library language: tl maps to fil');
+  devAssert(normalizeLibraryLanguageCode('fi') === 'fi', 'library language: fi stays Finnish');
+  devAssert(normalizeVoiceAccentsLanguage('fil') === 'fil', 'accents endpoint accepts fil');
+  devAssert(normalizeVoiceAccentsLanguage('eng') === null, 'accents endpoint rejects iso3 eng');
+  devAssert(extractLocaleFromField('cmn-CN') === 'cmn-CN', 'parse locale cmn-CN');
+  devAssert(extractLocaleFromField('fil-PH') === 'fil-PH', 'parse locale fil-PH');
+  devAssert(extractLocaleFromField('zh-CN') === 'cmn-CN', 'zh-CN locale maps to cmn-CN');
+  devAssert(extractLocaleFromField('zh-HK') === null, 'zh-HK is not a library locale');
+  devAssert(normalizeRequestedLocale('zh-cn') === 'cmn-CN', 'user zh-cn maps to cmn-CN');
+  devAssert(libraryLanguageFromLocaleTag('cmn-CN') === 'zh', 'cmn locale uses language zh');
+  devAssert(libraryLanguageFromLocaleTag('fil-PH') === 'fil', 'fil-PH uses language fil');
+  devAssert(
+    preferredLocalesForChineseDialect('mandarin')[0] === 'cmn-CN',
+    'mandarin locale is cmn-CN'
+  );
+  devAssert(
+    preferredLocalesForChineseDialect('cantonese').length === 0,
+    'cantonese does not send a locale'
+  );
+  const hFil = parseUserLanguageHints('filipino');
+  devAssert(hFil.iso2 === 'fil', 'static alias: filipino -> fil');
+  const hCeb = parseUserLanguageHints('cebuano');
+  devAssert(hCeb.iso2 === 'ceb', 'static alias: cebuano -> ceb');
+  const hYue = parseUserLanguageHints('cantonese');
+  devAssert(hYue.iso2 === 'zh', 'static alias: cantonese stays zh');
+  const hLangFil = parseUserLanguageHints('language: fil');
+  devAssert(hLangFil.iso2 === 'fil', 'explicit language: fil parses');
+  devAssert(normalizeAgeForApiParam('adult') === 'middle_aged', 'age adult maps to middle_aged');
+  devAssert(normalizeAgeForApiParam('child') === 'young', 'age child maps to young');
+  devAssert(normalizeAgeForApiParam('old') === 'old', 'age old stays old');
+  devAssert(isCodeShapedAccentToken('en-american') === true, 'code-shaped accent rejected');
+  devAssert(isCodeShapedAccentToken('american') === false, 'word accent kept');
+  devAssert(
+    JSON.stringify(iso2ToArenaLangCodes('fil')) === JSON.stringify(['fil']),
+    'arena codes: fil stays fil'
+  );
 
   const hGccEmi = parseUserLanguageHints('which are the best Emirati voices');
   devAssert(hGccEmi.iso2 === 'ar' && hGccEmi.reason === 'gcc_region', 'GCC: Emirati -> ar');
@@ -14447,6 +14601,45 @@ function runDevAsserts() {
       !detectVoiceLookupIntent('find a high quality polish female voice'),
       'voice lookup intent: generic hq search excluded'
     );
+    devAssert(
+      !isHighQuality({ high_quality_base_model_ids: ['eleven_multilingual_v2'] }),
+      'library HQ: model ids alone are not the badge'
+    );
+    devAssert(isHighQuality({ category: 'high_quality' }), 'library HQ: category high_quality');
+    devAssert(
+      isStudioRecording({ recording_quality: 'studio', category: 'professional' }) &&
+        !isHighQuality({ recording_quality: 'studio', category: 'professional' }),
+      'studio recording does not require library HQ'
+    );
+    const moderatedLine = formatVoiceLine(
+      { voice_id: 'modvoice1', name: 'Mod', live_moderation_enabled: true, featured: true },
+      'en'
+    );
+    devAssert(
+      moderatedLine.includes('live moderation') && moderatedLine.includes('featured'),
+      'voice line: live moderation and featured'
+    );
+    devAssert(
+      formatVoiceLine({ voice_id: 'ratevoice1', name: 'Rate', rate: 2 }, 'en').includes('💲'),
+      'voice line: custom rate marker'
+    );
+    const copied = { voice_id: 'full1', category: 'professional' };
+    copyDisplayMetadataFromFullVoice(copied, {
+      high_quality_base_model_ids: ['eleven_v3'],
+      verified_languages: [{ language: 'fil', locale: 'fil-PH', accent: 'standard', model_id: 'eleven_v3' }],
+      recording_quality: 'studio',
+      category: 'cloned',
+      safety_control: 'BAN',
+      settings: { stability: 0.5 },
+      fine_tuning: { state: 'fine_tuned' }
+    });
+    devAssert(copied.recording_quality === 'studio', 'display copy: recording quality');
+    devAssert(copied.category === 'professional', 'display copy: keeps existing category');
+    devAssert(!copied.safety_control && !copied.settings && !copied.fine_tuning, 'display copy: omits private fields');
+    devAssert(
+      collectVoiceModelIds(copied).includes('eleven_v3'),
+      'display copy: models from full voice'
+    );
   }
 
   // Listed IDs are evaluated directly and never refined through the previous language.
@@ -14486,9 +14679,9 @@ Helmut covxL85MSd0uUrktE45z`;
       listedQ
     );
     devAssert(
-      message.includes('Marked studio/high quality: Yes') &&
-        message.includes('Marked studio/high quality: No'),
-      'listed lookup: reports catalog quality for each voice'
+      message.includes('Library high quality: Yes') &&
+        message.includes('Library high quality: No'),
+      'listed lookup: reports library high quality for each voice'
     );
     devAssert(
       message.includes('infinity') && message.includes('Suitability:'),
@@ -14832,7 +15025,8 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
           lookupTrace.push(entry);
         } catch (_) {}
       };
-      const voice = await lookupVoiceById(bareVoiceId, traceCb);
+      let voice = await lookupVoiceById(bareVoiceId, traceCb);
+      if (voice?.voice_id) voice = await enrichVoiceDisplayMetadata(voice, traceCb);
       if (!voice) {
         const msg = await translateForUserLanguage(
           "I couldn't find a voice with that ID in the public Voice Library or your workspace.",
@@ -15014,10 +15208,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
         await facetKB.ensureLoaded();
       }
       const hint = parseUserLanguageHints(cleaned);
-      const iso2 = (keywordPlan?.target_voice_language || hint?.iso2 || '')
-        .toString()
-        .toLowerCase()
-        .slice(0, 2);
+      const iso2 = normalizeLibraryLanguageCode(keywordPlan?.target_voice_language || hint?.iso2);
       const kbReady = facetKB && facetKB.isLoaded && facetKB.isLoaded() && facetKB.hasIso2 && facetKB.hasIso2(iso2);
 
       if (iso2 && kbReady) {
@@ -15461,10 +15652,9 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
       // Similarity results: if query is strongly language-specific, enforce strict verified language matches.
       {
         const isStrong = isStrongLanguageRequest(cleaned, keywordPlan);
-        const iso2 = (keywordPlan?.target_voice_language || detectVoiceLanguageFromText(cleaned) || '')
-          .toString()
-          .slice(0, 2)
-          .toLowerCase();
+        const iso2 = normalizeLibraryLanguageCode(
+          keywordPlan?.target_voice_language || detectVoiceLanguageFromText(cleaned)
+        );
         const requestedLocale = isStrong ? getRequestedLocale(cleaned, keywordPlan) : null;
         const requestedAccent =
           isStrong && (hasExplicitAccentMention(cleaned) || requestedLocale)
@@ -15717,7 +15907,7 @@ async function handleNewSearch(event, cleaned, threadTs, client) {
     // Results message (single by default, strict+verified when query is strongly language-specific)
     {
       const isStrong = isStrongLanguageRequest(cleaned, keywordPlan);
-      const iso2 = (keywordPlan?.target_voice_language || '').toString().slice(0, 2).toLowerCase();
+      const iso2 = normalizeLibraryLanguageCode(keywordPlan?.target_voice_language);
       const requestedLocale = isStrong ? getRequestedLocale(cleaned, keywordPlan) : null;
       const requestedAccent =
         isStrong && (hasExplicitAccentMention(cleaned) || requestedLocale)
